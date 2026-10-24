@@ -9,6 +9,7 @@ pub mod fakeip;
 pub mod host_resolver_hook;
 pub mod resolver;
 pub mod server;
+pub mod tcp;
 pub mod upstream;
 
 pub use cache::{DnsCache, DnsCacheSnapshotEntry, ReverseSnapshotEntry};

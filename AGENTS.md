@@ -75,7 +75,7 @@ The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `rill-transport` | Composable stream-transport layers (TLS, WebSocket, gRPC, HTTP/2, HTTP Upgrade) — protocol-agnostic, no dep on other rill crates (see [ADR-0001](docs/adr/0001-rill-transport-crate.md)) |
 | `rill-proxy` | Proxy protocol implementations (SS, Trojan, VLESS, Direct, Reject), groups (Selector, URLTest, Fallback, LoadBalance, Relay), and health probing |
 | `rill-rules` | Rule matching engine and parser (domain, IP-CIDR, GeoIP, process, logic composition) |
-| `rill-dns` | DNS resolver, cache, DNS snooping (IP→domain reverse table), UDP server |
+| `rill-dns` | DNS resolver, cache, DNS snooping (IP→domain reverse table), UDP + TCP server (`dns.listen`; `tcp.rs` also answers TUN's `dns-hijack: tcp://…`) |
 | `rill-tunnel` | Core routing engine: TCP/UDP relay, rule matching dispatch, connection statistics |
 | `rill-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind the opt-in `listener-tun` feature) |
 | `rill-config` | YAML configuration parsing into typed structs |

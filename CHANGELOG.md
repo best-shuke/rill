@@ -31,6 +31,8 @@ meow-rs's own history is kept in `docs/history/meow-rs-CHANGELOG.md`.
   `SRC-GEOIP,LAN` are built in and need no database. The default GeoIP
   file and download are mihomo's `geoip.metadb`, geosite's `GeoSite.dat`,
   each found without regard to case.
+- `dns.listen` serves TCP beside UDP, as mihomo does, so a stub resolver
+  (macOS's, which FlowBar points at it) can retry a truncated answer.
 - DNS `fallback-filter` as in mihomo: `geosite:` categories go to the
   fallback servers only (with mihomo's deprecation warning),
   `geoip-code: LAN` needs no database, and a geoip gate whose database

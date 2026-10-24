@@ -92,13 +92,26 @@ impl DnsServer {
     /// with the old `run()`-binds-internally shape, a caller that spawned
     /// `run()` fire-and-forget had no way to distinguish "listening" from
     /// "bind failed, every query will be dropped".
+    ///
+    /// TCP is bound on the same address (the UDP socket's port, when the
+    /// configured one is 0), as mihomo serves `dns.listen`: a stub resolver
+    /// retries a truncated answer over TCP. A TCP bind failure only warns —
+    /// UDP is what every client tries first.
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
         let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
         let bound = socket.local_addr().unwrap_or(self.listen_addr);
+        let tcp = match tokio::net::TcpListener::bind(bound).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                warn!("DNS server: TCP {bound} unavailable ({e}); serving UDP only");
+                None
+            }
+        };
         info!("DNS server listening on {bound}");
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,
+            tcp,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -869,6 +882,8 @@ impl DnsServer {
 pub struct BoundDnsServer {
     resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
+    /// The TCP listener on the same address, served by the same future.
+    tcp: Option<tokio::net::TcpListener>,
     /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
     /// already running. Exposed for stats/observability (issue #515).
     dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -889,6 +904,7 @@ impl BoundDnsServer {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -899,6 +915,7 @@ impl BoundDnsServer {
         Self {
             resolver,
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -942,7 +959,8 @@ impl BoundDnsServer {
     /// Ownership contract: the serve loop holds the ONLY strong `Arc` to the
     /// listen socket — query tasks hold `Weak` refs and upgrade per reply.
     /// When an embedder aborts the task running this future, the socket
-    /// drops with the future's frame and the port is released immediately,
+    /// (and the TCP listener, accepted in this same future) drops with the
+    /// future's frame and the port is released immediately,
     /// even while a task is still parked inside `handle_query` awaiting an
     /// upstream (previously worker-held strong clones kept the port bound
     /// for up to the ~5 s query timeout after an abort, so an immediate
@@ -951,9 +969,26 @@ impl BoundDnsServer {
         let BoundDnsServer {
             resolver,
             socket,
+            tcp,
             dropped,
         } = self;
+        let tcp = async {
+            match tcp {
+                Some(listener) => crate::tcp::accept_loop(listener, Arc::clone(&resolver)).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = Self::serve_udp(Arc::clone(&resolver), socket, dropped) => result,
+            never = tcp => match never {},
+        }
+    }
 
+    async fn serve_udp(
+        resolver: ResolverSlot,
+        socket: Arc<UdpSocket>,
+        dropped: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
         let mut buf = vec![0u8; 4096];

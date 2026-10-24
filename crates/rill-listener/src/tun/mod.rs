@@ -61,7 +61,6 @@
 
 mod device;
 mod dns;
-mod dns_tcp;
 #[cfg(target_os = "windows")]
 mod local_dns;
 mod outbound_binding;
@@ -955,7 +954,7 @@ impl TunListener {
                         // as on the UDP path: DNS aimed at the device's own
                         // address is answered too.
                         if dns_hijack_tcp && dst.port() == 53 {
-                            tasks.spawn(dns_tcp::serve(stream, self.tunnel.resolver(), src));
+                            tasks.spawn(rill_dns::tcp::serve(stream, self.tunnel.resolver(), src));
                             continue;
                         }
                         // Same loop guard as the UDP path: a dial to the
