@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Upstream Go mihomo default for v4 fake-IP CIDR. Used when
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
@@ -165,12 +165,14 @@ pub async fn parse_dns(
         let raw_filter = dns.fallback_filter.clone();
         let mmdb_path = mmdb_path.map(std::path::Path::to_path_buf);
         let geodata_mode = crate::geodata_mode(raw);
+        let geosite = geosite.clone();
         Some(
             crate::spawn_blocking_with_current_dispatcher(move || {
                 build_fallback_filter(
                     raw_filter.as_ref(),
                     mmdb_path.as_deref(),
                     geodata_mode,
+                    geosite.as_ref(),
                     strict,
                 )
             })
@@ -827,16 +829,19 @@ async fn resolve_policy_host(
     None
 }
 
-/// Build a `FallbackFilter` from the raw config.
+/// Build a `FallbackFilter` from the raw config, as mihomo does.
 ///
-/// If `geoip: true` but no GeoIP database is available, GeoIP gate is
-/// disabled with a `warn!`. Class B per ADR-0002: NOT a startup error. The
-/// database is the one GEOIP rules read: an MMDB of any flavour mihomo
-/// accepts, or `GeoIP.dat` under `geodata-mode`.
+/// The geoip gate reads the database GEOIP rules read — an MMDB of any
+/// flavour mihomo accepts, or `GeoIP.dat` under `geodata-mode` — and, as in
+/// mihomo, a gate whose database cannot be loaded is a config error;
+/// `geoip-code: LAN` needs no database. `geosite` categories are matched
+/// against the loaded geosite DB (`geosite`), whose absence is an error too.
+/// Under `-t --offline` a missing database only leaves its gate out.
 fn build_fallback_filter(
     raw: Option<&crate::raw::RawFallbackFilter>,
     explicit_mmdb_path: Option<&std::path::Path>,
     geodata_mode: bool,
+    geosite: Option<&Arc<rill_rules::geosite::GeositeDB>>,
     strict: bool,
 ) -> Result<FallbackFilter, anyhow::Error> {
     let geoip = raw.and_then(|f| f.geoip).unwrap_or(true);
@@ -874,7 +879,12 @@ fn build_fallback_filter(
 
     // The geoip gate: an answer passes when it is in `geoip_code` or a LAN
     // address — mihomo's filter never sends private answers to fallback.
-    let geoip_trusted = if geoip {
+    let lan = rill_rules::country_index::lan_ranges();
+    let geoip_trusted = if !geoip {
+        None
+    } else if rill_rules::country_index::is_lan_code(&geoip_code) {
+        Some(Arc::new(move |ip| lan.contains(ip)) as rill_dns::GeoIpTrusted)
+    } else {
         let path = if geodata_mode {
             crate::default_geoip_dat_path()
         } else {
@@ -884,20 +894,61 @@ fn build_fallback_filter(
         match crate::load_geoip_index(geodata_mode, &path, &allowed, "dns.fallback-filter.geoip") {
             Ok(index) => {
                 let ranges = index.ranges_for(&geoip_code);
-                let lan = rill_rules::country_index::lan_ranges();
                 Some(Arc::new(move |ip| ranges.contains(ip) || lan.contains(ip))
                     as rill_dns::GeoIpTrusted)
             }
-            Err(e) => {
-                warn!(
-                    "fallback-filter: geoip=true but no usable GeoIP database ({e:#}) — \
-                     GeoIP gate disabled (Class B per ADR-0002)"
-                );
+            Err(e) if crate::is_offline_geodata() && !path.exists() => {
+                debug!("fallback-filter: geoip gate left out offline: {e:#}");
                 None
             }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "load GeoIP dns fallback filter error, {e:#}"
+                ))
+            }
         }
-    } else {
-        None
+    };
+
+    // mihomo's `geosite` gate: a domain in any listed category skips the
+    // primary servers, like a `domain` match.
+    let categories: Vec<&str> = raw
+        .and_then(|f| f.geosite.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|category| category.trim())
+        .filter(|category| !category.is_empty())
+        .collect();
+    let geosite = match (categories.is_empty(), geosite) {
+        (true, _) => None,
+        (false, None) if crate::is_offline_geodata() => None,
+        (false, None) => {
+            return Err(anyhow::anyhow!(
+                "DNS FallbackGeosite[0] format error: can't load GeoSite.dat for \
+                 fallback-filter.geosite ({})",
+                categories.join(", ")
+            ))
+        }
+        (false, Some(db)) => {
+            warn!(
+                "replace fallback-filter.geosite with nameserver-policy, it will be removed in \
+                 the future"
+            );
+            let mut keys = Vec::with_capacity(categories.len());
+            for category in categories {
+                match db.resolve_keys(category) {
+                    Some(resolved) => keys.push(resolved),
+                    None => warn!(
+                        "fallback-filter.geosite: category '{category}' is not in the geosite \
+                         database; it never matches"
+                    ),
+                }
+            }
+            let db = Arc::clone(db);
+            Some(Arc::new(move |domain: &str| {
+                keys.iter()
+                    .any(|resolved| resolved.iter().all(|key| db.lookup_resolved(key, domain)))
+            }) as rill_dns::DomainGate)
+        }
     };
 
     let geoip_enabled = geoip && geoip_trusted.is_some();
@@ -907,6 +958,7 @@ fn build_fallback_filter(
         geoip_code,
         ipcidr,
         domain,
+        geosite,
         geoip_trusted,
     })
 }
@@ -1964,13 +2016,68 @@ mod tests {
         assert!(pol.lookup("example.cn").is_some());
     }
 
-    // Fallback-filter defaults when no raw config provided.
+    // Fallback-filter defaults when no raw config provided: mihomo's geoip
+    // gate on `CN`, whose database must load.
     #[test]
     fn build_fallback_filter_defaults() {
-        let ff = build_fallback_filter(None, None, false, false).unwrap();
+        let absent = std::path::Path::new("/nonexistent/rill-test/geoip.metadb");
+        let err = build_fallback_filter(None, Some(absent), false, None, false)
+            .err()
+            .expect("the default geoip gate needs its database")
+            .to_string();
+        assert!(
+            err.starts_with("load GeoIP dns fallback filter error"),
+            "{err}"
+        );
+
+        let raw = crate::raw::RawFallbackFilter {
+            geoip: Some(false),
+            ..Default::default()
+        };
+        let ff = build_fallback_filter(Some(&raw), None, false, None, false).unwrap();
         assert_eq!(ff.geoip_code, "CN");
         assert!(ff.ipcidr.is_empty());
         assert!(ff.domain.search("anything").is_none());
+        assert!(!ff.domain_gated("anything"));
+    }
+
+    /// mihomo's `geoip-code: LAN` needs no database: LAN answers stay with
+    /// the primary servers, every other answer goes to fallback.
+    #[test]
+    fn build_fallback_filter_geoip_lan_needs_no_database() {
+        let raw = crate::raw::RawFallbackFilter {
+            geoip_code: Some("lan".to_string()),
+            ..Default::default()
+        };
+        let absent = std::path::Path::new("/nonexistent/rill-test/geoip.metadb");
+        let ff = build_fallback_filter(Some(&raw), Some(absent), false, None, false).unwrap();
+        assert!(ff.geoip_enabled);
+        assert!(!ff.ip_gated(&["192.168.1.1".parse().unwrap()]));
+        assert!(ff.ip_gated(&["8.8.8.8".parse().unwrap()]));
+    }
+
+    /// mihomo's `fallback-filter.geosite`: a domain in a listed category
+    /// goes to fallback only; without a geosite DB the filter is an error.
+    #[test]
+    fn build_fallback_filter_geosite_gate() {
+        let raw = crate::raw::RawFallbackFilter {
+            geoip: Some(false),
+            geosite: Some(vec!["GFW".to_string(), "absent".to_string()]),
+            ..Default::default()
+        };
+        let mut db = rill_rules::geosite::GeositeDB::empty();
+        db.insert("gfw", "+.google.com");
+        let db = Arc::new(db);
+        let ff = build_fallback_filter(Some(&raw), None, false, Some(&db), false).unwrap();
+        assert!(ff.domain_gated("www.google.com"));
+        assert!(ff.domain_gated("WWW.Google.com"));
+        assert!(!ff.domain_gated("example.org"));
+
+        let err = build_fallback_filter(Some(&raw), None, false, None, false)
+            .err()
+            .expect("geosite categories need a geosite DB")
+            .to_string();
+        assert!(err.contains("GeoSite.dat"), "{err}");
     }
 
     // Fallback-filter CIDR gate.
@@ -1982,8 +2089,9 @@ mod tests {
             geoip_code: None,
             ipcidr: Some(vec!["240.0.0.0/4".to_string()]),
             domain: None,
+            geosite: None,
         };
-        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, None, false).unwrap();
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
         let clean: IpAddr = "8.8.8.8".parse().unwrap();
         assert!(ff.ip_gated(&[bogon]));
@@ -2000,8 +2108,9 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["+.google.cn".to_string()]),
+            geosite: None,
         };
-        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, None, false).unwrap();
         assert!(ff.domain_gated("www.google.cn"));
         assert!(ff.domain_gated("google.cn"));
         assert!(!ff.domain_gated("www.google.com"));
@@ -2018,8 +2127,9 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["*.fb.test".to_string()]),
+            geosite: None,
         };
-        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, None, false).unwrap();
         assert!(
             ff.domain_gated("a.fb.test"),
             "single-label subdomain of *.fb.test must match"
@@ -2212,9 +2322,10 @@ mod tests {
             ipcidr: Some(vec!["not-a-cidr".to_string()]),
             ..Default::default()
         };
-        build_fallback_filter(Some(&raw), None, false, false).expect("lenient skips bad CIDRs");
+        build_fallback_filter(Some(&raw), None, false, None, false)
+            .expect("lenient skips bad CIDRs");
         assert!(
-            build_fallback_filter(Some(&raw), None, false, true).is_err(),
+            build_fallback_filter(Some(&raw), None, false, None, true).is_err(),
             "strict must reject an invalid fallback-filter CIDR"
         );
 

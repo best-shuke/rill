@@ -501,6 +501,9 @@ pub struct RawFallbackFilter {
     pub geoip_code: Option<String>,
     pub ipcidr: Option<Vec<String>>,
     pub domain: Option<Vec<String>>,
+    /// Geosite categories whose domains are asked of the fallback servers
+    /// only — mihomo's (deprecated) `fallback-filter.geosite`.
+    pub geosite: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]

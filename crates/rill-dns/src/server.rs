@@ -1862,6 +1862,7 @@ mod tests {
                 geoip_code: "CN".to_string(),
                 ipcidr: vec![],
                 domain: ff_domain,
+                geosite: None,
                 geoip_trusted: None,
             }),
         )

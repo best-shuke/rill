@@ -3144,7 +3144,7 @@ fn parse_sniffer_config(
 /// the rule-line scan (`GEOIP`/`SRC-GEOIP`, `IP-ASN`/`SRC-IP-ASN`,
 /// `GEOSITE`, including logic-rule and provider-payload occurrences) and
 /// the DNS-side consumers (`geosite:` nameserver-policy keys, the
-/// fallback-filter geoip gate).
+/// fallback-filter geoip gate and its `geosite` categories).
 ///
 /// Shared by `missing_geodata_downloads` (startup fetch gating) and the
 /// geodata auto-update tick, so "is this DB referenced" is one judgment —
@@ -3159,7 +3159,8 @@ pub struct GeoDataNeeds {
     pub geoip_dat: bool,
     /// GeoLite2-ASN MMDB — IP-ASN rules.
     pub asn: bool,
-    /// geosite DB (`.dat`/`.mrs`) — GEOSITE rules or `geosite:` policy keys.
+    /// geosite DB (`.dat`/`.mrs`) — GEOSITE rules, `geosite:` policy keys or
+    /// `fallback-filter.geosite`.
     pub geosite: bool,
 }
 
@@ -3174,8 +3175,7 @@ pub(crate) fn geo_references(raw: &raw::RawConfig, scan_lines: &[String]) -> Geo
         mmdb: geoip && !dat,
         geoip_dat: geoip && dat,
         asn: scan_lines.iter().any(|l| line_references_asn(l)),
-        geosite: scan_lines.iter().any(|l| line_references_geosite(l))
-            || dns_policy_uses_geosite(raw),
+        geosite: scan_lines.iter().any(|l| line_references_geosite(l)) || dns_uses_geosite(raw),
     }
 }
 
@@ -3183,7 +3183,8 @@ pub(crate) fn geo_references(raw: &raw::RawConfig, scan_lines: &[String]) -> Geo
 /// `dns_parser::parse_dns` chain: the whole `dns:` block early-returns
 /// unless `enable: true` (the filter is never built), the filter is built
 /// only when `fallback:` nameservers exist, and its geoip gate defaults to
-/// `true` when `fallback-filter` is absent.
+/// `true` when `fallback-filter` is absent. `geoip-code: LAN` is mihomo's
+/// built-in private-range check and needs no database.
 fn dns_fallback_filter_uses_geoip(raw: &raw::RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
@@ -3194,10 +3195,26 @@ fn dns_fallback_filter_uses_geoip(raw: &raw::RawConfig) -> bool {
     if dns.fallback.as_deref().unwrap_or(&[]).is_empty() {
         return false;
     }
-    dns.fallback_filter
+    let filter = dns.fallback_filter.as_ref();
+    filter.and_then(|f| f.geoip).unwrap_or(true)
+        && !filter
+            .and_then(|f| f.geoip_code.as_deref())
+            .is_some_and(rill_rules::country_index::is_lan_code)
+}
+
+/// `fallback-filter.geosite` categories that `parse_dns` will build: like
+/// the geoip gate, only with DNS enabled and `fallback:` servers present.
+fn dns_fallback_geosite_categories(raw: &raw::RawConfig) -> impl Iterator<Item = &str> {
+    raw.dns
         .as_ref()
-        .and_then(|f| f.geoip)
-        .unwrap_or(true)
+        .filter(|dns| dns.enable.unwrap_or(false))
+        .filter(|dns| !dns.fallback.as_deref().unwrap_or(&[]).is_empty())
+        .and_then(|dns| dns.fallback_filter.as_ref())
+        .and_then(|f| f.geosite.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|category| category.trim())
+        .filter(|category| !category.is_empty())
 }
 
 /// The geodata files this config's rules reference that are absent on disk —
@@ -3500,11 +3517,10 @@ fn build_parser_context_at(
         None => None,
     };
 
-    let geosite_trigger =
-        lines.iter().any(|l| line_references_geosite(l)) || dns_policy_uses_geosite(raw);
+    let geosite_trigger = lines.iter().any(|l| line_references_geosite(l)) || dns_uses_geosite(raw);
     let geosite = if geosite_trigger {
         let mut allowed = collect_geosite_categories(&lines);
-        allowed.extend(collect_dns_policy_geosite_categories(raw));
+        allowed.extend(collect_dns_geosite_categories(raw));
         info!(
             "Loading geosite database for {} referenced categories",
             allowed.len()
@@ -3646,13 +3662,16 @@ fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<Str
     out
 }
 
-fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
+fn dns_uses_geosite(raw: &raw::RawConfig) -> bool {
     // `dns.enable: false` (or absent) → `parse_dns` early-returns before the
     // nameserver-policy is built, so the geosite reference is dead and must
     // not count as a consumer (same posture as the fallback-filter gate).
     let enabled = raw.dns.as_ref().and_then(|dns| dns.enable).unwrap_or(false);
     if !enabled {
         return false;
+    }
+    if dns_fallback_geosite_categories(raw).next().is_some() {
+        return true;
     }
     raw.dns
         .as_ref()
@@ -3668,10 +3687,11 @@ fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
         })
 }
 
-fn collect_dns_policy_geosite_categories(
-    raw: &raw::RawConfig,
-) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+fn collect_dns_geosite_categories(raw: &raw::RawConfig) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = dns_fallback_geosite_categories(raw)
+        .filter_map(|category| category.split('@').next())
+        .map(str::to_ascii_lowercase)
+        .collect();
     let Some(policy) = raw
         .dns
         .as_ref()
@@ -6286,6 +6306,33 @@ mod geoip_context_tests {
         .unwrap_err()
         .to_string();
         assert!(err.starts_with("can't load GeoIP database"), "{err}");
+    }
+
+    /// The fallback filter's `geoip-code: LAN` needs no database, and its
+    /// `geosite` categories need the geosite DB (and load those categories).
+    #[test]
+    fn fallback_filter_lan_and_geosite_needs() {
+        let dns = |filter: &str| {
+            format!(
+                "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  fallback: [8.8.8.8]\n  \
+                 fallback-filter:\n{filter}"
+            )
+        };
+        let needs = needs_of(&dns("    geoip-code: LAN\n"), &[]);
+        assert!(!needs.mmdb && !needs.geosite);
+        let needs = needs_of(&dns("    geoip-code: CN\n"), &[]);
+        assert!(needs.mmdb);
+        let yaml = dns("    geoip: false\n    geosite: [gfw, 'cn@ads']\n");
+        let needs = needs_of(&yaml, &[]);
+        assert!(needs.geosite && !needs.mmdb);
+        let raw: raw::RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut got: Vec<_> = collect_dns_geosite_categories(&raw).into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["cn", "gfw"]);
+        // No fallback servers: the filter is never built.
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  \
+                    fallback-filter:\n    geosite: [gfw]\n";
+        assert!(!needs_of(yaml, &[]).geosite);
     }
 
     fn needs_of(yaml: &str, scan: &[&str]) -> GeoDataNeeds {

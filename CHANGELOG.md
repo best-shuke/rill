@@ -27,6 +27,11 @@ meow-rs's own history is kept in `docs/history/meow-rs-CHANGELOG.md`.
   `SRC-GEOIP,LAN` are built in and need no database. The default GeoIP
   file and download are mihomo's `geoip.metadb`, geosite's `GeoSite.dat`,
   each found without regard to case.
+- DNS `fallback-filter` as in mihomo: `geosite:` categories go to the
+  fallback servers only (with mihomo's deprecation warning),
+  `geoip-code: LAN` needs no database, and a geoip gate whose database
+  cannot be loaded is a config error (`load GeoIP dns fallback filter
+  error, …`) instead of being silently left out.
 - `rill -t` downloads a referenced-but-missing database the way mihomo's
   config test does, with mihomo's log wording (`Can't find MMDB, start
   download`, …); `rill -t --offline` keeps the network-free check, which

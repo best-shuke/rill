@@ -56,8 +56,11 @@ Out of scope:
 - **`dhcp://` nameserver** — device-specific; deferred.
 - **Per-policy DoH/DoT client instances with different TLS configs** — all
   policy nameservers share the global TLS config from M1.E-1.
-- **`fallback-filter.geoip: true` when no MMDB installed** — treated as
-  `geoip: false` (skip GeoIP gate) with a `warn!` at startup. Not an error.
+- **`fallback-filter.geoip: true` when no MMDB installed** — *superseded
+  (rill, 2026-10-24)*: a config error, as upstream (`load GeoIP dns fallback
+  filter error, …`); the database is downloaded first like any referenced
+  geodata, and `-t --offline` leaves the gate out. `geoip-code: LAN` needs
+  no database.
 
 ## User-facing config
 
@@ -119,7 +122,7 @@ Field reference — `fallback-filter`:
 |---|------|:-----:|-----------|
 | 1 | `geosite:`/`rule-set:` patterns in nameserver-policy — upstream supports | — | **Implemented.** `geosite:` compiles into a matcher from the loaded geosite DB (issue #299 / #237). `rule-set:` compiles into a matcher from the loaded rule-providers: `Domain` behavior matches directly, `Classical` warns once and matches only its domain rules, `IpCidr` is a hard error, and a missing provider is a hard error (`not found rule-set: <name>`). The matcher snapshots the provider on each lookup, so background refreshes take effect automatically. Other unknown `:`-prefixed patterns still warn-once and skip. |
 | 2 | `dhcp://` nameserver — upstream supports | B | Warn-once at parse time; entry skipped. |
-| 3 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | B | We treat as `geoip: false` with `warn!`. Single-resolver configs are valid without a GeoIP DB. NOT a startup error. |
+| 3 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | — | *Superseded (rill, 2026-10-24)*: we match upstream — a startup/config error after the on-demand download fails. |
 | 4 | nameserver-policy entry with no valid nameservers (all skipped) → upstream panics | A | Hard parse error: "nameserver-policy entry 'KEY' has no valid nameservers after skipping unsupported prefixes." A policy entry with zero valid nameservers silently routes the configured domain to global nameservers — a potential DNS leakage for internal/corporate domains. Fail loudly. |
 | 5 | fallback-filter `domain` pattern syntax | — | We match upstream: entries feed `DomainSetBuilder.Insert` there, `DomainTrie::insert` here — bare/`+.`/`*.`/`.` all follow the canonical matrix. Consistent with nameserver-policy patterns. |
 
@@ -262,8 +265,10 @@ boilerplate of a manual `FuturesUnordered` loop.
    → fallback used.
 8. `fallback-filter.domain: ["+.google.cn"]`, query for `www.google.cn`
    → fallback used (primary not consulted).
-9. `fallback-filter.geoip: true` with no MMDB → GeoIP gate skipped,
-   `warn!` at startup. NOT a startup error. Class A per ADR-0002.
+9. `fallback-filter.geoip: true` with no MMDB → config error, as upstream
+   (*superseded 2026-10-24*; it was a warn-and-skip). `geoip-code: LAN`
+   needs no MMDB; `fallback-filter.geosite` categories go to fallback only,
+   and need the geosite DB.
 10. All three gate conditions disabled (`geoip: false`, empty `ipcidr`, empty
     `domain`) → fallback only on primary failure (existing behaviour unchanged).
 11. Multiple global nameservers: parallel dispatch, first valid response returned.

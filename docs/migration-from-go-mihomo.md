@@ -82,7 +82,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. |
-| `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
+| `dns:` — `fallback-filter` | ✓ | GeoIP (incl. `geoip-code: LAN`)/IP-CIDR/domain/geosite gates. |
 | `dns:` — `hosts` + `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
 | `tproxy-port` | ✓ | Linux nftables / macOS pf. |
@@ -111,7 +111,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `dns.default-nameserver` absent with encrypted hostname upstream | Fails at first query | Hard error at load | A |
 | `nameserver-policy` entry with all URLs stripped | Runtime panic | Hard parse error at load | A |
 | `fallback-filter` GeoIP/CIDR gates | Only on primary failure | Also on poisoned responses (non-CN IP, bogon) | A |
-| `fallback-filter.geoip: true` with no MMDB | Startup error | Warn-once, gate disabled | B |
+| `fallback-filter.geoip: true` with no MMDB | Startup error | Same (after the on-demand download fails) | — |
 | `nameserver-policy` key with `geosite:` prefix | Resolved via geosite DB | Same — resolved via geosite DB (needs geosite DB; warn-skip if absent) | — |
 | `nameserver-policy` key with `rule-set:` prefix | Resolved via rule-provider | Same — resolved via rule-provider (domain/classical); `ipcidr` behavior and missing provider are hard errors | — |
 | `IN-TYPE` with unknown value (e.g. `IN-TYPE,QUIC`) | Silently no-match | Hard parse error | A |

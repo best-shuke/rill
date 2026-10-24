@@ -59,7 +59,7 @@ Following ADR-0002 classification format:
 | # | Case | Class | Note |
 |---|------|:-----:|------|
 | 1 | `geosite:`/`rule-set:` prefix in nameserver-policy key — upstream supports | B | Warn-once at parse time, entry skipped. NOT hard error — real configs use these. |
-| 2 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | B | We treat as `geoip: false` with `warn!`. Single-resolver configs need no GeoIP DB. NOT a startup error. |
+| 2 | `fallback-filter.geoip: true` with no MMDB — upstream errors at startup | — | *Superseded (rill, 2026-10-24)*: a config error, as upstream. |
 | 3 | Policy entry with zero valid nameservers (all URLs skipped) — upstream panics | A | Hard parse error: `"nameserver-policy entry 'KEY' has no valid nameservers"`. Silent routing to global = DNS leakage for internal domains. NOT silent fall-through. |
 | 4 | `fallback-filter` GeoIP/CIDR/domain gates — upstream only falls back on primary failure | A | We trigger fallback on GeoIP anomaly, bogon IP, or domain pattern match even when primary succeeds. Upstream: `dns/resolver.go::ipWithFallback` checks only SERVFAIL/timeout. NOT pass-through on poisoned responses. |
 | 5 | Fallback results not re-filtered — both upstream and rill match | — | Consistent: fallback is the trusted alternate; re-filtering creates rejection loops. |
@@ -101,7 +101,7 @@ that returns controlled country codes.
 | B7 | `fallback_filter_domain_wildcard_matches_root` | `domain: ["+.google.cn"]`. Query `google.cn`. Assert `should_use_fallback` returns `true`. (`+.` includes root.) |
 | B8 | `fallback_filter_domain_does_not_match_sibling` **[guard-rail]** | `domain: ["+.google.cn"]`. Query `notgoogle.cn`. Assert `should_use_fallback` returns `false`. |
 | B9 | `fallback_filter_all_disabled_never_triggers` | `geoip: false`, empty `ipcidr`, empty `domain`. Any primary IP. Assert `should_use_fallback` always returns `false`. |
-| B10 | `fallback_filter_geoip_no_mmdb_skips_gate_and_warns` | `geoip: true`, MMDB = `None`. Assert `should_use_fallback` returns `false` (gate skipped). Assert one `warn!` emitted at `Resolver::new()` time (NOT at query time — warn once at startup). <br/> Upstream: `dns/resolver.go` — Go mihomo errors at startup if MMDB is absent with geoip enabled. <br/> NOT a startup error — Class B per ADR-0002: single-resolver deployments without MMDB are valid. |
+| B10 | `fallback_filter_geoip_no_mmdb_skips_gate_and_warns` | `geoip: true`, MMDB = `None`. Assert `should_use_fallback` returns `false` (gate skipped). Assert one `warn!` emitted at `Resolver::new()` time (NOT at query time — warn once at startup). <br/> Upstream: `dns/resolver.go` — Go mihomo errors at startup if MMDB is absent with geoip enabled. <br/> NOT a startup error — Class B per ADR-0002: single-resolver deployments without MMDB are valid. *(2026-10-24: still the resolver's behaviour for a filter without a gate, but the config layer now refuses such a config, as upstream — see row 2.)* |
 | B11 | `fallback_filter_fallback_result_not_refiltered` | Fallback returns an IP that would itself trigger the GeoIP gate. Assert the result is returned as-is (filter not re-applied to fallback response). Per spec §Resolved questions item 3. |
 | B12 | `fallback_filter_geoip_multiple_ips_any_triggers` **[guard-rail]** | GeoIP gate active. Primary returns two IPs: `1.1.1.1` (CN, passes) and `8.8.8.8` (US, fails). Assert `should_use_fallback` returns `true`. Any non-matching IP is sufficient to trigger fallback — guards that the loop does not short-circuit on the first match. |
 

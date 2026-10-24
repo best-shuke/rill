@@ -197,6 +197,10 @@ pub struct FallbackFilter {
     pub ipcidr: Vec<IpNet>,
     /// Domain patterns — match means skip primary entirely, go straight to fallback.
     pub domain: DomainTrie<()>,
+    /// mihomo's `fallback-filter.geosite`: a domain in one of its categories
+    /// goes straight to fallback, like a `domain` match. Built by the config
+    /// layer from the loaded geosite DB.
+    pub geosite: Option<DomainGate>,
     /// Whether an answer address passes the geoip gate: inside
     /// `geoip_code`, or a LAN address (which mihomo never sends to
     /// fallback). Built by the config layer from whichever GeoIP database
@@ -208,10 +212,14 @@ pub struct FallbackFilter {
 /// See [`FallbackFilter::geoip_trusted`].
 pub type GeoIpTrusted = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 
+/// See [`FallbackFilter::geosite`].
+pub type DomainGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 impl FallbackFilter {
     /// True if the domain pattern gate matches (primary should be skipped).
     pub fn domain_gated(&self, domain: &str) -> bool {
         self.domain.search(domain).is_some()
+            || self.geosite.as_ref().is_some_and(|gate| gate(domain))
     }
 
     /// True if the resolved IPs should be discarded and fallback used.
@@ -3676,6 +3684,7 @@ mod tests {
             geoip_code: "CN".to_string(),
             ipcidr: vec![],
             domain: domain_trie,
+            geosite: None,
             geoip_trusted: None,
         };
         let hosts = DomainTrie::new();
@@ -3700,6 +3709,7 @@ mod tests {
             geoip_code: "CN".to_string(),
             ipcidr: vec![cidr],
             domain: DomainTrie::new(),
+            geosite: None,
             geoip_trusted: None,
         };
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
