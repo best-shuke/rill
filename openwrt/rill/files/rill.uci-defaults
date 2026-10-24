@@ -1,0 +1,30 @@
+#!/bin/sh
+# Add sections introduced after the first release to preserved configs.
+# Preserve existing credentials on upgrades; initialize an empty install.
+if [ -z "$(uci -q get rill.main.secret)" ]; then
+    secret=$(head -c 32 /dev/urandom | hexdump -v -e '1/1 "%02x"')
+    [ "${#secret}" -eq 64 ] || exit 1
+    uci set "rill.main.secret=$secret"
+fi
+if ! uci -q get rill.tproxy >/dev/null; then
+	uci -q batch <<-UCI
+		set rill.tproxy=transparent
+		set rill.tproxy.enabled='0'
+		set rill.tproxy.mode='tproxy'
+		set rill.tproxy.interface='lan'
+		set rill.tproxy.tproxy_port='7893'
+		set rill.tproxy.dns_hijack='1'
+		set rill.tproxy.dns_port='1053'
+		set rill.tproxy.ipv6='0'
+	UCI
+fi
+if ! uci -q get rill.arp >/dev/null; then
+	uci -q batch <<-UCI
+		set rill.arp=arp_hijack
+		set rill.arp.enabled='0'
+		set rill.arp.interface='lan'
+		set rill.arp.interval='2'
+	UCI
+fi
+uci -q commit rill
+exit 0

@@ -1,0 +1,61 @@
+[package]
+name = "rill-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "REST API server (Axum) for the rill proxy kernel."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+listener-tun = ["rill-listener/listener-tun"]
+
+[dependencies]
+rill-common = { workspace = true }
+rill-tunnel = { workspace = true }
+rill-dns = { workspace = true, default-features = false }
+rill-config = { workspace = true, default-features = false }
+rill-proxy = { workspace = true, default-features = false }
+rill-rules = { workspace = true }
+rill-listener = { workspace = true, default-features = false, optional = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+subtle = "2"
+sysinfo = "0.32"
+uuid = { workspace = true }
+time = { workspace = true }
+base64 = "0.22"
+prometheus-client = "0.22"
+hickory-proto = { workspace = true }
+smol_str = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# api_test opens a logbook.
+rill-common = { workspace = true, features = ["logbook"] }
+rill-trie = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+tempfile = "3"
+async-trait = { workspace = true }
+smallvec = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,141 @@
+[package]
+name = "rill-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A high-performance, rule-based tunneling proxy kernel in Rust, compatible with mihomo (Clash.Meta)."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["proxy", "clash", "mihomo", "vpn", "networking"]
+categories = ["network-programming", "command-line-utilities"]
+
+[features]
+# Default = everything a release binary ships: all protocols/listeners/DNS.
+# TLS is BoringSSL everywhere (proxies, health probes, DoT/DoH, provider
+# fetches; ECH/uTLS included) — boring-sys is a hard requirement of the
+# `full` and `minimal` bundles alike, so every build needs cmake + a C++
+# compiler. `hysteria2` runs quiche on the same BoringSSL; no rustls.
+default = ["full"]
+# Compatibility alias: BoringSSL is the only TLS backend now, so this is a
+# no-op kept for existing `--features boring-tls` invocations.
+boring-tls = []
+# Auto-download a third-party dashboard from `external-ui-url` (issue #223).
+# Off by default — adds the `zip` dependency (ADR-0007 binary-size caps).
+# Force-disabled at compile time on iOS/Android even if enabled.
+external-ui-download = ["rill-config/external-ui-download"]
+# Persistent logbook (ADR-0014): bundles SQLite. In `full`; excluded from
+# `minimal` (ADR-0007 binary-size caps), where `GET /logbook` reports it off.
+logbook = ["rill-common/logbook"]
+# Heap profiling via dhat crate — swaps global allocator; never enable in production.
+dhat-heap = ["dhat"]
+
+# Protocol features — forwarded to rill-proxy and rill-config
+ss = ["rill-config/ss", "rill-proxy/ss"]
+trojan = ["rill-config/trojan", "rill-proxy/trojan"]
+vless = ["rill-config/vless", "rill-proxy/vless"]
+vless-vision = ["vless", "rill-config/vless-vision", "rill-proxy/vless-vision"]
+vless-encryption = ["vless", "rill-config/vless-encryption", "rill-proxy/vless-encryption"]
+vmess = ["rill-config/vmess", "rill-proxy/vmess"]
+snell = ["rill-config/snell", "rill-proxy/snell"]
+# AnyTLS outbound (issue #377 item 1) — in the `full` bundle so release
+# binaries carry it; excluded from `minimal` (ADR-0007 binary-size caps).
+anytls = ["rill-config/anytls", "rill-proxy/anytls"]
+hysteria2 = ["rill-config/hysteria2", "rill-proxy/hysteria2"]
+# TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+trusttunnel = ["rill-config/trusttunnel", "rill-proxy/trusttunnel"]
+# `quic: true` for that outbound; see rill-proxy's `trusttunnel-h3`.
+trusttunnel-h3 = [
+    "trusttunnel",
+    "rill-config/trusttunnel-h3",
+    "rill-proxy/trusttunnel-h3",
+]
+ech-tls-tunnel = [
+    "ss",
+    "rill-config/ech-tls-tunnel",
+    "rill-proxy/ech-tls-tunnel",
+]
+# sing-mux multiplexing (in `full`; excluded from `minimal` per ADR-0007).
+mux = ["rill-config/mux", "rill-proxy/mux"]
+# In-process kcptun SS-plugin client (issue #533) — in `full`; excluded
+# from `minimal` alongside `mux` (ADR-0007 binary-size caps).
+kcptun = ["rill-config/kcptun", "rill-proxy/kcptun"]
+
+# DNS
+dns-server = ["rill-dns/dns-server"]
+dns-encrypted = ["rill-dns/encrypted"]
+
+# Listener features — forwarded to rill-listener
+listener-http = ["rill-listener/listener-http"]
+listener-socks5 = ["rill-listener/listener-socks5"]
+listener-tproxy = ["rill-listener/listener-tproxy"]
+listener-mixed = ["rill-listener/listener-mixed"]
+# TUN inbound (issue #326) — transparent proxy without a tproxy/REDIRECT
+# firewall; the only transparent-proxy mode available on Windows.
+listener-tun = ["rill-listener/listener-tun", "rill-api/listener-tun"]
+# Shadowsocks encrypted-server inbound. Fully opt-in: excluded from `full`
+# and `minimal` (server scenario; ADR-0007 binary-size caps) — enable with
+# an explicit `--features listener-shadowsocks`.
+listener-shadowsocks = ["rill-listener/listener-shadowsocks"]
+
+# Convenience bundles
+minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
+full = [
+    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
+    "dns-server", "dns-encrypted",
+    "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
+    "logbook",
+]
+
+[[bin]]
+name = "rill"
+path = "src/main.rs"
+
+# cargo-machete false-positive: rill-proxy has no direct src imports but is
+# required here to forward protocol features (`ss`, `trojan`, `vless`, etc.)
+# to the proxy crate via the [features] table's `rill-proxy/<feat>` entries.
+[package.metadata.cargo-machete]
+ignored = ["rill-proxy"]
+
+[dependencies]
+rill-common = { workspace = true }
+rill-config = { workspace = true, default-features = false }
+rill-rules = { workspace = true }
+rill-tunnel = { workspace = true }
+rill-listener = { workspace = true, default-features = false }
+rill-dns = { workspace = true, default-features = false }
+rill-api = { workspace = true }
+rill-proxy = { workspace = true, default-features = false }
+base64 = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+libc = "0.2"
+dhat = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+tracing-appender = "0.2.5"
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+serde_yaml = { workspace = true }
+base64 = { workspace = true }
+rill-config = { workspace = true }
+rill-rules = { workspace = true }
+rill-trie = { workspace = true }
+maxminddb = { workspace = true }
+libc = "0.2"
+async-trait = { workspace = true }
+smol_str = { workspace = true }
+
+[lints]
+workspace = true

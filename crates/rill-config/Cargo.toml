@@ -1,0 +1,90 @@
+[package]
+name = "rill-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "YAML configuration parsing for the rill proxy kernel."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
+ss = ["rill-proxy/ss"]
+trojan = ["rill-proxy/trojan"]
+# `rill-transport/reality` rides along with vless: `reality-opts` is only
+# reachable from the vless parser, and REALITY must not depend on boring-tls
+# (issue #377 — boring-sys cannot be linked on some targets; REALITY uses
+# x25519-dalek so it works with the rustls-only `full` feature set).
+vless = ["rill-proxy/vless", "rill-transport/reality"]
+vless-vision = ["vless", "rill-proxy/vless-vision"]
+vless-encryption = ["vless", "rill-proxy/vless-encryption"]
+vmess = ["rill-proxy/vmess"]
+anytls = ["rill-proxy/anytls"]
+hysteria2 = ["rill-proxy/hysteria2"]
+# TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+trusttunnel = ["rill-proxy/trusttunnel"]
+# `quic: true` for that outbound; see rill-proxy's `trusttunnel-h3`.
+trusttunnel-h3 = ["trusttunnel", "rill-proxy/trusttunnel-h3"]
+# `rill-transport/simple-obfs` is used directly by the snell parser's
+# `obfs-opts.host` check (issue #648) — declare it rather than rely on
+# `rill-proxy/snell`'s transitive activation.
+snell = ["rill-proxy/snell", "rill-transport/simple-obfs"]
+# Compatibility alias: BoringSSL is the only TLS backend now, so this is a
+# no-op kept for existing `--features boring-tls` invocations.
+boring-tls = []
+ech-tls-tunnel = ["ss", "rill-proxy/ech-tls-tunnel"]
+# In-process kcptun SS-plugin client (issue #533) — forwarded to rill-proxy;
+# rides the `mux` feature for the smux session layer.
+kcptun = ["ss", "mux", "rill-proxy/kcptun"]
+# sing-mux multiplexing (forwarded to rill-proxy; opt-out in `minimal`).
+mux = ["rill-proxy/mux"]
+# Auto-download + unzip a third-party dashboard from `external-ui-url` (issue
+# #223). Off by default: pulls in the `zip` crate, which grows the binary
+# against the ADR-0007 size caps. Even when enabled, the code path is
+# force-disabled on iOS/Android targets (see `src/lib.rs`).
+external-ui-download = ["dep:zip"]
+
+[dependencies]
+rill-common = { workspace = true }
+rill-trie = { workspace = true }
+rill-dns = { workspace = true, features = ["encrypted"] }
+rill-rules = { workspace = true }
+rill-proxy = { workspace = true, default-features = false }
+rill-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "httpupgrade", "xhttp"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+maxminddb = { workspace = true }
+ipnet = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
+parking_lot = { workspace = true }
+hickory-proto = { workspace = true }
+smol_str = { workspace = true }
+url = "2"
+httparse = "1"
+# Optional: only compiled when the `external-ui-download` feature is enabled.
+# `deflate` is the only codec GitHub release zips use; skip the heavier ones.
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+dashmap = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Unit tests open a logbook.
+rill-common = { workspace = true, features = ["logbook"] }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+
+[[test]]
+name = "vless_config_test"
+path = "tests/vless_config_test.rs"
+
+[lints]
+workspace = true

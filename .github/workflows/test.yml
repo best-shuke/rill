@@ -1,0 +1,376 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+  pull_request:
+    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+
+# One active run per ref: a superseded push to the same PR/branch cancels the
+# in-flight run instead of racing it to completion. `push` is limited to
+# `main` above, so a PR branch is tested exactly once per push (via the
+# pull_request event) instead of twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# No step needs write: dashboard's artifact upload works under read.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # This gate runs on the rust-toolchain.toml pin via rustup's
+      # toolchain-file resolution (the file beats `rustup default`; the
+      # @stable step just provides rustup + a fallback toolchain — no
+      # `components:`, the pin declares its own). Mirrored on floating
+      # stable by toolchain-drift.yml — keep the step set in sync.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Also stands in for the per-crate `cargo check --all-features` legs
+      # that used to run in the test job (transport G7, VLESS G3): clippy is
+      # a strict superset of check.
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      # `minimal` leaves out `logbook`, but every workspace run above turns it
+      # on (rill-api's dev-dependency enables it), so the stub that stands in
+      # for it (`rill-common/src/logbook/disabled.rs`) needs its own run.
+      - name: Clippy (rill-common without logbook)
+        run: cargo clippy -p rill-common --all-targets -- -D warnings
+
+      - name: Doc check
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    # Every test target links the whole engine; with full debuginfo the
+    # debug target dir outgrew the hosted runner's disk and the linker died
+    # with SIGBUS ("No space left on device"). Tests need no debuginfo.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same reason: the runner image's preinstalled SDKs take ~20 GB that
+      # this job never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # cargo-nextest: per-test process isolation + `--retries 2 --no-fail-fast` absorbs
+      # the tail-latency/UDP-drop flakes these real-I/O suites are prone to
+      # on shared runners (e.g. snell_v3_docker_udp read timeouts).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache ssserver binary
+        id: cache-ssserver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/ssserver
+          key: ssserver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install ssserver
+        if: steps.cache-ssserver.outputs.cache-hit != 'true'
+        # --force: on a Cargo.lock change this step's cache misses, but the
+        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
+        # and a plain `cargo install` refuses to overwrite it.
+        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
+
+      - name: Install simple-obfs (obfs-local / obfs-server)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends simple-obfs
+          # Fail fast if either binary is missing — the obfs integration tests
+          # rely on both being on PATH (otherwise they would silently SKIP).
+          command -v obfs-local
+          command -v obfs-server
+
+      # Real-server smux E2E (smux_singbox_integration) runs against this
+      # pinned sing-box and REFUSES to silently skip when it is missing,
+      # so a green run always means real-server smux was exercised. Keep
+      # the version in sync with SINGBOX_VERSION in
+      # crates/rill-app/tests/smux_singbox_integration.rs.
+      - name: Install sing-box (real-server smux E2E)
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION=1.14.0
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          command -v sing-box
+
+      # Real-peer gost-plugin interop (gost_plugin_integration) runs against
+      # this pinned gost binary — with it on PATH the suite exercises a real
+      # `ss+mws` server instead of printing SKIP.
+      - name: Install gost (gost-plugin interop E2E)
+        run: |
+          set -euo pipefail
+          GOST_VERSION=3.3.0
+          curl -fsSL -o /tmp/gost.tar.gz \
+            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gost.tar.gz -C /tmp gost
+          sudo install -m 755 /tmp/gost /usr/local/bin/gost
+          command -v gost
+
+      # The restls upstream-interop leg runs against a real
+      # metacubex/restls-client-go server built from the committed Go
+      # harness; RESTLS_SERVER_BIN on the test step tells the suite where
+      # it lives (the test fails when the env is unset — no silent skip).
+      - name: Set up Go (restls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/rill-transport/tests/support/restls-server/go.mod
+          cache: false
+
+      - name: Build restls-server harness
+        run: go build -C crates/rill-transport/tests/support/restls-server -o "$RUNNER_TEMP/restls-server" .
+
+      # The jls upstream-interop leg runs against a real metacubex/jls-tls
+      # server built from the committed Go harness; JLS_SERVER_BIN on the
+      # test step tells the suite where it lives (the test fails when the
+      # env is unset — no silent skip).
+      - name: Set up Go (jls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/rill-transport/tests/support/jls-server/go.mod
+          cache: false
+
+      - name: Build jls-server harness
+        run: go build -C crates/rill-transport/tests/support/jls-server -o "$RUNNER_TEMP/jls-server" .
+
+      # The kcptun e2e suite drives the full SS→smux→snappy→KCP→crypt/FEC
+      # stack against a real upstream Go peer (kcp-go + xtaci/smux +
+      # go-shadowsocks2), so build the in-tree harness. Without
+      # KCPTUN_SERVER_BIN every leg loud-skips — a green run here always
+      # means real wire interop was exercised.
+      - name: Set up Go (kcptun harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/rill-proxy/tests/support/kcptun-server/go.mod
+
+      - name: Build kcptun interop harness
+        working-directory: crates/rill-proxy/tests/support/kcptun-server
+        run: go build -o "$RUNNER_TEMP/kcptun-server" .
+
+      - name: Build
+        run: cargo build --tests
+
+      - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
+      - name: TrustTunnel opt-in protocol and configuration tests
+        env:
+          TRUSTTUNNEL_SERVER_BIN: ${{ runner.temp }}/trusttunnel/trusttunnel_endpoint
+        run: |
+          cargo nextest run -p rill-proxy --no-default-features --features trusttunnel --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p rill-proxy --no-default-features --features trusttunnel --test trusttunnel_integration --retries 2 --no-fail-fast
+          cargo nextest run -p rill-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p rill-config --features trusttunnel --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p rill-config --no-default-features --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p rill-api --features rill-config/trusttunnel --test api_test trusttunnel_provider --retries 2 --no-fail-fast
+          # The HTTP/3 transport is a second opt-in feature on top of it, so
+          # the quiche driver, its in-tree HTTP/3 peer tests, the official
+          # endpoint's `[listen_protocols.quic]` interop leg and the `quic:`
+          # parser contract are invisible to every run above.
+          cargo nextest run -p rill-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p rill-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p rill-config --features trusttunnel-h3 --test trusttunnel_config_test --retries 2 --no-fail-fast
+          # rill-config's own unit tests embed TrustTunnel fixtures too; only
+          # this scope compiles them with every TrustTunnel transport on.
+          cargo nextest run -p rill-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
+
+      # One workspace-scoped invocation for every default-features test
+      # target. A single invocation keeps a single feature-resolution scope,
+      # so default targets share artifacts within this invocation instead
+      # of re-unifying features per `-p`-scoped step. The preceding opt-in
+      # TrustTunnel checks deliberately use separate feature scopes.
+      # `cargo test -p rill-dns --lib` was folded in: `--lib` already
+      # runs every crate's lib tests, rill-dns included.
+      - name: Unit + integration tests (default features)
+        env:
+          # Points restls_e2e's upstream-interop leg at the Go harness
+          # built above — without it that leg fails (never silently skips).
+          RESTLS_SERVER_BIN: ${{ runner.temp }}/restls-server
+          # Same contract for jls_e2e's upstream-interop leg.
+          JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
+          # And for kcptun_e2e's all-real-peer suite.
+          KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
+        run: |
+          cargo nextest run --lib --bin rill --bin rill-bench --bin rill-cli \
+            --test common_test \
+            --test socks5_udp_user \
+            --test dns_cache_test \
+            --test config_test \
+            --test tun_config_test \
+            --test dialer_proxy_group \
+            --test statistics_test \
+            --test rules_test \
+            --test api_test \
+            --test rill_cli_test \
+            --test raii_guard_test \
+            --test http_connection_close \
+            --test config_persistence_test \
+            --test systemd_config_test \
+            --test launchd_config_test \
+            --test trojan_integration \
+            --test vless_config_test \
+            --test vless_integration \
+            --test v2ray_plugin_integration \
+            --test gost_plugin_integration \
+            --test shadow_tls_test \
+            --test restls_e2e \
+            --test jls_e2e \
+            --test kcptun_e2e \
+            --test pre_resolve_test \
+            --test offline_config_test \
+            --test subscription_refresh_test \
+            --test tls_test \
+            --test boring_tls_test \
+            --test ws_test \
+            --test crate_invariants_test \
+            --test crate_publish_metadata_test \
+            --test smux_singbox_integration --retries 2 --no-fail-fast
+
+      # `-p rill-api` builds api_test WITHOUT `listener-tun` (rill-app's
+      # `full` never enters the graph), so the `cfg(not(feature =
+      # "listener-tun"))` TUN-reconcile tests actually execute — in the
+      # unified invocation above feature unification compiles them out.
+      - name: API tests without listener-tun (TUN reconcile)
+        run: cargo nextest run -p rill-api --test api_test --retries 2 --no-fail-fast
+
+      # `minimal` leaves out `logbook`, which every run above unifies on;
+      # `-p rill-common` alone builds the stub that stands in for it
+      # (`rill-common/src/logbook/disabled.rs`).
+      - name: Logbook stub tests (rill-common without logbook)
+        run: cargo nextest run -p rill-common --lib logbook --retries 2 --no-fail-fast
+
+      - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
+        run: cargo nextest run -p rill-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
+
+      # `ss_listener_integration` is `required-features = ["listener-shadowsocks"]`,
+      # which is opt-in (excluded from the app bundles and default features), so
+      # the default-features suite above never compiles it. The `--lib` leg runs
+      # the whole `shadowsocks::tests` module; the `--test` leg runs the suite.
+      - name: Shadowsocks listener tests (SIP022 UDP)
+        run: |
+          cargo nextest run -p rill-listener --features listener-shadowsocks --lib shadowsocks --retries 2 --no-fail-fast
+          cargo nextest run -p rill-listener --features listener-shadowsocks --test ss_listener_integration --retries 2 --no-fail-fast
+
+      # ADR-0008 allocation-count gates. Release build: the thresholds are
+      # calibrated against release codegen. The provider-backed pressure
+      # test self-skips when geodata files are absent (as on CI runners);
+      # the remaining gates run everywhere.
+      - name: Allocation-count gates (ADR-0008)
+        run: cargo nextest run -p rill-tunnel --test alloc_count_test --release --retries 2 --no-fail-fast
+
+      # Kept as its own step: MIHOMO_REQUIRE_INTEGRATION_BINS flips *every*
+      # suite that probes for external binaries from skip to fail (e.g.
+      # vless_integration probes for xray, which is not installed here), so
+      # it must only wrap the suite whose binaries are installed above.
+      - name: Shadowsocks integration tests (incl. simple-obfs)
+        env:
+          # Force-fail (instead of silently SKIP) if ssserver / obfs-local /
+          # obfs-server are missing on PATH — they are installed above.
+          MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
+        run: cargo nextest run --test shadowsocks_integration --retries 2 --no-fail-fast
+
+      - name: Docker integration tests (Hysteria2 + Snell v3–v6 + Xray VMess/VLESS encryption/Vision)
+        env:
+          RILL_REQUIRE_DOCKER: "1"
+        run: |
+          cargo nextest run -p rill-proxy --features "hysteria2,snell,vmess,vless-encryption,vless-vision" \
+            --test hysteria2_integration \
+            --test snell_server_docker_integration \
+            --test xray_server_docker_integration --retries 2 --no-fail-fast
+
+      - name: AnyTLS unit and integration tests (embedded server)
+        run: |
+          cargo nextest run -p rill-anytls --lib --retries 2 --no-fail-fast
+          cargo nextest run -p rill-proxy --features anytls --lib \
+            --test anytls_integration --test anytls_leak --retries 2 --no-fail-fast
+
+      # One invocation/feature set for the feature-gated transport suites.
+      # Per-feature-combination *compile* coverage (the old G1-G6 matrix)
+      # lives in the feature-powerset job; the nightly coverage workflow
+      # runs these same tests under --all-features.
+      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP)
+        run: |
+          cargo nextest run -p rill-transport --features "grpc,h2,httpupgrade,xhttp" \
+            --test grpc_test \
+            --test h2_test \
+            --test xhttp_test \
+            --test httpupgrade_test --retries 2 --no-fail-fast
+
+  features:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: features
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Capped powerset: --depth 2 covers the empty set, every single feature,
+      # and every pair — enough for the real-world cfg-interaction bugs while
+      # keeping the leg count ~n^2 instead of ~2^n (rill-proxy: 66 legs,
+      # ~129 across the four crates — cargo-hack dedups subsets that resolve
+      # to identical builds). Same trade-off tokio (--depth 2 --keep-going)
+      # and quinn (--depth 3 --no-dev-deps) make in their PR CI.
+      # --no-dev-deps: dev-dependencies are irrelevant to a compile check and
+      # dominate per-leg build time. Deeper combinations (3+ features) run
+      # nightly in .github/workflows/feature-powerset-daily.yml; the
+      # --all-features legs (transport G7, VLESS G3) are covered by clippy
+      # --all-features in the lint job.
+      - name: Feature powerset (depth 2) — rill-transport
+        # `tls` is BoringSSL (boring-sys builds once and is cached across
+        # legs); `boring-tls` is a no-op alias of it, so skip that duplicate.
+        run: cargo hack check -p rill-transport --feature-powerset --depth 2 --no-dev-deps --exclude-features boring-tls
+
+      - name: Feature powerset (depth 2) — rill-proxy
+        run: cargo hack check -p rill-proxy --feature-powerset --depth 2 --no-dev-deps
+
+      - name: Feature powerset (depth 2) — rill-listener
+        run: cargo hack check -p rill-listener --feature-powerset --depth 2 --no-dev-deps
+
+      - name: Feature powerset (depth 2) — rill-dns
+        run: cargo hack check -p rill-dns --feature-powerset --depth 2 --no-dev-deps

@@ -1,0 +1,29 @@
+rill
+Copyright (c) 2026 jijason04
+
+rill is derived from meow-rs (https://github.com/meow-rs/meow-rs), taken at
+commit 62525d4ee9b5b57c66c87a5ba6999298b00c3c13 (meow-rs 0.26.1) and renamed
+and developed independently from there. meow-rs is distributed under the MIT
+License:
+
+    Copyright (c) 2026 Max Lv
+
+The full MIT text, which applies to rill as a whole, is in LICENSE. Comments
+and documents inherited from meow-rs still cite its issues and pull requests
+(`madeye/meow-rs#N`, `#N`); those numbers refer to the meow-rs tracker.
+docs/history/ and docs/benchmarks/ keep inherited records verbatim, under the
+names they were written with.
+
+Third-party components vendored in this repository:
+
+- crates/rill-lwip/old-src/: lwIP 2.1.2 C sources (via the madeye/lwip fork),
+  BSD-3-Clause, Copyright (c) 2001, 2002 Swedish Institute of Computer
+  Science and contributors. License text: crates/rill-lwip/COPYING.
+- crates/rill-lwip/rust/: Rust bindings for lwIP from ssrlive/lwip and the
+  madeye/lwip fork, MIT OR Apache-2.0.
+- crates/rill-anytls/: the madeye fork of anytls-rs, MIT License,
+  Copyright (c) 2024 Mickey and AnyTLS Contributors. License text:
+  crates/rill-anytls/LICENSE.
+
+Dependencies fetched by Cargo at build time carry their own licenses; see
+Cargo.lock for the full list.

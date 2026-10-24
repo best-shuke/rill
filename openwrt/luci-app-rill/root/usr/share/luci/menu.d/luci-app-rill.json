@@ -1,0 +1,67 @@
+{
+	"admin/services/rill": {
+		"title": "rill",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-rill" ],
+			"uci": { "rill": true }
+		}
+	},
+
+	"admin/services/rill/overview": {
+		"title": "Overview",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "rill/overview"
+		}
+	},
+
+	"admin/services/rill/panel": {
+		"title": "Panel",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "rill/panel"
+		}
+	},
+
+	"admin/services/rill/config": {
+		"title": "Configuration",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "rill/config"
+		}
+	},
+
+	"admin/services/rill/clients": {
+		"title": "Clients",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "rill/clients"
+		}
+	},
+
+	"admin/services/rill/settings": {
+		"title": "Settings",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "rill/settings"
+		}
+	},
+
+	"admin/services/rill/log": {
+		"title": "Log",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "rill/log"
+		}
+	}
+}

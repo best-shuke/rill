@@ -1,0 +1,43 @@
+{
+	"luci-app-rill": {
+		"description": "Grant access to rill service configuration",
+		"read": {
+			"uci": [ "rill", "network", "dhcp" ],
+			"ubus": {
+				"luci-rpc": [ "getHostHints", "getDHCPLeases" ],
+				"service": [ "list" ],
+				"file": [ "exec" ],
+				"uci": [ "get", "changes" ]
+			},
+			"file": {
+				"/sbin/logread -e rill": [ "exec" ],
+				"/usr/share/rill/gateway.sh status": [ "exec" ],
+				"/usr/share/rill/arp-hijack.sh clients": [ "exec" ],
+				"/usr/libexec/rill-api GET /version": [ "exec" ],
+				"/usr/libexec/rill-api GET /configs": [ "exec" ],
+				"/usr/libexec/rill-api GET /connections": [ "exec" ],
+				"/etc/rill/config.yaml": [ "read" ]
+			},
+			"cgi-io": [ "download", "exec" ]
+		},
+		"write": {
+			"uci": [ "rill" ],
+			"file": {
+				"/tmp/rill-luci-check.yaml": [ "write" ],
+				"/tmp/rill-luci-settings-*.yaml": [ "write" ],
+				"/etc/init.d/rill start": [ "exec" ],
+				"/etc/init.d/rill stop": [ "exec" ],
+				"/etc/init.d/rill restart": [ "exec" ],
+				"/etc/init.d/rill-arp restart": [ "exec" ],
+				"/usr/libexec/rill-api PATCH /configs *": [ "exec" ],
+				"/etc/rill/config.yaml": [ "write" ],
+				"/usr/libexec/rill-validate *": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec", "remove" ],
+				"uci": [ "add", "apply", "confirm", "delete", "order", "rename", "set" ]
+			},
+			"cgi-io": [ "upload" ]
+		}
+	}
+}

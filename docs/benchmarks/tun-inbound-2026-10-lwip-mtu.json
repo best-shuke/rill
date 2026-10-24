@@ -1,0 +1,1359 @@
+{
+  "note": "meow-bench --only tun (with the parallel leg and tun_tx_dropped), three runs per MTU; `before` is meow @ 62525d4, `after` is perf/tun-lwip-mtu against mihomo v1.19.30. See the follow-up section of tun-inbound-2026-10.md.",
+  "before": {
+    "mtu1500": [
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 16478208,
+            "rss_load_bytes": 25616384,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.343939025,
+                "gbps": 0.4876411710717307
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.123007855,
+                "gbps": 1.3639141988127506
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.721037534,
+                "gbps": 1.4891621772355612
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 10.838885541908514,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 7.789516925,
+              "gbps": 1.1027557516989412
+            },
+            "parallel_cpu_secs_per_gb": 11.799857020378113,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 334.92199999999997,
+              "p95_us": 524.404,
+              "p99_us": 864.006,
+              "min_us": 237.84199999999998,
+              "max_us": 1362.73
+            },
+            "conn_rate": {
+              "duration_secs": 10.003164879,
+              "total_connections": 123106,
+              "connections_per_sec": 12306.705076754339,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 175.78347115493963,
+            "tun_tx_dropped": 1478
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 15417344,
+            "rss_load_bytes": 26124288,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.237314844,
+                "gbps": 0.529663087109945
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.121237283,
+                "gbps": 1.3838330573607458
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.693065019,
+                "gbps": 1.5492656454502143
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 10.417139022768104,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 7.36451361,
+              "gbps": 1.1663953720359816
+            },
+            "parallel_cpu_secs_per_gb": 11.352822184562681,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 305.76300000000003,
+              "p95_us": 389.482,
+              "p99_us": 480.243,
+              "min_us": 236.602,
+              "max_us": 3655.705
+            },
+            "conn_rate": {
+              "duration_secs": 10.002918997,
+              "total_connections": 123436,
+              "connections_per_sec": 12339.997958297972,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 172.80209987361872,
+            "tun_tx_dropped": 1613
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 16838656,
+            "rss_load_bytes": 26263552,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.208941487,
+                "gbps": 0.5420940608352206
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.101898589,
+                "gbps": 1.6464620525805318
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.565783855,
+                "gbps": 1.8977950934990893
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 9.32059807300304,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 7.156037521,
+              "gbps": 1.2003758458213931
+            },
+            "parallel_cpu_secs_per_gb": 8.875504136085508,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 316.562,
+              "p95_us": 400.32300000000004,
+              "p99_us": 541.163,
+              "min_us": 253.36199999999997,
+              "max_us": 2388.097
+            },
+            "conn_rate": {
+              "duration_secs": 10.00339088,
+              "total_connections": 139249,
+              "connections_per_sec": 13920.17983406043,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 151.45530668083796,
+            "tun_tx_dropped": 1316
+          }
+        ]
+      }
+    ],
+    "mtu9000": [
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 16928768,
+            "rss_load_bytes": 26611712,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.232278449,
+                "gbps": 0.5318278515150758
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.09432885499999999,
+                "gbps": 1.7785878986869927
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.583704139,
+                "gbps": 1.8395309408624907
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 9.362772724917082,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 9.994318457,
+              "gbps": 0.8594817774676398
+            },
+            "parallel_cpu_secs_per_gb": 8.866190910339354,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 312.04200000000003,
+              "p95_us": 380.60299999999995,
+              "p99_us": 441.163,
+              "min_us": 248.961,
+              "max_us": 1801.332
+            },
+            "conn_rate": {
+              "duration_secs": 10.004199166,
+              "total_connections": 136891,
+              "connections_per_sec": 13683.354132456105,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 151.94570862949357,
+            "tun_tx_dropped": 1539
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 15429632,
+            "rss_load_bytes": 25792512,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.220746009,
+                "gbps": 0.5368520520799016
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.11854890600000001,
+                "gbps": 1.4152147468994778
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.720293249,
+                "gbps": 1.4907009408885907
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 10.501488326596187,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 7.896690631,
+              "gbps": 1.0877891756679101
+            },
+            "parallel_cpu_secs_per_gb": 11.101365089416504,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 325.363,
+              "p95_us": 412.12300000000005,
+              "p99_us": 533.1239999999999,
+              "min_us": 249.16199999999998,
+              "max_us": 3334.783
+            },
+            "conn_rate": {
+              "duration_secs": 10.003072919,
+              "total_connections": 120539,
+              "connections_per_sec": 12050.197072046358,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 176.29149072084556,
+            "tun_tx_dropped": 1136
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": null,
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 15446016,
+            "rss_load_bytes": 25214976,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.294653162,
+                "gbps": 0.5062050742513847
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.11918482799999999,
+                "gbps": 1.407663733843707
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.757580108,
+                "gbps": 1.4173310685712988
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 11.091933453392759,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 7.155391236,
+              "gbps": 1.2004842654560335
+            },
+            "parallel_cpu_secs_per_gb": 12.097880244255066,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 322.722,
+              "p95_us": 400.16200000000003,
+              "p99_us": 530.764,
+              "min_us": 257.842,
+              "max_us": 669.204
+            },
+            "conn_rate": {
+              "duration_secs": 10.004626488,
+              "total_connections": 114271,
+              "connections_per_sec": 11421.815710667639,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 185.78642000157524,
+            "tun_tx_dropped": 1350
+          }
+        ]
+      }
+    ]
+  },
+  "after": {
+    "mtu1500": [
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 16850944,
+            "rss_load_bytes": 28672000,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.267038011,
+                "gbps": 0.5172378368370829
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.111475336,
+                "gbps": 1.505015961557631
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.599222687,
+                "gbps": 1.791891140463445
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 9.911043199799614,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 6.547160727,
+              "gbps": 1.3120091212326215
+            },
+            "parallel_cpu_secs_per_gb": 11.688098311424254,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 320.64300000000003,
+              "p95_us": 394.803,
+              "p99_us": 445.32300000000004,
+              "min_us": 245.761,
+              "max_us": 673.9250000000001
+            },
+            "conn_rate": {
+              "duration_secs": 10.002873917,
+              "total_connections": 119863,
+              "connections_per_sec": 11982.856226578187,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 180.87316352836154,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 43630592,
+            "rss_load_bytes": 88461312,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.890542513,
+                "gbps": 0.7359109648704666
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.112219221,
+                "gbps": 1.4950394282277188
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.557904879,
+                "gbps": 1.9245965834258283
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 6.790118958160585,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 11.515149872,
+              "gbps": 0.7459681104878285
+            },
+            "parallel_cpu_secs_per_gb": 6.658956408500671,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 360.00300000000004,
+              "p95_us": 439.323,
+              "p99_us": 495.083,
+              "min_us": 298.40200000000004,
+              "max_us": 916.687
+            },
+            "conn_rate": {
+              "duration_secs": 18.753560086,
+              "total_connections": 85667,
+              "connections_per_sec": 4568.039327314314,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 263.46200987544796,
+            "tun_tx_dropped": 92534
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 45330432,
+            "rss_load_bytes": 932388864,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 2.279479611,
+                "gbps": 0.28750421668062026
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.20476782500000001,
+                "gbps": 0.8193287202225251
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 1.167070955,
+                "gbps": 0.9200313137773187
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 19.948610355341348,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.814858561,
+              "gbps": 1.7840471289391215
+            },
+            "parallel_cpu_secs_per_gb": 13.625249266624449,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 554.284,
+              "p95_us": 717.2049999999999,
+              "p99_us": 884.886,
+              "min_us": 403.323,
+              "max_us": 3313.423
+            },
+            "conn_rate": {
+              "duration_secs": 10.0118831,
+              "total_connections": 55536,
+              "connections_per_sec": 5547.008434407309,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 499.67588591184096,
+            "tun_tx_dropped": 22117
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 17178624,
+            "rss_load_bytes": 27328512,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.233441937,
+                "gbps": 0.5313261859686549
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.091147752,
+                "gbps": 1.840661522842604
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.449121563,
+                "gbps": 2.3907599021247616
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 8.603628990464346,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.56592275,
+              "gbps": 1.8813140436946725
+            },
+            "parallel_cpu_secs_per_gb": 9.015202522277832,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 334.563,
+              "p95_us": 492.604,
+              "p99_us": 776.0459999999999,
+              "min_us": 233.762,
+              "max_us": 1715.772
+            },
+            "conn_rate": {
+              "duration_secs": 10.002604475,
+              "total_connections": 136972,
+              "connections_per_sec": 13693.633527381877,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 154.33811289898662,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 43982848,
+            "rss_load_bytes": 88936448,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.876160933,
+                "gbps": 0.7479904379621546
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.10623174,
+                "gbps": 1.5793035113611054
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.501558328,
+                "gbps": 2.14081147507135
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 6.452721742848259,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 12.772570976,
+              "gbps": 0.6725297990624374
+            },
+            "parallel_cpu_secs_per_gb": 6.798654794692993,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 359.882,
+              "p95_us": 446.88300000000004,
+              "p99_us": 534.2040000000001,
+              "min_us": 301.362,
+              "max_us": 962.247
+            },
+            "conn_rate": {
+              "duration_secs": 19.824817936,
+              "total_connections": 95864,
+              "connections_per_sec": 4835.555126381263,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 259.43002586998244,
+            "tun_tx_dropped": 98930
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 45289472,
+            "rss_load_bytes": 771518464,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 2.315624463,
+                "gbps": 0.28301652986985226
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.20832716800000003,
+                "gbps": 0.8053302006198249
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 1.1655749850000001,
+                "gbps": 0.9212121380590541
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 19.99078500725539,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.883912161,
+              "gbps": 1.7588224990191426
+            },
+            "parallel_cpu_secs_per_gb": 13.755634427070616,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 542.723,
+              "p95_us": 678.6850000000001,
+              "p99_us": 804.605,
+              "min_us": 418.843,
+              "max_us": 4760.152999999999
+            },
+            "conn_rate": {
+              "duration_secs": 10.011658178,
+              "total_connections": 52373,
+              "connections_per_sec": 5231.20137232476,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 506.9405991636913,
+            "tun_tx_dropped": 24696
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 1500,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 17010688,
+            "rss_load_bytes": 27242496,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.225297561,
+                "gbps": 0.534857834422801
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.09389101200000001,
+                "gbps": 1.78688200740663
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.453980437,
+                "gbps": 2.3651720129076836
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 8.730152946206466,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.775942131,
+              "gbps": 1.7985843120342448
+            },
+            "parallel_cpu_secs_per_gb": 9.313225746154785,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 323.562,
+              "p95_us": 403.962,
+              "p99_us": 460.524,
+              "min_us": 250.00199999999998,
+              "max_us": 560.684
+            },
+            "conn_rate": {
+              "duration_secs": 10.00336772,
+              "total_connections": 135706,
+              "connections_per_sec": 13566.031340493399,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 156.44113009004758,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 43122688,
+            "rss_load_bytes": 91123712,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.881378168,
+                "gbps": 0.7435627790589885
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.113767033,
+                "gbps": 1.474699265471747
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.52200467,
+                "gbps": 2.05695827203998
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 6.663595002418463,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 8.109504671,
+              "gbps": 1.0592428194434664
+            },
+            "parallel_cpu_secs_per_gb": 6.705522537231445,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 367.042,
+              "p95_us": 493.243,
+              "p99_us": 614.6850000000001,
+              "min_us": 297.482,
+              "max_us": 1265.4479999999999
+            },
+            "conn_rate": {
+              "duration_secs": 18.331983155,
+              "total_connections": 75631,
+              "connections_per_sec": 4125.631109331008,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 268.01179410559155,
+            "tun_tx_dropped": 112741
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 45723648,
+            "rss_load_bytes": 818020352,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 2.304907907,
+                "gbps": 0.2843324013118586
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.221282218,
+                "gbps": 0.7581818436038995
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 1.329121282,
+                "gbps": 0.8078584238635342
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 20.876452697450247,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.919962931,
+              "gbps": 1.7459348195239481
+            },
+            "parallel_cpu_secs_per_gb": 13.811513781547546,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 549.804,
+              "p95_us": 688.364,
+              "p99_us": 781.4060000000001,
+              "min_us": 413.083,
+              "max_us": 1178.888
+            },
+            "conn_rate": {
+              "duration_secs": 10.009440602,
+              "total_connections": 53356,
+              "connections_per_sec": 5330.567623263469,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 497.78843991303705,
+            "tun_tx_dropped": 23787
+          }
+        ]
+      }
+    ],
+    "mtu9000": [
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 15585280,
+            "rss_load_bytes": 26382336,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.07426423,
+                "gbps": 0.6100547534753158
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.035762649,
+                "gbps": 4.691267696640704
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.196891169,
+                "gbps": 5.453478840384151
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 5.229656837341072,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.676955701,
+              "gbps": 5.1223384057656745
+            },
+            "parallel_cpu_secs_per_gb": 3.557652235031128,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 316.922,
+              "p95_us": 402.443,
+              "p99_us": 486.083,
+              "min_us": 239.282,
+              "max_us": 818.525
+            },
+            "conn_rate": {
+              "duration_secs": 10.003626882,
+              "total_connections": 121477,
+              "connections_per_sec": 12143.295769915141,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 176.5766359063856,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 43765760,
+            "rss_load_bytes": 88584192,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.796928381,
+                "gbps": 0.8223574610025088
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.035510887000000005,
+                "gbps": 4.724527438585242
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.187365863,
+                "gbps": 5.730722805146208
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 3.205273545467109,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 4.309202404,
+              "gbps": 1.9933931587957967
+            },
+            "parallel_cpu_secs_per_gb": 2.5238841772079468,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 370.92199999999997,
+              "p95_us": 534.163,
+              "p99_us": 798.846,
+              "min_us": 291.60200000000003,
+              "max_us": 1826.452
+            },
+            "conn_rate": {
+              "duration_secs": 18.565526579,
+              "total_connections": 83612,
+              "connections_per_sec": 4503.615862669682,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 263.59852652729273,
+            "tun_tx_dropped": 16238
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 47190016,
+            "rss_load_bytes": 145326080,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.883124335,
+                "gbps": 0.3480173814439077
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.084987353,
+                "gbps": 1.974083838097652
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.542300051,
+                "gbps": 1.9799773612781757
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 8.645803642378388,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.6387484749999999,
+              "gbps": 5.241765117126959
+            },
+            "parallel_cpu_secs_per_gb": 3.967434167861938,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 622.884,
+              "p95_us": 845.926,
+              "p99_us": 1444.25,
+              "min_us": 412.042,
+              "max_us": 4197.829
+            },
+            "conn_rate": {
+              "duration_secs": 10.013354869,
+              "total_connections": 52912,
+              "connections_per_sec": 5284.143096117409,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 506.3123677048685,
+            "tun_tx_dropped": 0
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 16580608,
+            "rss_load_bytes": 27680768,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.076085043,
+                "gbps": 0.6090224971187523
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.040053198000000005,
+                "gbps": 4.188733194288256
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.194916755,
+                "gbps": 5.508719986642503
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 5.314006141169155,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.803087178,
+              "gbps": 4.7640151273928035
+            },
+            "parallel_cpu_secs_per_gb": 3.7718564271926875,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 324.362,
+              "p95_us": 401.203,
+              "p99_us": 457.683,
+              "min_us": 262.922,
+              "max_us": 709.365
+            },
+            "conn_rate": {
+              "duration_secs": 10.005719337,
+              "total_connections": 117409,
+              "connections_per_sec": 11734.18882197055,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 183.6315784990929,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 43651072,
+            "rss_load_bytes": 91226112,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.756779382,
+                "gbps": 0.8659855376451047
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.034259598,
+                "gbps": 4.8970848986611
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.180435815,
+                "gbps": 5.950824252934486
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 3.163098893553068,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 3.659440327,
+              "gbps": 2.3473356099351963
+            },
+            "parallel_cpu_secs_per_gb": 2.4214386940002437,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 372.80199999999996,
+              "p95_us": 494.56299999999993,
+              "p99_us": 691.6850000000001,
+              "min_us": 309.762,
+              "max_us": 1111.648
+            },
+            "conn_rate": {
+              "duration_secs": 18.943106164,
+              "total_connections": 86204,
+              "connections_per_sec": 4550.679242025495,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 265.764929701638,
+            "tun_tx_dropped": 15451
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 45473792,
+            "rss_load_bytes": 153690112,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.858756445,
+                "gbps": 0.35257981311263187
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.08187364800000001,
+                "gbps": 2.049159456043781
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.535415244,
+                "gbps": 2.0054375291563424
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 8.434930382808181,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.5588490400000001,
+              "gbps": 5.510433898076493
+            },
+            "parallel_cpu_secs_per_gb": 3.8556754589080815,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 541.124,
+              "p95_us": 761.125,
+              "p99_us": 1321.45,
+              "min_us": 401.283,
+              "max_us": 3361.383
+            },
+            "conn_rate": {
+              "duration_secs": 10.006422262,
+              "total_connections": 53067,
+              "connections_per_sec": 5303.294085591929,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 496.91898920232916,
+            "tun_tx_dropped": 0
+          }
+        ]
+      },
+      {
+        "meta": {
+          "meow_version": "0.26.1",
+          "tested_version": "Meow Meta 0.26.1",
+          "git_sha": "7c73b6f4297f3ad1dc9e1e76c7184d1c5ef9a85d",
+          "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) (Red Hat 1.92.0-1.el9)",
+          "mihomo_version": "v1.19.30",
+          "platform": "linux-aarch64",
+          "duration_secs": 10
+        },
+        "mtu": 9000,
+        "targets": [
+          {
+            "target": "meow (lwip)",
+            "rss_idle_bytes": 17113088,
+            "rss_load_bytes": 26034176,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.112241134,
+                "gbps": 0.5892247462949881
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.036444213,
+                "gbps": 4.603533625489456
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.185389489,
+                "gbps": 5.791816082949557
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 5.145307533512991,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.371192695,
+              "gbps": 6.264571437204164
+            },
+            "parallel_cpu_secs_per_gb": 2.924352884292602,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 314.002,
+              "p95_us": 395.083,
+              "p99_us": 516.484,
+              "min_us": 228.682,
+              "max_us": 1471.41
+            },
+            "conn_rate": {
+              "duration_secs": 10.002781156,
+              "total_connections": 133297,
+              "connections_per_sec": 13325.993833229477,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 154.3920718395763,
+            "tun_tx_dropped": 0
+          },
+          {
+            "target": "mihomo (system)",
+            "rss_idle_bytes": 44261376,
+            "rss_load_bytes": 88977408,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 0.820964509,
+                "gbps": 0.798280550274068
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.035209165,
+                "gbps": 4.765013882038952
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.194972995,
+                "gbps": 5.507130995243726
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 3.2474481973811495,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 5.248129574,
+              "gbps": 1.6367611490683822
+            },
+            "parallel_cpu_secs_per_gb": 2.346932888031006,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 367.72200000000004,
+              "p95_us": 522.924,
+              "p99_us": 850.686,
+              "min_us": 294.682,
+              "max_us": 1421.89
+            },
+            "conn_rate": {
+              "duration_secs": 18.997393022,
+              "total_connections": 86594,
+              "connections_per_sec": 4558.204375711946,
+              "echo_timeouts": 1
+            },
+            "connrate_cpu_us_per_conn": 263.7596138300575,
+            "tun_tx_dropped": 12625
+          },
+          {
+            "target": "mihomo (gvisor)",
+            "rss_idle_bytes": 45539328,
+            "rss_load_bytes": 134246400,
+            "throughput": [
+              {
+                "label": "4 KB x 10000",
+                "total_bytes": 81920000,
+                "elapsed_secs": 1.8747160360000001,
+                "gbps": 0.34957827607764697
+              },
+              {
+                "label": "1 MB x 10",
+                "total_bytes": 20971520,
+                "elapsed_secs": 0.084427428,
+                "gbps": 1.987176015832201
+              },
+              {
+                "label": "64 MB x 1",
+                "total_bytes": 134217728,
+                "elapsed_secs": 0.538927627,
+                "gbps": 1.9923673795999328
+              }
+            ],
+            "throughput_cpu_secs_per_gb": 8.561454338550305,
+            "parallel": {
+              "label": "16 MB x 32 parallel",
+              "total_bytes": 1073741824,
+              "elapsed_secs": 1.642654062,
+              "gbps": 5.22930225585136
+            },
+            "parallel_cpu_secs_per_gb": 3.93018126487732,
+            "latency": {
+              "iterations": 1000,
+              "p50_us": 534.443,
+              "p95_us": 664.404,
+              "p99_us": 765.3249999999999,
+              "min_us": 409.803,
+              "max_us": 2790.739
+            },
+            "conn_rate": {
+              "duration_secs": 10.008523236,
+              "total_connections": 52834,
+              "connections_per_sec": 5278.900668378285,
+              "echo_timeouts": 0
+            },
+            "connrate_cpu_us_per_conn": 497.2177007230192,
+            "tun_tx_dropped": 0
+          }
+        ]
+      }
+    ]
+  }
+}
