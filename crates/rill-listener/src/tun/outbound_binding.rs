@@ -80,10 +80,7 @@ impl OutboundBinding {
                  refusing to install default routes without loop avoidance"
             ))
         })?;
-        info!(
-            "tun: global route scope — outbound sockets bound to '{iface}' \
-             (experimental, #375)"
-        );
+        info!("tun: global route scope — outbound sockets bound to '{iface}'");
         Ok(Self(guard))
     }
 
@@ -170,6 +167,10 @@ mod tests {
                 route_scope: super::super::TunRouteScope::Global,
                 outbound_interface: Some(LO.into()),
                 dns_hijack: false,
+                dns_hijack_tcp: false,
+                strict_route: false,
+                route_address: Vec::new(),
+                route_exclude_address: Vec::new(),
                 udp_timeout: std::time::Duration::from_secs(60),
                 max_connections: 0,
             },

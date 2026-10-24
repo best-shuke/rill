@@ -1708,8 +1708,12 @@ async fn publish_tun_if_committed(
     let still_current = {
         let committed = raw_config.read();
         committed.tun.as_ref().is_some_and(|t| t.enable)
-            && rill_config::parse_tun_config(committed.tun.as_ref(), committed.max_connections)
-                .is_ok_and(|c| c == *startup_tun)
+            && rill_config::parse_tun_config(
+                committed.tun.as_ref(),
+                committed.max_connections,
+                rill_config::effective_ipv6(committed.ipv6),
+            )
+            .is_ok_and(|c| c == *startup_tun)
     };
     if !still_current {
         warn!(
@@ -1937,7 +1941,12 @@ mod tests {
 
         fn startup_tun(raw: &RwLock<RawConfig>) -> rill_config::TunConfig {
             let guard = raw.read();
-            rill_config::parse_tun_config(guard.tun.as_ref(), guard.max_connections).unwrap()
+            rill_config::parse_tun_config(
+                guard.tun.as_ref(),
+                guard.max_connections,
+                rill_config::effective_ipv6(guard.ipv6),
+            )
+            .unwrap()
         }
 
         /// A pending listener task plus a drop signal proving teardown.
@@ -2184,8 +2193,6 @@ mod tests {
             for yaml in [
                 "port: 7890\n",
                 "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: false\n",
                 // Rejected later by `build_config`; never pre-installs.
@@ -2205,12 +2212,22 @@ mod tests {
             assert!(preinstall_global_route_binding(&raw(missing)).is_none());
             assert!(rill_common::outbound_interface().is_none());
 
-            let global = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n";
-            let binding = preinstall_global_route_binding(&raw(global))
-                .expect("global route scope pre-installs the binding");
-            assert_eq!(rill_common::outbound_interface().as_deref(), Some(LO));
-            drop(binding);
-            assert!(rill_common::outbound_interface().is_none());
+            // `global`, mihomo's `true`, and the default all route everything.
+            for global in [
+                "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  outbound-interface: LO\n",
+            ] {
+                let binding = preinstall_global_route_binding(&raw(global))
+                    .expect("global route scope pre-installs the binding");
+                assert_eq!(
+                    rill_common::outbound_interface().as_deref(),
+                    Some(LO),
+                    "{global}"
+                );
+                drop(binding);
+                assert!(rill_common::outbound_interface().is_none(), "{global}");
+            }
         }
     }
 }

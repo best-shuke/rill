@@ -7,9 +7,11 @@
 //! subnet's own on-link route frequently already covers the range (in which
 //! case some platforms report "route exists").
 
+use std::net::IpAddr;
+
 use ipnet::IpNet;
-use route_manager::{Route, RouteManager};
-use tracing::{debug, warn};
+use route_manager::{Route, RouteKind, RouteManager};
+use tracing::{debug, info, warn};
 
 pub(super) struct RouteGuard {
     manager: RouteManager,
@@ -21,23 +23,206 @@ impl RouteGuard {
     /// Individual failures are logged and skipped so a pre-existing
     /// equivalent route does not abort listener startup.
     pub(super) fn setup(if_index: u32, nets: &[IpNet]) -> std::io::Result<Self> {
+        let routes = nets
+            .iter()
+            .map(|net| Route::new(net.network(), net.prefix_len()).with_if_index(if_index))
+            .collect();
+        Self::install(routes, false)
+    }
+
+    /// Install `routes` as given — the global scope's exclusions through
+    /// the physical gateway and strict-route's unreachable routes, which no
+    /// device owns. With `replace_stale`, an identical route a crashed
+    /// predecessor left behind is deleted first: nothing else would ever
+    /// remove it, and the add would fail on it.
+    pub(super) fn install(routes: Vec<Route>, replace_stale: bool) -> std::io::Result<Self> {
         let mut manager = RouteManager::new()?;
-        let mut installed = Vec::with_capacity(nets.len());
-        for net in nets {
-            let route = Route::new(net.network(), net.prefix_len()).with_if_index(if_index);
+        let mut installed = Vec::with_capacity(routes.len());
+        for route in routes {
+            if replace_stale && manager.delete(&route).is_ok() {
+                debug!("tun auto-route: removed a stale {route}");
+            }
             match manager.add(&route) {
                 Ok(()) => {
-                    debug!("tun auto-route: added {net} via if_index {if_index}");
+                    debug!("tun auto-route: added {route}");
                     installed.push(route);
                 }
                 Err(e) => warn!(
-                    "tun auto-route: failed to add {net} via if_index {if_index}: {e} \
-                     (continuing — the device subnet may already cover it)"
+                    "tun auto-route: failed to add {route}: {e} \
+                     (continuing — an equivalent route may already exist)"
                 ),
             }
         }
         Ok(Self { manager, installed })
     }
+}
+
+/// The physical default route of one family, as `(gateway, if_index)`: the
+/// unscoped `/0` with the lowest metric that does not go through the TUN
+/// (`tun_index`). `None` when the host has no such default — offline, or
+/// no IPv6 uplink.
+pub(super) fn default_route(
+    v6: bool,
+    tun_index: u32,
+) -> std::io::Result<Option<(Option<IpAddr>, u32)>> {
+    let routes = RouteManager::new()?.list()?;
+    Ok(routes
+        .iter()
+        .filter(|r| {
+            r.prefix() == 0
+                && r.destination().is_ipv6() == v6
+                && r.destination().is_unspecified()
+                && r.kind() == RouteKind::Unicast
+                && !if_scoped(r)
+                && main_table(r)
+        })
+        .filter_map(|r| {
+            let index = r.if_index().filter(|&i| i != tun_index)?;
+            Some((r.metric().unwrap_or(0), r.gateway(), index))
+        })
+        .min_by_key(|(metric, _, _)| *metric)
+        .map(|(_, gateway, index)| (gateway, index)))
+}
+
+/// macOS `RTF_IFSCOPE`: a default only sockets scoped to its interface use
+/// (every non-primary interface has one).
+#[cfg(target_os = "macos")]
+fn if_scoped(route: &Route) -> bool {
+    route.if_scope()
+}
+#[cfg(not(target_os = "macos"))]
+fn if_scoped(_route: &Route) -> bool {
+    false
+}
+
+/// Linux lists every routing table; only `main` holds the default route
+/// the host actually uses.
+#[cfg(target_os = "linux")]
+fn main_table(route: &Route) -> bool {
+    const RT_TABLE_MAIN: u8 = 254;
+    route.table() == RT_TABLE_MAIN
+}
+#[cfg(not(target_os = "linux"))]
+fn main_table(_route: &Route) -> bool {
+    true
+}
+
+/// `route-exclude-address` under global scope: each prefix through the
+/// physical default of its family, more specific than the TUN's split
+/// routes so it keeps bypassing the device. A family without a physical
+/// default has nothing to route its exclusions through and is skipped.
+pub(super) fn exclusion_routes(nets: &[IpNet], tun_index: u32) -> std::io::Result<Vec<Route>> {
+    let mut routes = Vec::with_capacity(nets.len());
+    for v6 in [false, true] {
+        let family: Vec<&IpNet> = nets
+            .iter()
+            .filter(|n| matches!(n, IpNet::V6(_)) == v6)
+            .collect();
+        if family.is_empty() {
+            continue;
+        }
+        let Some((gateway, if_index)) = default_route(v6, tun_index)? else {
+            warn!(
+                "tun route-exclude-address: no physical IPv{} default route — {} \
+                 exclusion(s) not installed",
+                if v6 { 6 } else { 4 },
+                family.len()
+            );
+            continue;
+        };
+        for net in family {
+            let mut route = Route::new(net.network(), net.prefix_len()).with_if_index(if_index);
+            if let Some(gateway) = gateway {
+                route = route.with_gateway(gateway);
+            }
+            routes.push(route);
+        }
+    }
+    Ok(routes)
+}
+
+/// Global scope's return traffic under strict reverse-path filtering.
+///
+/// A reply to a dial bound to the physical interface arrives on that
+/// interface, but the kernel's reverse-path lookup for its source picks the
+/// TUN's split route — so with `rp_filter = 1` (strict; the default for new
+/// interfaces on RHEL-family hosts) every such reply is dropped and DIRECT
+/// dials time out. While global scope binds outbound sockets to an
+/// interface, its filter is loosened to `2` (any route back suffices — the
+/// systemd and Ubuntu default) and restored on drop. The effective value is
+/// the larger of `all` and the interface's own, so only the interface is
+/// touched. IPv6 has no such filter.
+pub(super) struct RpFilterGuard {
+    #[cfg(target_os = "linux")]
+    iface: String,
+    #[cfg(target_os = "linux")]
+    previous: String,
+}
+
+impl RpFilterGuard {
+    /// Loosen `iface` if its effective filter is strict; `None` when there
+    /// is nothing to do (already loose or off, not Linux, or unreadable).
+    #[cfg(target_os = "linux")]
+    pub(super) fn loosen(iface: &str) -> Option<Self> {
+        let path = |name: &str| format!("/proc/sys/net/ipv4/conf/{name}/rp_filter");
+        let read = |name: &str| -> Option<u8> {
+            std::fs::read_to_string(path(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let own = read(iface)?;
+        if read("all").unwrap_or(0).max(own) != 1 {
+            return None;
+        }
+        if let Err(e) = std::fs::write(path(iface), "2") {
+            warn!(
+                "tun: rp_filter on '{iface}' is strict and could not be loosened ({e}); \
+                 replies to DIRECT dials may be dropped"
+            );
+            return None;
+        }
+        info!("tun: rp_filter on '{iface}' loosened from 1 to 2 for return traffic");
+        Some(Self {
+            iface: iface.to_owned(),
+            previous: own.to_string(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn loosen(_iface: &str) -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RpFilterGuard {
+    fn drop(&mut self) {
+        // The interface may be gone by now (unplugged); nothing to restore then.
+        let path = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", self.iface);
+        if std::fs::write(&path, &self.previous).is_ok() {
+            debug!(
+                "tun: rp_filter on '{}' restored to {}",
+                self.iface, self.previous
+            );
+        }
+    }
+}
+
+/// strict-route without IPv6 in the device: all global IPv6 unreachable,
+/// as mihomo does on Linux, so it cannot leave by the physical interface
+/// and bypass the proxy. Two `/1`s outrank the physical `::/0` the same
+/// way the split routes do; on-link prefixes (the LAN, link-local) stay
+/// reachable, as their IPv4 counterparts do.
+pub(super) fn strict_ipv6_routes() -> Vec<Route> {
+    ["::/1", "8000::/1"]
+        .into_iter()
+        .map(|cidr| {
+            let net: IpNet = cidr.parse().expect("static CIDR parses");
+            Route::new(net.network(), net.prefix_len()).with_kind(RouteKind::Unreachable)
+        })
+        .collect()
 }
 
 impl Drop for RouteGuard {

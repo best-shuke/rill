@@ -787,7 +787,7 @@ struct TunFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inet4_address: Option<String>,
+    inet4_address: Option<serde_yaml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inet6_address: Option<serde_yaml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -874,7 +874,11 @@ async fn update_configs(
             let raw = state.raw_config.read();
             let mut tun = raw.tun.clone().unwrap_or_default();
             patch.merge_into(&mut tun);
-            if let Err(e) = rill_config::parse_tun_config(Some(&tun), raw.max_connections) {
+            if let Err(e) = rill_config::parse_tun_config(
+                Some(&tun),
+                raw.max_connections,
+                rill_config::effective_ipv6(raw.ipv6),
+            ) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "message": format!("tun config error: {e}") })),
@@ -2865,7 +2869,11 @@ async fn spawn_tun_from_raw(
     raw: &RawConfig,
     binding: Option<OutboundBinding>,
 ) -> Result<Option<rill_tunnel::TunHandle>, String> {
-    let tun_cfg = match rill_config::parse_tun_config(raw.tun.as_ref(), raw.max_connections) {
+    let tun_cfg = match rill_config::parse_tun_config(
+        raw.tun.as_ref(),
+        raw.max_connections,
+        rill_config::effective_ipv6(raw.ipv6),
+    ) {
         Ok(c) => c,
         Err(e) => {
             return Err(format!("tun config parse error: {e}"));
@@ -3015,26 +3023,33 @@ async fn swap_config_and_reconcile_tun(
         // When either side fails to parse, fall back to the raw diff —
         // a broken candidate stays conservative: restart → spawn fails
         // → `enable` rolls back.
-        let tun_changed = if guard.tun == candidate.tun
-            && guard.max_connections == candidate.max_connections
-        {
-            // Fast path: identical raw sections cannot differ
-            // semantically — and skipping the parse avoids re-warn!ing
-            // on upstream-only fields (`stack:`, `strict-route:`, …) on
-            // every commit that never touched `tun:`.
-            false
-        } else {
-            match (
-                rill_config::parse_tun_config(guard.tun.as_ref(), guard.max_connections),
-                rill_config::parse_tun_config(candidate.tun.as_ref(), candidate.max_connections),
-            ) {
-                (Ok(o), Ok(n)) => o != n,
-                // Raw sections already known to differ — a broken
-                // candidate stays conservative: restart → spawn fails
-                // → `enable` rolls back.
-                _ => true,
-            }
-        };
+        let tun_changed =
+            if guard.tun == candidate.tun && guard.max_connections == candidate.max_connections {
+                // Fast path: identical raw sections cannot differ
+                // semantically — and skipping the parse avoids re-warn!ing
+                // on upstream-only fields (`stack:`, `strict-route:`, …) on
+                // every commit that never touched `tun:`.
+                false
+            } else {
+                match (
+                    rill_config::parse_tun_config(
+                        guard.tun.as_ref(),
+                        guard.max_connections,
+                        rill_config::effective_ipv6(guard.ipv6),
+                    ),
+                    rill_config::parse_tun_config(
+                        candidate.tun.as_ref(),
+                        candidate.max_connections,
+                        rill_config::effective_ipv6(candidate.ipv6),
+                    ),
+                ) {
+                    (Ok(o), Ok(n)) => o != n,
+                    // Raw sections already known to differ — a broken
+                    // candidate stays conservative: restart → spawn fails
+                    // → `enable` rolls back.
+                    _ => true,
+                }
+            };
         let snapshot = (new_enable && !old).then(|| candidate.clone());
         // Extract health-check specs straight from the candidate before it
         // is moved into the lock — no second read of `raw_config` and no
@@ -3518,9 +3533,11 @@ async fn put_configs(
     // `enable`.
     // Checked before `reconcile_dns_config` so a doomed PUT cannot trigger
     // that path's provider-registry side effects.
-    if let Err(e) =
-        rill_config::parse_tun_config(raw_config.tun.as_ref(), raw_config.max_connections)
-    {
+    if let Err(e) = rill_config::parse_tun_config(
+        raw_config.tun.as_ref(),
+        raw_config.max_connections,
+        rill_config::effective_ipv6(raw_config.ipv6),
+    ) {
         if force {
             tracing::error!("config reload forced despite tun config error: {e}");
             forced.push(format!("tun config error: {e}"));

@@ -16,22 +16,27 @@ other inbounds.
 
 ## Quick start
 
+The `tun:` section means what it means to mihomo: with `auto-route: true`
+(the default) every IPv4 flow — and IPv6 with `ipv6: true` — goes through
+the device, IP literals included.
+
 ```yaml
 # config.yaml
 mode: rule
 
 dns:
   enable: true
-  enhanced-mode: fake-ip          # REQUIRED for the v1 TUN flow (see below)
-  fake-ip-range: 198.18.0.1/16
+  enhanced-mode: fake-ip          # recommended: domain rules match on the name
   nameserver:
     - https://1.1.1.1/dns-query
 
 tun:
   enable: true
-  auto-route: true                # routes the fake-ip range into the device
+  auto-route: true                # route everything into the device
   dns-hijack:
     - any:53                      # answer DNS entering the tun in-process
+    - tcp://any:53                # ... over TCP too
+  strict-route: true              # without IPv6, IPv6 cannot bypass the proxy
 
 proxies:
   # ... your outbounds ...
@@ -48,18 +53,12 @@ Then:
    fetch a sidecar with `scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir .`.
    Run the shell elevated ("Run as administrator"). **Linux/macOS**: run as root
    or grant `CAP_NET_ADMIN`.
-2. Point the OS resolver at an address **inside the fake-ip range**, e.g.
-   `198.18.0.2`. On Windows:
+2. Start rill. DNS queries to any server enter the device and `dns-hijack`
+   answers them; rill leaves the OS resolver configuration alone, as mihomo
+   does.
 
-   ```
-   netsh interface ip set dns name="rill" static 198.18.0.2
-   ```
-
-   (The adapter is named after `tun.device`, default platform-chosen.) On
-   Linux/macOS set the DNS server for your active connection the same way.
-3. Start rill. DNS queries route into the tun (the range is on-link/routed),
-   `dns-hijack` answers them with fake IPs, connections to those fake IPs
-   route into the tun, and rules match on the recovered domain.
+The older, loop-free fake-IP-only scope is still there as
+`auto-route: fake-ip` (below).
 
 ## Windows: address setup, adapter reuse, and conflicts
 
@@ -89,7 +88,7 @@ address cannot send packets. Three consequences of how that is done:
   adapter is left as it was found — and the listener moves on to the
   next one.
 
-## How v1 stays loop-free (and what it doesn't capture)
+## Fake-IP scope — `auto-route: fake-ip`
 
 The classic TUN failure mode is the routing loop: with a global default
 route into the device, rill's *own* outbound dials (proxy upstreams and
@@ -139,22 +138,53 @@ Consequences:
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
 
-## Global route mode — `auto-route: global` (experimental)
+## Global routing — `auto-route: true` (the default)
 
-Tracked on [#375](https://github.com/madeye/meow-rs/issues/375). Routes
-**all IPv4 traffic** into the device instead of just the fake-ip range, so
-IP-literal connections are captured too — and all IPv6 traffic as well when
-the device is given an `inet6-address`:
+Tracked on [#375](https://github.com/madeye/meow-rs/issues/375). mihomo's
+`auto-route: true` (spelled `global` too): **all IPv4 traffic** goes into
+the device, so IP-literal connections are captured — and all IPv6 traffic
+as well with top-level `ipv6: true`, where the device gets mihomo's
+`fdfe:dcba:9876::1/126` unless `inet6-address` names another:
 
 ```yaml
 tun:
   enable: true
-  auto-route: global
-  # outbound-interface: eth0   # optional; auto-detected from the default route
-  # inet6-address: fdfe:dcba:9876::1/126   # optional; also capture IPv6
+  auto-route: true
+  # outbound-interface: eth0   # optional; auto-detected and followed
   dns-hijack:
     - any:53
+    - tcp://any:53
+  strict-route: true
+  # route-exclude-address: [192.168.0.0/16]
 ```
+
+What global routing does on top of the routes, matching mihomo:
+
+- **Follows the default route** (`auto-detect-interface`). Unless
+  `outbound-interface` pins one, the physical interface is re-detected
+  every 2 s; when the host moves (Wi-Fi to Ethernet, a dock), outbound
+  sockets bind to the new interface and `route-exclude-address` is
+  re-pointed at its gateway. Sockets bound to the old one go down with it.
+- **`strict-route`**: with IPv6 off, global IPv6 is made unreachable
+  (`unreachable ::/1` and `8000::/1`, Linux) so it cannot leave by the
+  physical interface. On-link prefixes (the LAN, link-local) stay
+  reachable. macOS has no strict routing, as in mihomo.
+- **`route-exclude-address`** keeps prefixes on the physical default route
+  (more specific routes through its gateway); **`route-address`** routes
+  only the listed prefixes into the device instead of everything. Both take
+  a CIDR or a list, and mihomo's legacy `inet4-`/`inet6-route-address` /
+  `-route-exclude-address` keys.
+- **DNS is left alone**: every query enters the device and is answered by
+  `dns-hijack` (UDP, and TCP with `tcp://…:53`), so rill never rewrites the
+  OS resolver in this scope.
+- **Strict reverse-path filtering** (`rp_filter = 1`, the default for new
+  interfaces on RHEL-family hosts) would drop the replies to rill's own
+  dials, which arrive on the physical interface while the reverse route
+  points at the TUN. rill loosens that one interface to `2` while it is
+  bound and restores it afterwards.
+
+`tests/tun-global/tun-e2e.sh` checks all of this against real routes in
+two network namespaces (Linux, root), using the `tun:` block FlowBar writes.
 
 Status per platform — "implemented" means the code path exists, compiles
 and is unit-tested; all three have been exercised with real routes (the
@@ -424,19 +454,24 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping rill: 
 |-------|---------|-------|
 | `enable` | `false` | Master switch. Requires a build with the `listener-tun` feature (included in `full`). |
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is reopened — or recreated, when the driver has orphaned it — and reconfigured either way (see *Windows: address setup, adapter reuse, and conflicts*). |
-| `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
-| `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
-| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
-| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental, see above); `false` = nothing. |
-| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
-| `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
+| `mtu` | `9000` | mihomo's default. Hard error below 1280 (userspace-stack minimum). |
+| `inet4-address` | `198.18.0.1/30` | CIDR assigned to the device — a string or mihomo's list form (first entry used). The default sits inside the default fake-IP range, whose pool never allocates its first four addresses. |
+| `inet6-address` | `fdfe:dcba:9876::1/126` with `ipv6: true` | IPv6 CIDR assigned to the device — a string, or mihomo's list form (only the first entry is used). Only used with top-level `ipv6: true` under global routing, which also routes IPv6 into the device; without IPv6 the device is IPv4-only. An invalid CIDR is a hard error. |
+| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`global` = all IPv4, plus all IPv6 with `ipv6: true` (see *Global routing*); `fake-ip` = only the fake-ip range; `false` = nothing. |
+| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to under global routing — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Pinning one stops rill following default-route moves. Ignored in fake-IP scope. |
+| `auto-detect-interface` | `true` | Accepted for mihomo compatibility: global routing always binds to the detected interface and follows it unless `outbound-interface` is set. |
+| `dns-hijack` | off | `any:53` / `udp://…:53` answer UDP :53 flows entering the device in-process; `tcp://…:53` answers TCP :53 flows. The host part is not matched. Other ports warn and are ignored. |
+| `strict-route` | `false` | Global routing without IPv6: make global IPv6 unreachable (Linux), so it cannot bypass the device. |
+| `route-address` | all | Global routing: route only these prefixes into the device. CIDR or list; also `inet4-route-address` / `inet6-route-address`. |
+| `route-exclude-address` | none | Global routing: keep these prefixes on the physical default route. CIDR or list; also `inet4-route-exclude-address` / `inet6-route-exclude-address`. |
+| `stack` | — | Accepted for mihomo compatibility; rill has one userspace stack (lwIP). |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
-mihomo fields rill does not implement (`stack`, `strict-route`,
-`auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
-UID filters, …) are accepted with a startup warning and ignored — same
-forward-compat policy as the rest of the config surface.
+mihomo fields rill does not implement (`mtu-v6`,
+`endpoint-independent-nat`, `auto-redirect`, UID filters, …) are accepted
+with a startup warning and ignored — same forward-compat policy as the rest
+of the config surface.
 
 Runtime reloads: `PUT /configs` reconciles the listener against the
 committed `tun:` section — an `enable` transition starts/stops it, and

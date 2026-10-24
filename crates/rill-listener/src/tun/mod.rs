@@ -20,11 +20,28 @@
 //! SSH) wait for the server's banner and would otherwise never get one
 //! (#695).
 //!
-//! ## Loop freedom (v1: fake-IP-scoped capture)
+//! ## Routing scopes and loop freedom
 //!
-//! The classic TUN failure mode is the routing loop: a global default route
-//! into the device makes rill's *own* outbound dials re-enter the tun. v1
-//! avoids the whole problem class by capturing only the fake-IP range:
+//! The classic TUN failure mode is the routing loop: a default route into
+//! the device makes rill's *own* outbound dials re-enter the tun.
+//!
+//! [`TunRouteScope::Global`] — mihomo's `auto-route: true`, the default —
+//! captures everything: `auto-route` installs split default routes
+//! (`0.0.0.0/1` + `128.0.0.0/1`, plus `::/1` + `8000::/1` when the device
+//! carries IPv6; on macOS an equivalent set that avoids the all-zero
+//! destination), and loop freedom comes from the outbound path — every
+//! socket rill creates is bound to the physical interface
+//! (`rill_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
+//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) before connect/bind,
+//! and hostname dials resolve through rill's own resolver hook. Startup
+//! fails closed if the binding cannot be installed. The binding follows
+//! default-route moves (`follow_default_interface`); `strict-route`,
+//! `route-exclude-address` and `route-address` shape the routes
+//! (`route.rs`), and DNS is answered by `dns-hijack` without touching the OS
+//! resolver.
+//!
+//! [`TunRouteScope::FakeIp`] (`auto-route: fake-ip`) avoids the problem
+//! class instead by capturing only the fake-IP range:
 //!
 //! 1. The OS resolver is pointed at an address inside the routed range, so
 //!    DNS queries enter the tun and `dns-hijack` answers them with fake IPs.
@@ -32,22 +49,9 @@
 //!    rewrite recovers the hostname and rules match on domain.
 //! 3. Outbound dials — proxy upstreams *and* DIRECT — go to real IPs, which
 //!    are never inside the fake range, so they take the physical route and
-//!    cannot loop. No SO_MARK, interface binding, or bypass routes needed.
+//!    cannot loop.
 //!
-//! The trade-off: IP-literal traffic (no DNS lookup) is not captured.
-//!
-//! ## Global route scope (#375, experimental)
-//!
-//! [`TunRouteScope::Global`] opts into capturing everything: `auto-route`
-//! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`, plus
-//! `::/1` + `8000::/1` when the device has an `inet6-address`; on macOS an
-//! equivalent set that avoids the all-zero destination), and loop
-//! freedom moves from route scoping to the outbound path — every socket
-//! rill creates is bound to the physical interface
-//! (`rill_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
-//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) before
-//! connect/bind, and hostname dials resolve through rill's own resolver
-//! hook. Startup fails closed if the binding cannot be installed.
+//! The trade-off there: IP-literal traffic (no DNS lookup) is not captured.
 //!
 //! On Windows the device is a Wintun adapter. `wintun.dll` is resolved next
 //! to the executable (official Windows zips ship it there), then the working
@@ -57,6 +61,7 @@
 
 mod device;
 mod dns;
+mod dns_tcp;
 #[cfg(target_os = "windows")]
 mod local_dns;
 mod outbound_binding;
@@ -221,6 +226,17 @@ pub struct TunListenerConfig {
     pub outbound_interface: Option<String>,
     /// Answer UDP :53 flows with the in-process DNS resolver.
     pub dns_hijack: bool,
+    /// Answer TCP :53 flows with it too (`dns-hijack: tcp://…:53`).
+    pub dns_hijack_tcp: bool,
+    /// mihomo `strict-route`: in global scope without IPv6 in the device,
+    /// make global IPv6 unreachable so it cannot bypass the TUN (Linux).
+    pub strict_route: bool,
+    /// Global scope: route only these prefixes into the device instead of
+    /// the split defaults (`route-address`). Empty = everything.
+    pub route_address: Vec<ipnet::IpNet>,
+    /// Global scope: prefixes kept on the physical default route
+    /// (`route-exclude-address`), re-pointed when the default route moves.
+    pub route_exclude_address: Vec<ipnet::IpNet>,
     /// Idle timeout for UDP flows (flow-table eviction).
     pub udp_timeout: Duration,
     /// Cap on concurrent TUN TCP handler tasks. Inherited from the
@@ -231,13 +247,14 @@ pub struct TunListenerConfig {
 /// Which routes `auto_route` installs (#375).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunRouteScope {
-    /// v1: route only the fake-IP range — loop-free by construction.
-    #[default]
+    /// rill's `auto-route: fake-ip`: route only the fake-IP range —
+    /// loop-free by construction.
     FakeIp,
-    /// Route all IPv4 (split defaults `0.0.0.0/1` + `128.0.0.0/1`) — and
-    /// all IPv6 (`::/1` + `8000::/1`) when the device has an IPv6 address —
-    /// into the device; outbound sockets bind to the physical interface
-    /// for loop avoidance. Experimental.
+    /// mihomo's `auto-route: true`: route all IPv4 (split defaults
+    /// `0.0.0.0/1` + `128.0.0.0/1`) — and all IPv6 (`::/1` + `8000::/1`)
+    /// when the device has an IPv6 address — into the device; outbound
+    /// sockets bind to the physical interface for loop avoidance.
+    #[default]
     Global,
 }
 
@@ -325,12 +342,25 @@ struct TunDevice {
     /// this field is dropped, before `device` is destroyed.
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
+    /// `route-exclude-address` routes through the physical gateway. No
+    /// device owns them, so they are removed here explicitly; the
+    /// default-route follower replaces them when the gateway changes.
+    exclude_guard: parking_lot::Mutex<Option<RouteGuard>>,
+    /// strict-route's unreachable IPv6 routes, likewise device-less.
+    #[allow(dead_code)]
+    strict_guard: Option<RouteGuard>,
     /// This listener's ownership of the process-global outbound-interface
     /// binding for global route scope, committed once the listener is up.
     /// Dropping it gives the ownership up (after `route_guard` has removed
     /// the routes it protects). A successor that already installed its own
-    /// binding keeps it; otherwise the binding is cleared.
-    iface_guard: Option<OutboundBinding>,
+    /// binding keeps it; otherwise the binding is cleared. The
+    /// default-route follower swaps in a new one when the host moves to
+    /// another interface.
+    iface_guard: parking_lot::Mutex<Option<OutboundBinding>>,
+    /// The bound interface's loosened reverse-path filter (Linux), moved
+    /// along with the binding.
+    #[allow(dead_code)]
+    rp_guard: parking_lot::Mutex<Option<route::RpFilterGuard>>,
     pub(super) device: tun_rs::AsyncDevice,
 }
 
@@ -609,7 +639,18 @@ impl TunListener {
                 // route survives untouched and restore-on-drop is trivial.
                 // The device's own /30 and the fake-IP range (if any) are
                 // inside the /1s already.
-                TunRouteScope::Global => Some(global_route_nets(cfg.inet6_address.is_some())),
+                // `route-address` narrows that to the given prefixes
+                // (IPv6 ones only when the device carries IPv6).
+                TunRouteScope::Global if cfg.route_address.is_empty() => {
+                    Some(global_route_nets(cfg.inet6_address.is_some()))
+                }
+                TunRouteScope::Global => Some(
+                    cfg.route_address
+                        .iter()
+                        .filter(|n| cfg.inet6_address.is_some() || matches!(n, ipnet::IpNet::V4(_)))
+                        .copied()
+                        .collect(),
+                ),
                 TunRouteScope::FakeIp => self.tunnel.resolver().fake_ip_v4_net().map(|n| vec![n]),
             }
         } else {
@@ -645,10 +686,10 @@ impl TunListener {
                 }
                 None => {
                     warn!(
-                        "tun '{}': auto-route currently only routes the fake-IP range, but \
-                         DNS is not in fake-ip mode — no routes installed. Add routes to \
-                         '{dev_name}' manually (and make sure outbound traffic cannot loop \
-                         back into the device).",
+                        "tun '{}': auto-route: fake-ip only routes the fake-IP range, but \
+                         DNS is not in fake-ip mode — no routes installed. Use auto-route: \
+                         true to route everything, or add routes to '{dev_name}' manually \
+                         (and make sure outbound traffic cannot loop back into the device).",
                         self.name
                     );
                     None
@@ -663,9 +704,54 @@ impl TunListener {
         // is dropped (routes deleted) **before** `device` (adapter destroyed)
         // when the last `Arc` clone goes away — ensuring route deletion always
         // succeeds because the adapter is still alive.
+        // Global scope's device-less routes: exclusions through the
+        // physical gateway, and strict-route's IPv6 block (Linux, as in
+        // mihomo; macOS has no strict routing there, and Windows blocks with
+        // filters rather than routes).
+        let global = cfg.auto_route && cfg.route_scope == TunRouteScope::Global;
+        let exclude_guard = if global && !cfg.route_exclude_address.is_empty() {
+            let nets = cfg.route_exclude_address.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    RouteGuard::install(route::exclusion_routes(&nets, if_index)?, true)
+                })
+                .await
+                .map_err(|join_err| {
+                    io::Error::other(format!("route-exclude-address task panicked: {join_err}"))
+                })?
+                .map_err(|e| io::Error::other(format!("route-exclude-address: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let strict_guard = if global
+            && cfg.strict_route
+            && cfg.inet6_address.is_none()
+            && cfg!(target_os = "linux")
+        {
+            let guard = tokio::task::spawn_blocking(|| {
+                RouteGuard::install(route::strict_ipv6_routes(), true)
+            })
+            .await
+            .map_err(|join_err| {
+                io::Error::other(format!("strict-route task panicked: {join_err}"))
+            })?
+            .map_err(|e| io::Error::other(format!("strict-route: {e}")))?;
+            info!("tun strict-route: IPv6 is unreachable while the device carries IPv4 only");
+            Some(guard)
+        } else {
+            None
+        };
+
+        let rp_guard = iface_guard
+            .as_ref()
+            .and_then(|binding| route::RpFilterGuard::loosen(binding.interface()));
         let device = Arc::new(TunDevice {
             route_guard,
-            iface_guard,
+            exclude_guard: parking_lot::Mutex::new(exclude_guard),
+            strict_guard,
+            iface_guard: parking_lot::Mutex::new(iface_guard),
+            rp_guard: parking_lot::Mutex::new(rp_guard),
             device,
         });
 
@@ -676,6 +762,7 @@ impl TunListener {
         #[cfg(target_os = "windows")]
         let local_dns_sockets = if cfg.dns_hijack
             && cfg.auto_route
+            && cfg.route_scope == TunRouteScope::FakeIp
             && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
         {
             Some(local_dns::bind().await.map_err(|e| {
@@ -691,28 +778,33 @@ impl TunListener {
         // which can take tens of seconds on Windows, so run them on a
         // blocking thread. The outer TUN_STARTUP_TIMEOUT guards the overall
         // startup.
-        let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
-            let t_dns = Instant::now();
-            let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
-                Some(gateway) => {
-                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(gateway))
-                        .await
-                        .map_err(|join_err| {
-                            Box::new(io::Error::other(format!(
-                                "dns-guard spawn_blocking panicked: {join_err}"
-                            )))
-                        })?;
-                    let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
-                    let dns_active = g.is_some();
-                    info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");
-                    g
-                }
-                None => None,
+        // Only fake-IP scope needs this: under global scope every DNS query
+        // already enters the device and dns-hijack answers it, so the OS
+        // resolver is left alone — as mihomo does (and as FlowBar expects,
+        // since it manages macOS DNS itself).
+        let _dns_guard =
+            if cfg.dns_hijack && cfg.auto_route && cfg.route_scope == TunRouteScope::FakeIp {
+                let t_dns = Instant::now();
+                let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
+                    Some(gateway) => {
+                        let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(gateway))
+                            .await
+                            .map_err(|join_err| {
+                                Box::new(io::Error::other(format!(
+                                    "dns-guard spawn_blocking panicked: {join_err}"
+                                )))
+                            })?;
+                        let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
+                        let dns_active = g.is_some();
+                        info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");
+                        g
+                    }
+                    None => None,
+                };
+                guard
+            } else {
+                None
             };
-            guard
-        } else {
-            None
-        };
 
         // lwIP answers ICMP echo itself. The core task is spawned inside
         // `NetStack::new` (one live stack per process — await `core_done`
@@ -786,8 +878,18 @@ impl TunListener {
         };
         // Nothing past here fails: the listener is up, and its binding is
         // the running one.
-        if let Some(binding) = &device.iface_guard {
+        if let Some(binding) = device.iface_guard.lock().as_ref() {
             binding.commit();
+        }
+        // mihomo's auto-detect-interface: an auto-detected binding follows
+        // the default route. Weak, so it never extends the device's life
+        // past the pumps (teardown order, see `device::PumpEnd`).
+        if global && cfg.outbound_interface.is_none() {
+            tasks.spawn(follow_default_interface(
+                Arc::downgrade(&device),
+                if_index,
+                cfg.route_exclude_address.clone(),
+            ));
         }
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
@@ -843,11 +945,19 @@ impl TunListener {
             None
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
+        let dns_hijack_tcp = cfg.dns_hijack_tcp;
 
         let result = loop {
             tokio::select! {
                 accepted = tcp_listener.next() => match accepted {
                     Some((stream, src, dst)) => {
+                        // `dns-hijack: tcp://…:53`, ahead of the loop guard
+                        // as on the UDP path: DNS aimed at the device's own
+                        // address is answered too.
+                        if dns_hijack_tcp && dst.port() == 53 {
+                            tasks.spawn(dns_tcp::serve(stream, self.tunnel.resolver(), src));
+                            continue;
+                        }
                         // Same loop guard as the UDP path: a dial to the
                         // TUN's own subnet routes back into the device.
                         if udp::is_looping_dst(dst.ip(), tun_net) {
@@ -1013,6 +1123,77 @@ fn global_route_nets_for(ipv6: bool, zero_key_shadows_default: bool) -> Vec<ipne
         .collect()
 }
 
+/// How often global scope re-checks the default route for an interface
+/// change.
+const DEFAULT_ROUTE_POLL: Duration = Duration::from_secs(2);
+
+/// mihomo's `auto-detect-interface` for global scope: re-detect the
+/// physical default interface every [`DEFAULT_ROUTE_POLL`] and, when the
+/// host moved to another one (Wi-Fi to Ethernet, a dock, a new adapter),
+/// bind outbound sockets there and re-point `route-exclude-address` at the
+/// new gateway. Sockets already bound to the old interface go down with
+/// it; new dials take the new one. With no default route at all (offline,
+/// mid-switch) the current binding stays until one appears.
+async fn follow_default_interface(
+    device: std::sync::Weak<TunDevice>,
+    tun_index: u32,
+    exclude: Vec<ipnet::IpNet>,
+) {
+    let mut tick = tokio::time::interval(DEFAULT_ROUTE_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let Ok(Ok(detected)) = tokio::task::spawn_blocking(route::default_interface).await else {
+            continue;
+        };
+        let Some(dev) = device.upgrade() else {
+            return;
+        };
+        let current = dev
+            .iface_guard
+            .lock()
+            .as_ref()
+            .map(|b| b.interface().to_owned());
+        if current.as_deref() == Some(detected.as_str()) {
+            continue;
+        }
+        let binding = match OutboundBinding::install(Some(&detected)) {
+            Ok(binding) => binding,
+            Err(e) => {
+                warn!("tun: default route moved to '{detected}' but re-binding failed: {e}");
+                continue;
+            }
+        };
+        binding.commit();
+        drop(dev.iface_guard.lock().replace(binding));
+        // Restore the old interface's filter, loosen the new one's.
+        *dev.rp_guard.lock() = route::RpFilterGuard::loosen(&detected);
+        info!(
+            "tun: default route moved from '{}' to '{detected}' — outbound sockets now bind there",
+            current.as_deref().unwrap_or("none")
+        );
+        if exclude.is_empty() {
+            continue;
+        }
+        let stale = dev.exclude_guard.lock().take();
+        let nets = exclude.clone();
+        // Route edits block (PowerShell on Windows): off the runtime.
+        let fresh = tokio::task::spawn_blocking(move || {
+            drop(stale);
+            RouteGuard::install(route::exclusion_routes(&nets, tun_index)?, true)
+        })
+        .await;
+        match fresh {
+            Ok(Ok(guard)) => *dev.exclude_guard.lock() = Some(guard),
+            Ok(Err(e)) => warn!("tun route-exclude-address: re-routing after the move failed: {e}"),
+            Err(join_err) => {
+                warn!("tun route-exclude-address: re-routing task panicked: {join_err}");
+            }
+        }
+    }
+}
+
 /// Device name to try on creation `attempt` (0-based).
 ///
 /// macOS only accepts `utunN` device names and picks one itself when none is
@@ -1022,7 +1203,9 @@ fn global_route_nets_for(ipv6: bool, zero_key_shadows_default: bool) -> Vec<ipne
 /// adapters from unclean shutdowns (common with wintun).
 fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<String> {
     if cfg!(target_os = "macos") {
-        configured.map(str::to_string)
+        // A bare `utun` is mihomo's "pick the next free one", which tun-rs
+        // spells as no name at all (it parses the digits after `utun`).
+        configured.filter(|n| *n != "utun").map(str::to_string)
     } else {
         let base = configured.unwrap_or("rill-tun");
         Some(if attempt == 0 {

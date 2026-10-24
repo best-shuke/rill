@@ -287,8 +287,9 @@ pub struct TunConfig {
     /// Address + prefix assigned to the device.
     pub inet4_address: ipnet::Ipv4Net,
     /// IPv6 address + prefix assigned to the device (`inet6-address`).
-    /// Only ever `Some` in global route mode, where it also adds the IPv6
-    /// split default routes (#375); `None` = the device is IPv4-only.
+    /// Only ever `Some` with top-level `ipv6: true` in global route mode,
+    /// where it also routes IPv6 into the device (mihomo: no IPv6 means the
+    /// TUN carries IPv4 only); `None` = the device is IPv4-only.
     pub inet6_address: Option<ipnet::Ipv6Net>,
     pub auto_route: bool,
     /// Which routes `auto-route` installs (#375). Only meaningful when
@@ -297,8 +298,22 @@ pub struct TunConfig {
     /// Physical interface outbound sockets bind to in global mode; `None`
     /// = auto-detect from the default route at listener startup.
     pub outbound_interface: Option<String>,
-    /// True when `dns-hijack` contains at least one usable (`:53`) entry.
+    /// True when `dns-hijack` has a usable UDP :53 entry (`any:53`,
+    /// `udp://any:53`).
     pub dns_hijack: bool,
+    /// True when `dns-hijack` has a `tcp://…:53` entry: TCP :53 flows are
+    /// answered in-process too.
+    pub dns_hijack_tcp: bool,
+    /// mihomo `strict-route`: with no IPv6 routed into the device, IPv6 is
+    /// made unreachable so it cannot bypass the TUN.
+    pub strict_route: bool,
+    /// `route-address` (+ legacy per-family keys): when non-empty, global
+    /// scope routes only these prefixes into the device instead of the
+    /// split default routes.
+    pub route_address: Vec<ipnet::IpNet>,
+    /// `route-exclude-address` (+ legacy per-family keys): prefixes global
+    /// scope keeps on the physical default route.
+    pub route_exclude_address: Vec<ipnet::IpNet>,
     pub udp_timeout: std::time::Duration,
     /// Cap on concurrent TUN TCP flows. Inherited from the top-level
     /// `max-connections` key (default 256; `0` = unlimited). The accept
@@ -310,14 +325,14 @@ pub struct TunConfig {
 /// Scope of the routes `tun.auto-route` installs (#375).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunRouteMode {
-    /// v1 behavior: route only the fake-IP range into the device. Loop-free
-    /// by construction; IP-literal traffic is not captured.
-    #[default]
+    /// rill's `auto-route: fake-ip`: route only the fake-IP range into the
+    /// device. Loop-free by construction; IP-literal traffic is not
+    /// captured.
     FakeIp,
-    /// Route all IPv4 traffic — and all IPv6 traffic when `inet6-address`
-    /// is set — into the device (split default routes) and bind outbound
-    /// sockets to the physical interface for loop avoidance. Experimental;
-    /// Linux, macOS and Windows.
+    /// mihomo's `auto-route: true`: route all IPv4 traffic — and all IPv6
+    /// with `ipv6: true` — into the device and bind outbound sockets to the
+    /// physical interface for loop avoidance. Linux, macOS and Windows.
+    #[default]
     Global,
 }
 
@@ -326,14 +341,20 @@ impl Default for TunConfig {
         Self {
             enable: false,
             device: None,
-            mtu: 1500,
-            // mihomo's default TUN subnet.
-            inet4_address: "172.19.0.1/30".parse().expect("static CIDR parses"),
+            // mihomo's defaults. The device subnet sits inside the default
+            // fake-IP range, whose pool never allocates its first four
+            // addresses.
+            mtu: 9000,
+            inet4_address: "198.18.0.1/30".parse().expect("static CIDR parses"),
             inet6_address: None,
             auto_route: true,
-            route_mode: TunRouteMode::FakeIp,
+            route_mode: TunRouteMode::Global,
             outbound_interface: None,
             dns_hijack: false,
+            dns_hijack_tcp: false,
+            strict_route: false,
+            route_address: Vec::new(),
+            route_exclude_address: Vec::new(),
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: 256,
         }
@@ -344,11 +365,15 @@ impl Default for TunConfig {
 /// smaller values break v6 traffic through the userspace stack.
 const TUN_MIN_MTU: u16 = 1280;
 
+/// mihomo's TUN IPv6 address, used when `ipv6: true` and none is given.
+const DEFAULT_TUN_INET6: &str = "fdfe:dcba:9876::1/126";
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent.
 pub fn parse_tun_config(
     raw: Option<&raw::RawTun>,
     global_max_connections: Option<usize>,
+    ipv6: bool,
 ) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
         // Keep the global-cap folding symmetric with the `Some` arm: an
@@ -363,14 +388,9 @@ pub fn parse_tun_config(
     // Warn on upstream-only fields (Class B per ADR-0002; policy of #328:
     // never silently ignore a mihomo flag).
     for (name, val) in [
-        ("stack", &r.stack),
-        ("strict-route", &r.strict_route),
-        ("auto-detect-interface", &r.auto_detect_interface),
         ("auto-redirect", &r.auto_redirect),
         ("endpoint-independent-nat", &r.endpoint_independent_nat),
         ("mtu-v6", &r.mtu_v6),
-        ("route-address", &r.route_address),
-        ("route-exclude-address", &r.route_exclude_address),
         ("include-uid", &r.include_uid),
         ("exclude-uid", &r.exclude_uid),
     ] {
@@ -391,22 +411,37 @@ pub fn parse_tun_config(
         ));
     }
 
-    let inet4_address = match r.inet4_address.as_deref() {
+    let inet4_address = match first_cidr("inet4-address", r.inet4_address.as_ref())? {
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
         None => defaults.inet4_address,
     };
 
-    // v1 hijacks all UDP :53 flows when any usable entry is present.
+    // Every :53 flow of a listed transport is hijacked; the host part is
+    // not matched.
     let mut dns_hijack = false;
+    let mut dns_hijack_tcp = false;
     for entry in r.dns_hijack.as_deref().unwrap_or(&[]) {
-        let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-        match port {
+        let (tcp, target) = match entry.split_once("://") {
+            Some(("tcp", rest)) => (true, rest),
+            Some(("udp", rest)) => (false, rest),
+            Some(_) => {
+                warn!("tun.dns-hijack: entry '{entry}' has an unknown scheme — entry ignored");
+                continue;
+            }
+            None => (false, entry.as_str()),
+        };
+        match target
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            Some(53) if tcp => dns_hijack_tcp = true,
             Some(53) => dns_hijack = true,
             _ => warn!(
                 "tun.dns-hijack: entry '{entry}' is not a :53 target; rill only hijacks \
-                 UDP port 53 — entry ignored"
+                 port 53 — entry ignored"
             ),
         }
     }
@@ -445,19 +480,60 @@ pub fn parse_tun_config(
     // (issue #543 review).
     let outbound_interface = outbound_interface.filter(|_| route_mode == TunRouteMode::Global);
 
-    // `inet6-address` is validated in every mode, but only global mode has
-    // IPv6 routes to send into the device — elsewhere an address on the
-    // device would capture nothing, so it is normalised out for the same
-    // restart-diff reason as `outbound-interface` above.
-    let inet6_address = parse_inet6_address(r.inet6_address.as_ref())?;
+    // `inet6-address` is validated in every mode, but only global mode
+    // with IPv6 enabled routes IPv6 into the device — mihomo's TUN carries
+    // IPv4 only without `ipv6: true` — so it is normalised out elsewhere
+    // for the same restart-diff reason as `outbound-interface` above, and
+    // defaults to mihomo's address when IPv6 is on.
+    let explicit_inet6 = parse_inet6_address(r.inet6_address.as_ref())?;
     let global = auto_route && route_mode == TunRouteMode::Global;
-    if inet6_address.is_some() && !global {
-        warn!(
-            "tun.inet6-address: only used with 'auto-route: global'; \
-             ignored (the device stays IPv4-only)"
-        );
-    }
-    let inet6_address = inet6_address.filter(|_| global);
+    let inet6_address = if global && ipv6 {
+        Some(
+            explicit_inet6
+                .unwrap_or_else(|| DEFAULT_TUN_INET6.parse().expect("static IPv6 CIDR parses")),
+        )
+    } else {
+        if explicit_inet6.is_some() {
+            debug!(
+                "tun.inet6-address: unused without ipv6: true and global routing; \
+                 the device stays IPv4-only"
+            );
+        }
+        None
+    };
+
+    let route_address = [
+        ("route-address", &r.route_address),
+        ("inet4-route-address", &r.inet4_route_address),
+        ("inet6-route-address", &r.inet6_route_address),
+    ]
+    .into_iter()
+    .map(|(name, value)| parse_cidr_list(name, value.as_ref()))
+    .collect::<Result<Vec<_>, _>>()?
+    .concat();
+    let route_exclude_address = [
+        ("route-exclude-address", &r.route_exclude_address),
+        (
+            "inet4-route-exclude-address",
+            &r.inet4_route_exclude_address,
+        ),
+        (
+            "inet6-route-exclude-address",
+            &r.inet6_route_exclude_address,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| parse_cidr_list(name, value.as_ref()))
+    .collect::<Result<Vec<_>, _>>()?
+    .concat();
+    // Both only shape global routing; normalised out elsewhere so a change
+    // under fake-IP scope does not restart the listener.
+    let (route_address, route_exclude_address) = if global {
+        (route_address, route_exclude_address)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let strict_route = r.strict_route.unwrap_or(false) && global;
 
     Ok(TunConfig {
         enable: r.enable,
@@ -469,25 +545,29 @@ pub fn parse_tun_config(
         route_mode,
         outbound_interface,
         dns_hijack,
+        dns_hijack_tcp,
+        strict_route,
+        route_address,
+        route_exclude_address,
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
     })
 }
 
-/// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
-/// list form. The device takes a single IPv6 address, so of a list only
-/// the first entry is used; an empty list or empty string is "unset".
-fn parse_inet6_address(
-    raw: Option<&serde_yaml::Value>,
-) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+/// A CIDR field given as a string or mihomo's list form: the first entry
+/// (the device takes one address per family). Empty means unset.
+fn first_cidr<'a>(
+    name: &str,
+    raw: Option<&'a serde_yaml::Value>,
+) -> Result<Option<&'a str>, anyhow::Error> {
     let cidr = match raw {
         None | Some(serde_yaml::Value::Null) => return Ok(None),
         Some(serde_yaml::Value::String(s)) => s.as_str(),
         Some(serde_yaml::Value::Sequence(entries)) => {
             if entries.len() > 1 {
                 warn!(
-                    "tun.inet6-address: {} entries given; rill assigns one IPv6 \
-                     address to the device — only the first is used",
+                    "tun.{name}: {} entries given; rill assigns one address per family \
+                     to the device — only the first is used",
                     entries.len()
                 );
             }
@@ -496,34 +576,78 @@ fn parse_inet6_address(
                 Some(serde_yaml::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
-                        "tun.inet6-address: expected a CIDR string, got {other:?}"
+                        "tun.{name}: expected a CIDR string, got {other:?}"
                     ));
                 }
             }
         }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "tun.inet6-address: expected a CIDR string or a list of them, got {other:?}"
+                "tun.{name}: expected a CIDR string or a list of them, got {other:?}"
             ));
         }
     };
-    if cidr.is_empty() {
-        return Ok(None);
-    }
-    cidr.parse::<ipnet::Ipv6Net>()
-        .map(Some)
-        .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
+    Ok((!cidr.is_empty()).then_some(cidr))
+}
+
+/// A list of CIDRs (`route-address`, `route-exclude-address`, …), given as
+/// one string or a list. A bare address counts as a host route.
+fn parse_cidr_list(
+    name: &str,
+    raw: Option<&serde_yaml::Value>,
+) -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+    let entries: Vec<&str> = match raw {
+        None | Some(serde_yaml::Value::Null) => return Ok(Vec::new()),
+        Some(serde_yaml::Value::String(s)) => vec![s.as_str()],
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("tun.{name}: expected CIDR strings, got {item:?}")
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "tun.{name}: expected a CIDR string or a list of them, got {other:?}"
+            ));
+        }
+    };
+    entries
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<ipnet::IpNet>()
+                .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map(|net| net.trunc())
+                .map_err(|e| anyhow::anyhow!("tun.{name}: invalid CIDR '{s}': {e}"))
+        })
+        .collect()
+}
+
+/// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
+/// list form (see [`first_cidr`]).
+fn parse_inet6_address(
+    raw: Option<&serde_yaml::Value>,
+) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+    first_cidr("inet6-address", raw)?
+        .map(|cidr| {
+            cidr.parse::<ipnet::Ipv6Net>()
+                .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
+        })
+        .transpose()
 }
 
 /// `auto-route` (#375): mihomo boolean, or a mode string selecting what
-/// gets routed. `true` keeps the loop-free v1 fake-IP scope. Shared by
+/// gets routed. `true` (and the default) routes everything, as mihomo
+/// does; `fake-ip` keeps rill's loop-free fake-IP scope. Shared by
 /// [`parse_tun_config`] and [`global_route_outbound_interface`] so the two
 /// can never disagree on what selects global scope.
 fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
     let defaults = TunConfig::default();
     Ok(match r.auto_route.as_ref() {
         None => (defaults.auto_route, defaults.route_mode),
-        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
+        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::Global),
         Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
             "fake-ip" => (true, TunRouteMode::FakeIp),
             "global" => (true, TunRouteMode::Global),
@@ -4286,7 +4410,11 @@ pub async fn build_config(
     };
 
     // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections)?;
+    let tun = parse_tun_config(
+        raw.tun.as_ref(),
+        raw.max_connections,
+        effective_ipv6(raw.ipv6),
+    )?;
 
     // API config
     let external_ui = raw
@@ -7028,7 +7156,7 @@ rules:
             udp_timeout: Some(u64::MAX),
             ..raw::RawTun::default()
         };
-        let err = parse_tun_config(Some(&tun), None)
+        let err = parse_tun_config(Some(&tun), None, false)
             .expect_err("absurd tun.udp-timeout must be rejected");
         assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
 

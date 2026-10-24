@@ -315,39 +315,60 @@ pub struct RawTun {
     /// Device name. Default: platform-chosen (`rill` on Windows/Linux,
     /// `utunN` auto-assigned on macOS).
     pub device: Option<String>,
-    /// Device MTU. Default 1500; hard parse error below 1280 (the
-    /// userspace stack's minimum, RFC 8200 §5).
+    /// Device MTU. Default 9000 (mihomo's); hard parse error below 1280
+    /// (the userspace stack's minimum, RFC 8200 §5).
     pub mtu: Option<u16>,
-    /// CIDR assigned to the device, e.g. `172.19.0.1/30` (default).
-    pub inet4_address: Option<String>,
-    /// Route installation on startup. Accepts the mihomo boolean
-    /// (`true` = fake-IP scope, `false` = off) plus the #375 mode strings
-    /// `fake-ip` and `global`. Default true (fake-IP scope).
+    /// CIDR assigned to the device — a string, or mihomo's list form (the
+    /// first entry is used). Default `198.18.0.1/30`, mihomo's.
+    pub inet4_address: Option<serde_yaml::Value>,
+    /// Route installation on startup. The mihomo boolean (`true` = route
+    /// all traffic into the device, the default) plus rill's mode strings
+    /// `global` (the same as `true`) and `fake-ip` (route only the fake-IP
+    /// range).
     pub auto_route: Option<RawAutoRoute>,
     /// Physical interface outbound sockets bind to in `auto-route: global`
     /// mode (loop avoidance, #375). Auto-detected from the default route
     /// when omitted. Ignored outside global mode.
     pub outbound_interface: Option<String>,
-    /// DNS hijack targets. rill v1 hijacks all UDP :53 flows entering
-    /// the device whenever this list is non-empty; entries with a port
-    /// other than 53 warn and are ignored.
+    /// DNS hijack targets, mihomo's form: `any:53` / `udp://any:53` answer
+    /// UDP :53 flows entering the device in-process, `tcp://any:53` TCP
+    /// ones. The host part is not matched — every :53 flow of the given
+    /// transport is hijacked; entries with another port warn and are
+    /// ignored.
     pub dns_hijack: Option<Vec<String>>,
     /// UDP NAT idle timeout in seconds. Default 60.
     pub udp_timeout: Option<u64>,
-    /// IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` —
-    /// a string, or mihomo's list form (the first entry is used). Opts
-    /// `auto-route: global` into IPv6 capture (#375); ignored with a
-    /// warning in every other mode. Default: none (IPv4 only).
+    /// IPv6 CIDR assigned to the device — a string, or mihomo's list form
+    /// (the first entry is used). Only used with top-level `ipv6: true` and
+    /// global routing, which also routes IPv6 into the device; defaults to
+    /// mihomo's `fdfe:dcba:9876::1/126` there.
     pub inet6_address: Option<serde_yaml::Value>,
-    // Upstream-only fields accepted for forward-compat; warn and ignore.
+    /// mihomo `strict-route`: with no IPv6 routed into the device, IPv6
+    /// is made unreachable so it cannot bypass the TUN (Linux; Windows
+    /// also blocks DNS that does not go through the device).
+    pub strict_route: Option<bool>,
+    /// mihomo `auto-detect-interface`. Global routing always binds
+    /// outbound sockets to the detected physical interface and follows
+    /// default-route changes; the key is accepted for compatibility.
+    pub auto_detect_interface: Option<bool>,
+    /// Prefixes routed into the device instead of the default routes —
+    /// a CIDR string or a list of them. mihomo also reads the legacy
+    /// `inet4-route-address` / `inet6-route-address`.
+    pub route_address: Option<serde_yaml::Value>,
+    pub inet4_route_address: Option<serde_yaml::Value>,
+    pub inet6_route_address: Option<serde_yaml::Value>,
+    /// Prefixes kept on the physical route under global routing — a CIDR
+    /// string or a list of them, plus mihomo's legacy per-family keys.
+    pub route_exclude_address: Option<serde_yaml::Value>,
+    pub inet4_route_exclude_address: Option<serde_yaml::Value>,
+    pub inet6_route_exclude_address: Option<serde_yaml::Value>,
+    /// mihomo's stack selector. rill has one userspace stack, so any value
+    /// is accepted.
     pub stack: Option<serde_yaml::Value>,
-    pub strict_route: Option<serde_yaml::Value>,
-    pub auto_detect_interface: Option<serde_yaml::Value>,
+    // mihomo-only fields accepted for forward-compat; warn and ignore.
     pub auto_redirect: Option<serde_yaml::Value>,
     pub endpoint_independent_nat: Option<serde_yaml::Value>,
     pub mtu_v6: Option<serde_yaml::Value>,
-    pub route_address: Option<serde_yaml::Value>,
-    pub route_exclude_address: Option<serde_yaml::Value>,
     pub include_uid: Option<serde_yaml::Value>,
     pub exclude_uid: Option<serde_yaml::Value>,
 }

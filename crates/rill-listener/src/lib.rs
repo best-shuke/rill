@@ -44,6 +44,25 @@ pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope};
 
+/// A resolver whose only answer is the hosts entry `name` → `ip`; any
+/// other name would go upstream to a TEST-NET address that never answers.
+#[cfg(all(test, feature = "listener-tun"))]
+fn test_resolver_with_host(name: &str, ip: &str) -> rill_dns::Resolver {
+    let mut hosts = rill_trie::DomainTrie::new();
+    hosts.insert(
+        name,
+        rill_dns::HostEntry::Addresses(vec![ip.parse().expect("valid IP literal")]),
+    );
+    rill_dns::Resolver::new(
+        vec!["192.0.2.1:53".parse().expect("static address parses")],
+        Vec::new(),
+        rill_common::DnsMode::Normal,
+        hosts,
+        true,
+        true,
+    )
+}
+
 #[cfg(all(
     test,
     any(

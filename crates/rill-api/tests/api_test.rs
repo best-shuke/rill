@@ -6305,14 +6305,14 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
 }
 
 /// Companion invariant: a semantically identical `tun:` section must NOT
-/// restart — the committed config spells `mtu: 1500` explicitly while the
+/// restart — the committed config spells `mtu: 9000` explicitly while the
 /// candidate omits it (same parsed default), which the `TunConfig` diff
 /// treats as unchanged.
 #[tokio::test]
 async fn put_configs_tun_unchanged_does_not_reconcile() {
     use base64::Engine as _;
     let mut raw = test_raw_config();
-    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 9000").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
     state.tunnel.set_tun_handle(handle).await;
