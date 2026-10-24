@@ -130,6 +130,10 @@ FAKE2=$($H dig +short +time=2 +tries=1 @10.10.9.9 echo2.test A)
 check "C7 domain flow after the move (DNS upstream re-bound)" "ok" "$($H python3 -I "$HERE/netsvc.py" echo "$FAKE2" 7000)"
 check "C7 exclusion re-routed via up2" "*10.10.8.0/24 via 10.10.2.1 dev up2*" "$($H ip route show 10.10.8.0/24)"
 
+# C9: dns.listen itself answers over TCP too (FlowBar points macOS's
+# resolver there; a truncated answer is retried over TCP).
+check "C9 dns.listen answers over TCP" "198.18.*" "$($H dig +tcp +short +time=2 +tries=1 -p 15353 @127.0.0.1 echo3.test A)"
+
 # C8: clean shutdown removes everything rill installed.
 kill -TERM "$RILL_PID"; wait "$RILL_PID" 2>/dev/null; RILL_PID=
 check "C8 device removed" "*does not exist*" "$($H ip -o link show FlowBar 2>&1)"
