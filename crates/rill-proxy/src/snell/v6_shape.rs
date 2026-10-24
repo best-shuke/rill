@@ -696,7 +696,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn profiles() -> impl Iterator<Item = ShapeProfile> {
-        (0..400).map(|i| ShapeProfile::new(format!("rill-shape-{i}").as_bytes()))
+        // Test PSKs only; the pinned fingerprint below was recorded over
+        // these exact strings (they predate the rename from meow-rs).
+        (0..400).map(|i| ShapeProfile::new(format!("meow-shape-{i}").as_bytes()))
     }
 
     #[test]
