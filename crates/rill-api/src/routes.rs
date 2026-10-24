@@ -5164,7 +5164,6 @@ mod global_route_binding_tests {
         for yaml in [
             "port: 7890\n",
             "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
-            "tun:\n  enable: true\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: false\n",
             "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
@@ -5185,6 +5184,12 @@ mod global_route_binding_tests {
         let fake_ip =
             preinstall_global_route_binding(&raw("tun:\n  enable: true\n  auto-route: fake-ip\n"));
         assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
+        // An omitted `auto-route` is mihomo's default — global — and installs.
+        let omitted = preinstall_global_route_binding(&raw(
+            "tun:\n  enable: true\n  outbound-interface: lo\n",
+        ));
+        assert!(omitted.is_installed() && !omitted.interface_changed());
+        drop(omitted);
         drop(second);
         assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
         drop(first);
