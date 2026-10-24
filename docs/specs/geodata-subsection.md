@@ -5,7 +5,10 @@ Status: Approved (architect 2026-04-11, M2+ implementation);
 convergence — `proxy` key, `geox-url` alias, reference-driven startup
 fetch and reference-filtered auto-update). Sections marked
 *As shipped* describe the landed implementation and supersede the
-original plan where they differ.
+original plan where they differ. **rill mihomo-parity amendment
+(2026-10-24)**: § *mihomo geo parity* below supersedes the file names,
+the `geodata-mode` / `geox-url.geoip` rows and the "`-t` stays offline"
+statements elsewhere in this spec.
 Owner: pm
 Tracks roadmap item: **M2** (task #47)
 Architect decision 2026-04-11: no `geodata:` YAML key in M1.
@@ -62,7 +65,7 @@ geodata:
   # Download URLs (used on demand for referenced-and-missing DBs and by
   # the auto-update tick)
   url:
-    mmdb: "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country.mmdb"
+    mmdb: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
     asn: "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
     geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.mrs"
 
@@ -84,16 +87,16 @@ Field reference:
 | `auto-update` | bool | `false` | If true, background task re-downloads the *referenced* DBs on each interval. |
 | `auto-update-interval` | u32 | `24` | Hours between update checks. Minimum: 1 (sub-hour polling hammers GitHub rate limits). No maximum. |
 | `proxy` | string | default egress | Outbound the downloads ride — a `proxies:`/`proxy-groups:` name, or a built-in terminal name (`DIRECT`, `REJECT`, `REJECT-DROP`, `COMPATIBLE`, `PASS`, `PASS-RULE`, case-insensitive) for direct. Unset → the last top-level `MATCH,<target>` target, then `proxies[0]`; blank/unknown names warn and fall through to the same default. |
-| `url.mmdb` | string | *(default above)* | Download URL for Country.mmdb. |
+| `url.mmdb` | string | *(default above)* | Download URL for the GeoIP MMDB (saved as `geoip.metadb`). |
 | `url.asn` | string | *(default above)* | Download URL for GeoLite2-ASN.mmdb. |
 | `url.geosite` | string | *(default above)* | Download URL for geosite.mrs. |
-| `geox-url` (top-level) | map | — | mihomo flat alias for `url.*` — keys `mmdb`/`asn`/`geosite`/`geoip`. Per-key precedence: `geodata.url.*` > `geox-url.*` > default; effective alone (no `geodata:` block). `geoip` is accepted and warned-on-ignored — upstream points it at `geoip.dat`, which has no consumer here. |
+| `geox-url` (top-level) | map | — | mihomo flat alias for `url.*` — keys `mmdb`/`asn`/`geosite`/`geoip`. Per-key precedence: `geodata.url.*` > `geox-url.*` > default; effective alone (no `geodata:` block). `geoip` is mihomo's `GeoIP.dat` URL, used under top-level `geodata-mode: true`; without it the key warns that it configures nothing. |
 
 **Fields absent from upstream that we intentionally omit:**
 
 | Upstream field | Reason omitted |
 |----------------|----------------|
-| `geodata-mode` | Go mihomo supports `.dat` (V2Ray binary) and `.mmdb`. We use mmdb for GeoIP/ASN and `.mrs` for geosite — no mode switch needed. |
+| `geodata-mode` | *Superseded*: mihomo's **top-level** `geodata-mode` (and `-m`) is supported — see § *mihomo geo parity*. Only the nested `geodata.geodata-mode` warns and is ignored. |
 | `geodata-loader` | Go-specific memory-vs-speed tradeoff for `.dat` loader. Not applicable. |
 | `geoip-matcher` | Go-specific (`succinct` vs `aho-corasick`). We use our own trie. |
 
@@ -132,10 +135,11 @@ built (a missing referenced file is otherwise a hard error downstream):
   geosite DB; `fallback:` non-empty with `fallback-filter.geoip` not
   `false` (default `true`) → MMDB.
 
-A config with zero geo references downloads nothing. `-t` validation stays
-fully offline (`is_offline_validate` early-returns before any fetch).
-Download failure is `warn!`-only; a still-missing required DB then fails
-at its own load point as before.
+A config with zero geo references downloads nothing. `-t` downloads a
+referenced-and-missing DB too, as mihomo's config test does; only
+`-t --offline` skips the fetch (`is_offline_geodata`) and validates
+against empty indexes. Download failure is `warn!`-only; a still-missing
+required DB then fails at its own load point as before.
 
 The verdict (`GeoDataNeeds`) is computed once by `geo_references` — the
 same helper `missing_geodata_downloads` consumes — and stored on
@@ -202,13 +206,43 @@ panic. The resolved URL is logged at INFO on each fire:
 `auto-update: downloading {db} from {url}` (via `… via proxy '{name}'`
 when `geodata.proxy`/the default egress resolved a proxy).
 
+## mihomo geo parity — *As shipped (rill, 2026-10-24)*
+
+A front end written for mihomo (FlowBar) drives rill with the same files,
+switches and log reading, so the GeoIP side follows mihomo exactly:
+
+- **File names**, in the config directory (`-d`), each matched without
+  regard to case: GeoIP MMDB `Country.mmdb` → `geoip.metadb` → `geoip.db`
+  (first that exists; a missing one downloads to `geoip.metadb`, mihomo's
+  name); `GeoIP.dat` under `geodata-mode`; geosite `GeoSite.dat`
+  (`geosite.mrs` still loads). `geodata.mmdb-path` keeps its override.
+- **MMDB flavours**: MaxMind/GeoLite2 Country, sing-geoip (`geoip.db`) and
+  Meta-geoip0 (`geoip.metadb`, several codes per network) all build the
+  same targeted country index.
+- **`geodata-mode: true`** (top level) or `-m` reads GEOIP — rules and the
+  `fallback-filter.geoip` gate — from V2Ray's `GeoIP.dat` (`GeoIPList`
+  protobuf), downloaded from `geox-url.geoip` (default
+  `meta-rules-dat/.../geoip.dat`).
+- **`GEOIP,LAN`** / **`SRC-GEOIP,LAN`** are built in — the private,
+  loopback, unspecified, link-local and multicast ranges of Go's `netip`
+  predicates mihomo uses, IPv4 and IPv6: they need no database and never
+  trigger a download.
+- **`-t` downloads** a referenced-and-missing database, like mihomo's
+  config test, and fails if it still cannot load it. `--offline` restores
+  the network-free check (LuCI's pre-save validation and the OpenWrt init
+  script use it).
+- **Log wording** matches mihomo's, which front ends parse for progress:
+  `Can't find {MMDB|GeoIP.dat|ASN.mmdb|GeoSite.dat}, start download`,
+  `Download {…} finish`, `can't download {…}: …`, and load failures start
+  with `can't load …`.
+
 ## Divergences from upstream (classified per ADR-0002)
 
 | # | Case | Class | Rationale |
 |---|------|:-----:|-----------|
-| 1 | `geodata-mode` / `geodata-loader` / `geoip-matcher` — present in upstream | B | Fields are silently ignored if present (forward-compat). Warn-once at parse time with names of ignored fields. |
+| 1 | `geodata-loader` / `geoip-matcher` — present in upstream | B | Ignored (forward-compat); inside `geodata:` they warn once. Top-level `geodata-mode` is supported (§ *mihomo geo parity*). |
 | 2 | Auto-update download failure — upstream logs and continues | — | We match: warn! and retry next interval. Not an error. |
-| 3 | `geox-url` top-level — upstream feeds `geoip.dat`/`geosite.dat`/mmdb update URLs | B | `mmdb`/`asn`/`geosite` merge per key under `geodata.url.*`; `geoip` (upstream's `geoip.dat` URL) warns-once and is ignored — rill has no geoip.dat consumer. |
+| 3 | `geox-url` top-level — upstream feeds `geoip.dat`/`geosite.dat`/mmdb update URLs | — | `mmdb`/`asn`/`geosite` merge per key under `geodata.url.*`; `geoip` is the `GeoIP.dat` URL under `geodata-mode`, as upstream. |
 | 4 | `geodata.proxy` — upstream downloads always direct | — | Extension, not a conflict: explicit egress selection plus a first-hop-dial-failure direct retry; providers/subscriptions keep their own `proxy:` semantics. |
 
 **Design note — explicit path to absent file:** upstream Go mihomo rejects at parse time
@@ -227,8 +261,9 @@ Class A or B divergence — it is a feature interaction, not a correctness trade
    hours, updated DB loaded without restart.
 5. Download failure → `warn!` logged, retry next interval, no crash.
 6. `url.mmdb` override → on-demand and auto-update fetches use custom URL.
-7. Upstream-only fields (`geodata-mode`, `geodata-loader`) → parsed without
-   error, `warn!` logged once per field.
+7. Upstream-only fields (`geodata-loader`, `geoip-matcher`) → parsed without
+   error; inside `geodata:` a `warn!` is logged once per field. Top-level
+   `geodata-mode: true` switches GEOIP to `GeoIP.dat`.
 8. `auto-update-interval: 0` → hard parse error ("minimum is 1 hour").
 9. ~~Conditional GET~~ — **superseded, not implemented**: every tick performs
    a full body download.
@@ -237,14 +272,14 @@ Class A or B divergence — it is a feature interaction, not a correctness trade
 11. Zero geo references → zero startup downloads; a referenced-and-missing
     DB (incl. DNS-side `fallback-filter.geoip` and `geosite:` policy keys,
     both gated by `dns.enable: true`) is fetched before the parser context
-    is built. `-t` stays offline.
+    is built. `-t` fetches it as well; `-t --offline` does not.
 12. `geodata.proxy` — named proxy/group rides the download; built-in
     terminal name → direct; unset → last top-level `MATCH` target, then
     `proxies[0]`; first-hop proxy-dial failure retries once direct
     (geodata-only fallback).
 13. `geox-url.*` fills any `url.*` key left unset (per-key precedence
-    `geodata.url` > `geox-url` > default); `geox-url.geoip` warns and is
-    ignored.
+    `geodata.url` > `geox-url` > default); `geox-url.geoip` is the
+    `GeoIP.dat` URL under `geodata-mode` and warns without it.
 14. Auto-update refreshes only referenced DBs (`Config.geo_needs` startup
     snapshot — `asn`/`geosite` flags only; the MMDB is never a tick
     target; all-false → the tick is a no-op).

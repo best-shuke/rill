@@ -18,7 +18,8 @@ pub use client::{
 pub use fakeip::{FileStore, MemoryStore, Pool, PoolError, Skipper, SkipperMode, Store};
 pub use host_resolver_hook::ResolverHostHook;
 pub use resolver::{
-    BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
+    BootstrapError, FallbackFilter, GeoIpTrusted, HostEntry, NameserverPolicy, PolicyEntry,
+    Resolver,
 };
 pub use server::{new_resolver_slot, BoundDnsServer, DnsServer, LocalAnswer, ResolverSlot};
 pub use upstream::{HostOrIp, NameServerEntry, NameServerParseError, NameServerUrl};

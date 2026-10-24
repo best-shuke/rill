@@ -118,7 +118,8 @@ These fields parse without error but behave differently from Go mihomo:
 | `PUT /configs` in-flight connections | Graceful handover | Cold reload, connections dropped + logged | A |
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |
 | `GET /configs` response includes null Option fields | Full struct with nulls | Only non-null fields returned | B |
-| `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
+| `geodata-mode` | GEOIP reads `GeoIP.dat` | Same (top level, or `-m`) | — |
+| `geodata-loader`, `geoip-matcher` | Valid fields | Ignored (warn-once inside `geodata:`) | B |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
 
@@ -425,16 +426,16 @@ See quick checklist above for status of each rule type.
 
 ### GEOIP
 
-Supported. Uses MaxMind MMDB format (`Country.mmdb`). Discovery chain:
+Supported, with mihomo's files: in the config directory (`-d`, else
+`$XDG_CONFIG_HOME/rill` / `$HOME/.config/rill`) the first of `Country.mmdb`,
+`geoip.metadb` and `geoip.db` that exists — MaxMind, Meta-geoip0 and
+sing-geoip MMDBs all work — or, with `geodata-mode: true`, `GeoIP.dat`.
+A missing database the config needs is downloaded (to `geoip.metadb` /
+`GeoIP.dat`), during `-t` as well unless `--offline` is given.
 
-```
-$XDG_CONFIG_HOME/rill/Country.mmdb
-$HOME/.config/rill/Country.mmdb
-./rill/Country.mmdb
-```
-
-The file name is matched ignoring case, so a `country.mmdb` is picked up too;
+File names are matched ignoring case, so a `country.mmdb` is picked up too;
 for `IP-ASN`, an `ASN.mmdb` is used when there is no `GeoLite2-ASN.mmdb`.
+`GEOIP,LAN` is built in and needs no database.
 
 ### GEOSITE
 

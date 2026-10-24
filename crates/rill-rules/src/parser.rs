@@ -147,11 +147,18 @@ fn parse_rule_depth(
         "NETWORK" => NetworkRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "PROCESS-NAME" => Ok(Box::new(ProcessRule::new(payload, adapter))),
         "GEOIP" => {
-            let index = ctx.geoip.as_ref().ok_or_else(|| {
-                "GEOIP rule requires a GeoIP database, but none is configured".to_string()
-            })?;
             let flags = parse_rule_flags(extra);
-            let ranges = index.ranges_for(payload);
+            // mihomo's `GEOIP,LAN` is built in and needs no database.
+            let ranges = if crate::country_index::is_lan_code(payload) {
+                crate::country_index::lan_ranges()
+            } else {
+                ctx.geoip
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "GEOIP rule requires a GeoIP database, but none is configured".to_string()
+                    })?
+                    .ranges_for(payload)
+            };
             if flags.is_src {
                 // Upstream parity: `GEOIP,...,src` is a `SRC-GEOIP` rule.
                 Ok(Box::new(SrcGeoIpRule::new(payload, adapter, ranges)))
@@ -165,10 +172,17 @@ fn parse_rule_depth(
             }
         }
         "SRC-GEOIP" => {
-            let index = ctx.geoip.as_ref().ok_or_else(|| {
-                "SRC-GEOIP rule requires a GeoIP database, but none is configured".to_string()
-            })?;
-            let ranges = index.ranges_for(payload);
+            let ranges = if crate::country_index::is_lan_code(payload) {
+                crate::country_index::lan_ranges()
+            } else {
+                ctx.geoip
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "SRC-GEOIP rule requires a GeoIP database, but none is configured"
+                            .to_string()
+                    })?
+                    .ranges_for(payload)
+            };
             Ok(Box::new(SrcGeoIpRule::new(payload, adapter, ranges)))
         }
         "GEOSITE" => {
@@ -590,6 +604,30 @@ mod tests {
         let mut meta = make_metadata("", 443);
         meta.dst_ip = Some("192.168.1.5".parse().unwrap());
         assert!(rule.match_metadata(&meta, &noop_helper()));
+    }
+
+    /// mihomo's `GEOIP,LAN` is built in: it parses without a GeoIP database
+    /// and matches private, loopback and link-local addresses — and so does
+    /// its source-side form. Any real country still needs the database.
+    #[test]
+    fn test_geoip_lan_needs_no_database() {
+        for line in ["GEOIP,LAN,DIRECT", "GEOIP,lan,DIRECT,no-resolve"] {
+            let rule = parse_rule(line, &ctx()).unwrap();
+            let mut meta = make_metadata("", 443);
+            for (ip, lan) in [("192.168.1.5", true), ("fe80::1", true), ("8.8.8.8", false)] {
+                meta.dst_ip = Some(ip.parse().unwrap());
+                assert_eq!(
+                    rule.match_metadata(&meta, &noop_helper()),
+                    lan,
+                    "{line} {ip}"
+                );
+            }
+        }
+        let src = parse_rule("SRC-GEOIP,LAN,DIRECT", &ctx()).unwrap();
+        let mut meta = make_metadata("", 443);
+        meta.src_ip = Some("10.0.0.2".parse().unwrap());
+        assert!(src.match_metadata(&meta, &noop_helper()));
+        assert!(parse_rule("GEOIP,CN,DIRECT", &ctx()).is_err());
     }
 
     #[test]

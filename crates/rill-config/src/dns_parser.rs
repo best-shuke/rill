@@ -164,9 +164,15 @@ pub async fn parse_dns(
     } else {
         let raw_filter = dns.fallback_filter.clone();
         let mmdb_path = mmdb_path.map(std::path::Path::to_path_buf);
+        let geodata_mode = crate::geodata_mode(raw);
         Some(
             crate::spawn_blocking_with_current_dispatcher(move || {
-                build_fallback_filter(raw_filter.as_ref(), mmdb_path.as_deref(), strict)
+                build_fallback_filter(
+                    raw_filter.as_ref(),
+                    mmdb_path.as_deref(),
+                    geodata_mode,
+                    strict,
+                )
             })
             .await
             .map_err(|e| anyhow::anyhow!("fallback-filter build task failed: {e}"))??,
@@ -823,11 +829,14 @@ async fn resolve_policy_host(
 
 /// Build a `FallbackFilter` from the raw config.
 ///
-/// If `geoip: true` but no MMDB is available, GeoIP gate is disabled with a
-/// `warn!`. Class B per ADR-0002: NOT a startup error.
+/// If `geoip: true` but no GeoIP database is available, GeoIP gate is
+/// disabled with a `warn!`. Class B per ADR-0002: NOT a startup error. The
+/// database is the one GEOIP rules read: an MMDB of any flavour mihomo
+/// accepts, or `GeoIP.dat` under `geodata-mode`.
 fn build_fallback_filter(
     raw: Option<&crate::raw::RawFallbackFilter>,
     explicit_mmdb_path: Option<&std::path::Path>,
+    geodata_mode: bool,
     strict: bool,
 ) -> Result<FallbackFilter, anyhow::Error> {
     let geoip = raw.and_then(|f| f.geoip).unwrap_or(true);
@@ -863,22 +872,26 @@ fn build_fallback_filter(
         domain.insert(s, ());
     }
 
-    // Attempt to load GeoIP MMDB for the geoip gate.
-    let geoip_reader = if geoip {
-        let mmdb_path =
-            explicit_mmdb_path.map_or_else(crate::default_geoip_path, std::path::PathBuf::from);
-        match std::fs::read(&mmdb_path)
-            .map_err(|e| format!("{e}"))
-            .and_then(|b| maxminddb::Reader::from_source(b).map_err(|e| format!("{e}")))
-        {
-            Ok(reader) => Some(Arc::new(reader)),
+    // The geoip gate: an answer passes when it is in `geoip_code` or a LAN
+    // address — mihomo's filter never sends private answers to fallback.
+    let geoip_trusted = if geoip {
+        let path = if geodata_mode {
+            crate::default_geoip_dat_path()
+        } else {
+            explicit_mmdb_path.map_or_else(crate::default_geoip_path, std::path::PathBuf::from)
+        };
+        let allowed = std::iter::once(geoip_code.to_ascii_uppercase()).collect();
+        match crate::load_geoip_index(geodata_mode, &path, &allowed, "dns.fallback-filter.geoip") {
+            Ok(index) => {
+                let ranges = index.ranges_for(&geoip_code);
+                let lan = rill_rules::country_index::lan_ranges();
+                Some(Arc::new(move |ip| ranges.contains(ip) || lan.contains(ip))
+                    as rill_dns::GeoIpTrusted)
+            }
             Err(e) => {
                 warn!(
-                    "fallback-filter: geoip=true but GeoIP database not available at {}: {} \
-                    — GeoIP gate disabled (Class B per ADR-0002). \
-                    Download Country.mmdb to enable GeoIP-based fallback filtering.",
-                    mmdb_path.display(),
-                    e
+                    "fallback-filter: geoip=true but no usable GeoIP database ({e:#}) — \
+                     GeoIP gate disabled (Class B per ADR-0002)"
                 );
                 None
             }
@@ -887,14 +900,14 @@ fn build_fallback_filter(
         None
     };
 
-    let geoip_enabled = geoip && geoip_reader.is_some();
+    let geoip_enabled = geoip && geoip_trusted.is_some();
 
     Ok(FallbackFilter {
         geoip_enabled,
         geoip_code,
         ipcidr,
         domain,
-        geoip_reader,
+        geoip_trusted,
     })
 }
 
@@ -1954,7 +1967,7 @@ mod tests {
     // Fallback-filter defaults when no raw config provided.
     #[test]
     fn build_fallback_filter_defaults() {
-        let ff = build_fallback_filter(None, None, false).unwrap();
+        let ff = build_fallback_filter(None, None, false, false).unwrap();
         assert_eq!(ff.geoip_code, "CN");
         assert!(ff.ipcidr.is_empty());
         assert!(ff.domain.search("anything").is_none());
@@ -1970,7 +1983,7 @@ mod tests {
             ipcidr: Some(vec!["240.0.0.0/4".to_string()]),
             domain: None,
         };
-        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
         let clean: IpAddr = "8.8.8.8".parse().unwrap();
         assert!(ff.ip_gated(&[bogon]));
@@ -1988,7 +2001,7 @@ mod tests {
             ipcidr: None,
             domain: Some(vec!["+.google.cn".to_string()]),
         };
-        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
         assert!(ff.domain_gated("www.google.cn"));
         assert!(ff.domain_gated("google.cn"));
         assert!(!ff.domain_gated("www.google.com"));
@@ -2006,7 +2019,7 @@ mod tests {
             ipcidr: None,
             domain: Some(vec!["*.fb.test".to_string()]),
         };
-        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let ff = build_fallback_filter(Some(&raw), None, false, false).unwrap();
         assert!(
             ff.domain_gated("a.fb.test"),
             "single-label subdomain of *.fb.test must match"
@@ -2199,9 +2212,9 @@ mod tests {
             ipcidr: Some(vec!["not-a-cidr".to_string()]),
             ..Default::default()
         };
-        build_fallback_filter(Some(&raw), None, false).expect("lenient skips bad CIDRs");
+        build_fallback_filter(Some(&raw), None, false, false).expect("lenient skips bad CIDRs");
         assert!(
-            build_fallback_filter(Some(&raw), None, true).is_err(),
+            build_fallback_filter(Some(&raw), None, false, true).is_err(),
             "strict must reject an invalid fallback-filter CIDR"
         );
 

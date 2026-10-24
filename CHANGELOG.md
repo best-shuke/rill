@@ -21,5 +21,16 @@ meow-rs's own history is kept in `docs/history/meow-rs-CHANGELOG.md`.
 
 ### Added
 
+- **mihomo geo parity**: top-level `geodata-mode` and `-m` read GEOIP from
+  `GeoIP.dat` (from `geox-url.geoip`); Meta-geoip0 (`geoip.metadb`) and
+  sing-geoip MMDBs load alongside MaxMind's; `GEOIP,LAN` and
+  `SRC-GEOIP,LAN` are built in and need no database. The default GeoIP
+  file and download are mihomo's `geoip.metadb`, geosite's `GeoSite.dat`,
+  each found without regard to case.
+- `rill -t` downloads a referenced-but-missing database the way mihomo's
+  config test does, with mihomo's log wording (`Can't find MMDB, start
+  download`, …); `rill -t --offline` keeps the network-free check, which
+  the OpenWrt init script and LuCI now use.
+
 - `rill-bench --only tun` and `bench-tun.sh`: TUN-inbound benchmark against
   mihomo's `system` and `gvisor` stacks, run in a private network namespace.

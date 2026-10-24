@@ -12,6 +12,8 @@ homepage.workspace = true
 rill-common = { workspace = true }
 rill-trie = { workspace = true }
 maxminddb = { workspace = true }
+# Untagged decode of `Meta-geoip0` MMDB records (a code or a list of codes).
+serde = { workspace = true }
 ipnet = { workspace = true }
 regex = { workspace = true }
 smol_str = { workspace = true }

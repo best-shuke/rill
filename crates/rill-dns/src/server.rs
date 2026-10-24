@@ -1862,7 +1862,7 @@ mod tests {
                 geoip_code: "CN".to_string(),
                 ipcidr: vec![],
                 domain: ff_domain,
-                geoip_reader: None,
+                geoip_trusted: None,
             }),
         )
         .await

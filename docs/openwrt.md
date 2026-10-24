@@ -99,7 +99,8 @@ executables at both validation and runtime (built-in plugins remain supported).
 A random API secret is generated at installation, preserving existing secrets
 on upgrade. Clearing it restricts the API to loopback; remote panel access then
 requires setting a secret again. HTTP provider payloads absent from the cache
-are deferred during `-t`, including strict validation; cached rule payloads and
+are deferred during `-t --offline`, including strict validation, and missing
+geodata is not downloaded there; cached rule payloads and
 inline definitions are still checked. ECH DNS lookup and DNS bootstrap for
 hostname-bearing upstreams are deferred to startup.
 
@@ -114,7 +115,7 @@ uci commit rill
 /etc/init.d/rill start
 ```
 
-The init script validates the config (`rill -t`) before starting and logs a
+The init script validates the config (`rill -t --offline`) before starting and logs a
 message via `logger` if validation fails. procd restarts the service when
 either `/etc/config/rill` or the YAML config changes, and respawns it if it
 crashes.
@@ -135,7 +136,7 @@ not reimplement a dashboard:
   embedded in LuCI, covering proxy selection, subscriptions, groups and
   rules. The API secret is passed in the URL fragment (`#token=`), so the
   panel works without typing it again.
-- **Configuration**: raw YAML editor. Edits are validated with `rill -t`
+- **Configuration**: raw YAML editor. Edits are validated with `rill -t --offline`
   before they replace the file. Saving explicitly restarts a running service;
   a stopped service stays stopped. Restart failures are reported separately.
   Validation uses cached rule providers and local geodata without downloading;
@@ -210,7 +211,7 @@ Saving **Settings** synchronizes the selected local YAML before saving UCI:
 - IPv6 capture uses a dual-stack TCP listener in REDIRECT mode. IPv6 with
   UDP TPROXY is rejected because that listener supports only IPv4.
 
-The candidate YAML is checked with `rill -t` before replacement. Validation
+The candidate YAML is checked with `rill -t --offline` before replacement. Validation
 and upload errors prevent the UCI save; a subsequent UCI save failure restores
 YAML. YAML is written on **Save**; **Save & Apply** also applies UCI and restarts
 the service. The Configuration tab reapplies these same settings when saving

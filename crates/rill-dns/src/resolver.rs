@@ -197,8 +197,16 @@ pub struct FallbackFilter {
     pub ipcidr: Vec<IpNet>,
     /// Domain patterns — match means skip primary entirely, go straight to fallback.
     pub domain: DomainTrie<()>,
-    pub geoip_reader: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
+    /// Whether an answer address passes the geoip gate: inside
+    /// `geoip_code`, or a LAN address (which mihomo never sends to
+    /// fallback). Built by the config layer from whichever GeoIP database
+    /// is installed (any MMDB flavour, or `GeoIP.dat` in geodata mode);
+    /// `None` when there is none.
+    pub geoip_trusted: Option<GeoIpTrusted>,
 }
+
+/// See [`FallbackFilter::geoip_trusted`].
+pub type GeoIpTrusted = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 
 impl FallbackFilter {
     /// True if the domain pattern gate matches (primary should be skipped).
@@ -215,20 +223,9 @@ impl FallbackFilter {
             }
         }
         if self.geoip_enabled {
-            if let Some(reader) = &self.geoip_reader {
-                for addr in addrs {
-                    if let Some(record) = reader
-                        .lookup(*addr)
-                        .ok()
-                        .and_then(|r| r.decode::<maxminddb::geoip2::Country>().ok())
-                        .flatten()
-                    {
-                        let code = record.country.iso_code;
-                        match code {
-                            Some(c) if c == self.geoip_code.as_str() => {}
-                            _ => return true,
-                        }
-                    }
+            if let Some(trusted) = &self.geoip_trusted {
+                if addrs.iter().any(|addr| !trusted(*addr)) {
+                    return true;
                 }
             }
         }
@@ -3679,7 +3676,7 @@ mod tests {
             geoip_code: "CN".to_string(),
             ipcidr: vec![],
             domain: domain_trie,
-            geoip_reader: None,
+            geoip_trusted: None,
         };
         let hosts = DomainTrie::new();
         let mut resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
@@ -3703,7 +3700,7 @@ mod tests {
             geoip_code: "CN".to_string(),
             ipcidr: vec![cidr],
             domain: DomainTrie::new(),
-            geoip_reader: None,
+            geoip_trusted: None,
         };
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
         let clean: IpAddr = "8.8.8.8".parse().unwrap();

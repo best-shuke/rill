@@ -736,6 +736,43 @@ pub fn is_offline_validate() -> bool {
     OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Geodata gets its own switch because mihomo's config test *does* download
+/// a missing database the config references — FlowBar relies on that to
+/// fetch it, with progress, inside its validation window — and fails when
+/// it cannot. Plain `rill -t` therefore downloads too. `rill -t --offline`
+/// (LuCI's pre-save check, which must not block on the network) sets this:
+/// no download, and a missing database validates against an empty index.
+static OFFLINE_GEODATA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn `-t --offline`'s no-download geodata handling on or off (see
+/// `OFFLINE_GEODATA`).
+pub fn set_offline_geodata(on: bool) {
+    OFFLINE_GEODATA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `-t --offline` is in effect for geodata (see `OFFLINE_GEODATA`).
+pub fn is_offline_geodata() -> bool {
+    OFFLINE_GEODATA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// mihomo's `-m` / `--geodata-mode` command-line switch, which turns geodata
+/// mode on whatever the config says.
+static GEODATA_MODE_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// mihomo's `-m` / `--geodata-mode`: geodata mode on whatever the config
+/// says.
+pub fn force_geodata_mode(on: bool) {
+    GEODATA_MODE_FORCED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether GEOIP reads `GeoIP.dat` (mihomo's geodata mode): the config's
+/// top-level `geodata-mode`, or the command-line switch.
+pub fn geodata_mode(raw: &raw::RawConfig) -> bool {
+    raw.geodata_mode.unwrap_or(false)
+        || GEODATA_MODE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Upper bound, in milliseconds, on how long a config load waits for the
 /// remote proxy- and rule-provider fetches that have no usable on-disk
 /// cache. `u64::MAX` = wait for every fetch to finish (the default).
@@ -1318,7 +1355,11 @@ pub async fn parse_dns_from_raw(
     prior_resolver: Option<&rill_dns::Resolver>,
     dialer_registry: Option<&rill_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(
+        raw.geodata.as_ref(),
+        raw.geox_url.as_ref(),
+        geodata_mode(raw),
+    )?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
         prefetched_payloads.map_or(&empty, Arc::as_ref);
@@ -3111,9 +3152,11 @@ fn parse_sniffer_config(
 /// never drift apart.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GeoDataNeeds {
-    /// GeoIP Country MMDB (`Country.mmdb`) — GEOIP rules or the
-    /// fallback-filter geoip gate.
+    /// GeoIP Country MMDB (`Country.mmdb` / `geoip.metadb`) — GEOIP rules
+    /// or the fallback-filter geoip gate, outside geodata mode.
     pub mmdb: bool,
+    /// `GeoIP.dat` — the same consumers under mihomo's `geodata-mode`.
+    pub geoip_dat: bool,
     /// GeoLite2-ASN MMDB — IP-ASN rules.
     pub asn: bool,
     /// geosite DB (`.dat`/`.mrs`) — GEOSITE rules or `geosite:` policy keys.
@@ -3124,9 +3167,12 @@ pub struct GeoDataNeeds {
 /// ([`collect_geo_scan_lines`]). `pub(crate)` — `build_config` stores the
 /// result on [`Config::geo_needs`] for the auto-update loop.
 pub(crate) fn geo_references(raw: &raw::RawConfig, scan_lines: &[String]) -> GeoDataNeeds {
+    let geoip =
+        scan_lines.iter().any(|l| line_references_geoip(l)) || dns_fallback_filter_uses_geoip(raw);
+    let dat = geodata_mode(raw);
     GeoDataNeeds {
-        mmdb: scan_lines.iter().any(|l| line_references_geoip(l))
-            || dns_fallback_filter_uses_geoip(raw),
+        mmdb: geoip && !dat,
+        geoip_dat: geoip && dat,
         asn: scan_lines.iter().any(|l| line_references_asn(l)),
         geosite: scan_lines.iter().any(|l| line_references_geosite(l))
             || dns_policy_uses_geosite(raw),
@@ -3160,8 +3206,11 @@ fn dns_fallback_filter_uses_geoip(raw: &raw::RawConfig) -> bool {
 /// startup actually has to download. `needs` is the
 /// [`geo_references`] verdict for this config — computing it once keeps the
 /// "is this DB referenced" judgment in one place.
-fn missing_geodata_downloads(geo: &GeoDataConfig, needs: GeoDataNeeds) -> Vec<(&String, PathBuf)> {
-    if !needs.mmdb && !needs.asn && !needs.geosite {
+fn missing_geodata_downloads(
+    geo: &GeoDataConfig,
+    needs: GeoDataNeeds,
+) -> Vec<(&String, PathBuf, &'static str)> {
+    if !needs.mmdb && !needs.geoip_dat && !needs.asn && !needs.geosite {
         return Vec::new();
     }
 
@@ -3184,15 +3233,23 @@ fn missing_geodata_downloads(geo: &GeoDataConfig, needs: GeoDataNeeds) -> Vec<(&
             |p| !p.exists(),
         );
 
+    let geoip_dat_path = default_geoip_dat_path();
+    let geoip_dat_missing = needs.geoip_dat && !geoip_dat_path.exists();
+
+    // The labels are mihomo's names for each database in its download log
+    // lines (see `ensure_geodata`).
     let mut downloads = Vec::new();
     if geoip_missing {
-        downloads.push((&geo.mmdb_url, geoip_path));
+        downloads.push((&geo.mmdb_url, geoip_path, "MMDB"));
+    }
+    if geoip_dat_missing {
+        downloads.push((&geo.geoip_dat_url, geoip_dat_path, "GeoIP.dat"));
     }
     if asn_missing {
-        downloads.push((&geo.asn_url, asn_path));
+        downloads.push((&geo.asn_url, asn_path, "ASN.mmdb"));
     }
     if geosite_missing {
-        downloads.push((&geo.geosite_url, geosite_path));
+        downloads.push((&geo.geosite_url, geosite_path, "GeoSite.dat"));
     }
     downloads
 }
@@ -3322,9 +3379,10 @@ async fn ensure_geodata(
     scan_lines: &[String],
     prefetch: Option<&PrefetchProxies>,
 ) {
-    if is_offline_validate() {
-        // Validate local databases when present; missing databases use empty
-        // indexes for structural checks and are fetched only at real startup.
+    if is_offline_geodata() {
+        // `-t --offline`: validate local databases when present; missing
+        // ones use empty indexes for structural checks and are fetched only
+        // at real startup.
         return;
     }
     let downloads = missing_geodata_downloads(geo, geo_references(raw, scan_lines));
@@ -3335,10 +3393,16 @@ async fn ensure_geodata(
     let proxy: Option<Arc<dyn Proxy>> =
         prefetch.and_then(|m| resolve_geodata_download_proxy(raw, &m.map));
 
-    for (url, dest) in downloads {
-        info!("geodata: downloading {} to {}", url, dest.display());
-        if let Err(e) = geodata::download_and_replace(url, &dest, proxy.as_ref()).await {
-            warn!("geodata: failed to download {} — {}", url, e);
+    for (url, dest, label) in downloads {
+        // mihomo's wording, which FlowBar reads its download progress and
+        // its "geo database" error hint from.
+        info!(
+            "Can't find {label}, start download ({url} → {})",
+            dest.display()
+        );
+        match geodata::download_and_replace(url, &dest, proxy.as_ref()).await {
+            Ok(()) => info!("Download {label} finish"),
+            Err(e) => warn!("can't download {label}: {e:#}"),
         }
     }
 }
@@ -3350,7 +3414,11 @@ fn build_parser_context_from_raw(
     raw: &raw::RawConfig,
     provider_payloads: &rule_provider::PrefetchedPayloads,
 ) -> Result<rill_rules::ParserContext, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(
+        raw.geodata.as_ref(),
+        raw.geox_url.as_ref(),
+        geodata_mode(raw),
+    )?;
     build_parser_context_with_geo(raw, &geo, provider_payloads)
 }
 
@@ -3359,7 +3427,12 @@ fn build_parser_context_with_geo(
     geo: &GeoDataConfig,
     provider_payloads: &rule_provider::PrefetchedPayloads,
 ) -> Result<rill_rules::ParserContext, anyhow::Error> {
-    let geoip_path = geo.mmdb_path.clone().unwrap_or_else(default_geoip_path);
+    // mihomo's geodata mode reads GEOIP from GeoIP.dat instead.
+    let geoip_path = if geo.geodata_mode {
+        default_geoip_dat_path()
+    } else {
+        geo.mmdb_path.clone().unwrap_or_else(default_geoip_path)
+    };
     let asn_path = geo.asn_path.clone().unwrap_or_else(default_asn_path);
     build_parser_context_at(
         raw,
@@ -3396,24 +3469,24 @@ fn build_parser_context_at(
 
     let geoip_trigger = lines.iter().find(|l| line_references_geoip(l));
     let geoip = match geoip_trigger {
-        Some(_) if is_offline_validate() && !geoip_path.exists() => {
+        Some(_) if is_offline_geodata() && !geoip_path.exists() => {
             Some(Arc::new(rill_rules::country_index::CountryIndex::default()))
         }
         Some(trigger) => {
-            let reader = load_mmdb_mmap(geoip_path, "GeoIP", trigger)?;
             let allowed = collect_geoip_countries(&lines);
-            let index = rill_rules::country_index::CountryIndex::build(&reader, &allowed)
-                .map_err(|e| anyhow::anyhow!("failed to build GeoIP country index: {e}"))?;
-            // reader is mmap-backed — pages are returned to the OS on drop.
-            drop(reader);
-            Some(Arc::new(index))
+            Some(Arc::new(load_geoip_index(
+                geodata_mode(raw),
+                geoip_path,
+                &allowed,
+                trigger,
+            )?))
         }
         None => None,
     };
 
     let asn_trigger = lines.iter().find(|l| line_references_asn(l));
     let asn = match asn_trigger {
-        Some(_) if is_offline_validate() && !asn_path.exists() => {
+        Some(_) if is_offline_geodata() && !asn_path.exists() => {
             Some(Arc::new(rill_rules::asn_index::AsnIndex::default()))
         }
         Some(trigger) => {
@@ -3456,6 +3529,38 @@ fn build_parser_context_at(
     })
 }
 
+/// The GeoIP country index for `allowed` from whichever database the config
+/// reads: `GeoIP.dat` under mihomo's `geodata-mode` (`dat`), else an MMDB of
+/// any flavour mihomo accepts (MaxMind Country, sing-geoip, Meta-geoip0).
+/// `trigger` names what needed it, for the error. Shared by the rule parser
+/// context and the DNS fallback filter.
+pub(crate) fn load_geoip_index(
+    dat: bool,
+    path: &Path,
+    allowed: &std::collections::HashSet<String>,
+    trigger: &str,
+) -> Result<rill_rules::country_index::CountryIndex, anyhow::Error> {
+    if dat {
+        let load = || -> Result<_, String> {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            rill_rules::country_index::CountryIndex::from_geoip_dat(&bytes, allowed)
+        };
+        let index = load().map_err(|e| {
+            anyhow::anyhow!(
+                "can't load GeoIP.dat at {}\n  required by: {}\n  underlying error: {e}",
+                path.display(),
+                trigger.trim()
+            )
+        })?;
+        info!("Loaded GeoIP.dat from {}", path.display());
+        return Ok(index);
+    }
+    let reader = load_mmdb_mmap(path, "GeoIP", trigger)?;
+    // reader is mmap-backed — pages are returned to the OS on drop.
+    rill_rules::country_index::CountryIndex::build(&reader, allowed)
+        .map_err(|e| anyhow::anyhow!("failed to build GeoIP country index: {e}"))
+}
+
 /// Memory-map an MMDB file. The OS reclaims pages immediately on drop,
 /// unlike `Vec<u8>` where the allocator retains the freed block.
 fn load_mmdb_mmap(
@@ -3467,7 +3572,7 @@ fn load_mmdb_mmap(
     // lifetime (dropped before the function returns to the caller).
     let reader = unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
         anyhow::anyhow!(
-            "Failed to load {} database at {}\n  required by rule: {}\n  underlying error: {}",
+            "can't load {} database at {}\n  required by rule: {}\n  underlying error: {}",
             kind,
             path.display(),
             trigger.trim(),
@@ -3503,7 +3608,9 @@ fn collect_geoip_countries(lines: &[String]) -> std::collections::HashSet<String
             continue;
         }
         for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_uppercase());
+            if !rill_rules::country_index::is_lan_code(&cap[1]) {
+                out.insert(cap[1].to_ascii_uppercase());
+            }
         }
     }
     out
@@ -3621,9 +3728,15 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
 /// top-level `GEOIP,`/`SRC-GEOIP,` rule or nested inside a logic rule
 /// (`AND`/`OR`/`NOT`). Comment lines never match. Uses the same regex as
 /// [`collect_geoip_countries`] so the trigger and the allowlist agree.
+/// `GEOIP,LAN` alone needs no database — it is mihomo's built-in private
+/// range check.
 fn line_references_geoip(line: &str) -> bool {
     let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geoip_scan_regex().is_match(line)
+    !line.is_empty()
+        && !line.starts_with('#')
+        && geoip_scan_regex()
+            .captures_iter(line)
+            .any(|cap| !rill_rules::country_index::is_lan_code(&cap[1]))
 }
 
 /// True iff `line` references the geosite database anywhere (top-level or
@@ -3687,7 +3800,22 @@ fn collect_geo_scan_lines(
 /// the `country.mmdb` a mihomo GUI copies into the home directory is used
 /// rather than downloaded again.
 pub fn default_geoip_path() -> PathBuf {
-    existing_or_first(&rill_config_dir(), &["Country.mmdb"])
+    // mihomo's lookup: an existing `Country.mmdb` in any case, else
+    // `geoip.metadb` — the name mihomo downloads to and FlowBar bundles —
+    // else sing-box's `geoip.db`; a missing database is downloaded to
+    // `geoip.metadb`.
+    let dir = rill_config_dir();
+    ["Country.mmdb", "geoip.metadb", "geoip.db"]
+        .into_iter()
+        .map(|name| rill_rules::geosite::find_in(&dir, name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join("geoip.metadb"))
+}
+
+/// Default path for the `GeoIP.dat` mihomo's `geodata-mode` reads GEOIP
+/// from, matched without regard to case.
+pub fn default_geoip_dat_path() -> PathBuf {
+    rill_rules::geosite::find_in(&rill_config_dir(), "GeoIP.dat")
 }
 
 /// Default path for the GeoLite2-ASN MMDB. Same discovery chain as GeoIP,
@@ -3720,11 +3848,11 @@ fn existing_or_first(dir: &Path, names: &[&str]) -> PathBuf {
         .map_or_else(|| dir.join(names[0]), |name| dir.join(name))
 }
 
-/// Default on-disk path for the geosite DB used by the geodata downloader.
-/// Uses `geosite.dat` since upstream MetaCubeX stopped publishing the `.mrs`
-/// release artifact; the loader transparently accepts either format.
+/// Default on-disk path for the geosite DB used by the geodata downloader:
+/// mihomo's `GeoSite.dat`, matched without regard to case (MetaCubeX no
+/// longer publishes the `.mrs` artifact; the loader accepts either format).
 pub fn default_geosite_path() -> PathBuf {
-    rill_config_dir().join("geosite.dat")
+    rill_rules::geosite::find_in(&rill_config_dir(), "GeoSite.dat")
 }
 
 /// Return the rill home directory.
@@ -4185,7 +4313,11 @@ pub async fn build_config(
     // Geodata config — parse and validate early so path errors surface before
     // anything tries to load the DBs. `geox-url` is the mihomo top-level
     // alias, merged per-key under the explicit `geodata.url.*` values.
-    let geodata = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geodata = geodata::parse_geodata(
+        raw.geodata.as_ref(),
+        raw.geox_url.as_ref(),
+        geodata_mode(&raw),
+    )?;
 
     // General config
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
@@ -6094,6 +6226,67 @@ mod geoip_context_tests {
     }
 
     // ── geo_references / GeoDataNeeds (the shared need verdict) ────────
+
+    /// `GEOIP,LAN` is mihomo's built-in private-range check: on its own it
+    /// references no database, and it never enters the country allowlist.
+    #[test]
+    fn geoip_lan_references_no_database() {
+        assert!(!super::line_references_geoip("GEOIP,LAN,DIRECT"));
+        assert!(!super::line_references_geoip("SRC-GEOIP,lan,DIRECT"));
+        assert!(super::line_references_geoip("GEOIP,CN,DIRECT"));
+        assert!(super::line_references_geoip(
+            "OR,((GEOIP,LAN),(GEOIP,CN)),DIRECT"
+        ));
+        let got = collect_geoip_countries(&["GEOIP,LAN,DIRECT".into(), "GEOIP,cn,DIRECT".into()]);
+        assert_eq!(got, std::iter::once("CN".to_string()).collect());
+    }
+
+    /// mihomo's `geodata-mode` moves the GeoIP consumers from the MMDB to
+    /// GeoIP.dat.
+    #[test]
+    fn geodata_mode_needs_geoip_dat_not_mmdb() {
+        let needs = needs_of("geodata-mode: true\n", &["GEOIP,CN,DIRECT"]);
+        assert!(needs.geoip_dat && !needs.mmdb);
+        let needs = needs_of("mode: rule\n", &["GEOIP,CN,DIRECT"]);
+        assert!(needs.mmdb && !needs.geoip_dat);
+        let needs = needs_of("geodata-mode: true\n", &["GEOIP,LAN,DIRECT"]);
+        assert!(!needs.geoip_dat && !needs.mmdb, "LAN needs neither");
+    }
+
+    /// The shared GeoIP loader reads GeoIP.dat in geodata mode, and both
+    /// paths name a failure with the "can't load" wording mihomo uses.
+    #[test]
+    fn load_geoip_index_reads_geoip_dat_and_names_failures() {
+        // GeoIPList{GeoIP{"CN", 1.0.0.0/24}}
+        const DAT: &[u8] = &[
+            0x0a, 0x0e, 0x0a, 0x02, b'C', b'N', 0x12, 0x08, 0x0a, 0x04, 1, 0, 0, 0, 0x10, 24,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("GeoIP.dat");
+        std::fs::write(&dat, DAT).unwrap();
+        let allowed = std::iter::once("CN".to_string()).collect();
+        let index = super::load_geoip_index(true, &dat, &allowed, "GEOIP,CN,DIRECT").unwrap();
+        assert!(index.ranges_for("cn").contains("1.0.0.1".parse().unwrap()));
+
+        let err = super::load_geoip_index(
+            true,
+            &dir.path().join("absent"),
+            &allowed,
+            "GEOIP,CN,DIRECT",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("can't load GeoIP.dat"), "{err}");
+        let err = super::load_geoip_index(
+            false,
+            &dir.path().join("absent.mmdb"),
+            &allowed,
+            "GEOIP,CN,DIRECT",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("can't load GeoIP database"), "{err}");
+    }
 
     fn needs_of(yaml: &str, scan: &[&str]) -> GeoDataNeeds {
         let raw: raw::RawConfig = serde_yaml::from_str(yaml).unwrap();

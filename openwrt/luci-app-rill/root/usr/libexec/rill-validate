@@ -11,4 +11,4 @@ case "$1" in
         ;;
 esac
 # Delegated LuCI configuration is deliberately confined to /etc/rill.
-exec /usr/bin/rill --no-external-plugins -d /etc/rill -f "$scratch" -t
+exec /usr/bin/rill --no-external-plugins --offline -d /etc/rill -f "$scratch" -t

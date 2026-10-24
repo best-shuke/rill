@@ -51,9 +51,14 @@ struct Args {
     #[arg(short = 't', long = "test")]
     test: bool,
 
-    /// Set geodata mode
+    /// Set geodata mode (GEOIP reads GeoIP.dat), whatever the config says
     #[arg(short = 'm', long = "geodata-mode")]
     geodata_mode: bool,
+
+    /// With -t: no network at all — missing geodata is not downloaded (for
+    /// pre-save checks such as LuCI's that must not block)
+    #[arg(long = "offline")]
+    offline: bool,
 
     /// Specify base64-encoded configuration string
     #[arg(long = "config-string")]
@@ -221,7 +226,7 @@ fn main() -> Result<()> {
     // pass these blindly, so warn instead of bailing (tracing is not yet
     // initialized here, hence eprintln).
     if args.geodata_mode {
-        eprintln!("warning: --geodata-mode is not supported and will be ignored");
+        rill_config::force_geodata_mode(true);
     }
     if args.ext_ctl_routing_mark.is_some() {
         eprintln!("warning: --ext-ctl-routing-mark is not supported and will be ignored");
@@ -482,9 +487,12 @@ fn run_application_inner(
     if args.test {
         // Validate config only — spin up a minimal runtime for the async load.
         // Offline: a config *test* checks structure, so it must not block on a
-        // slow or unreachable subscription fetch (which also lets LuCI's
-        // pre-save `rill -t` finish inside rpcd's exec timeout).
+        // slow or unreachable subscription fetch. Missing referenced geodata
+        // is still downloaded, as mihomo's config test does (FlowBar fetches
+        // it inside its validation window); `--offline` skips that too, which
+        // LuCI's pre-save check needs to finish inside rpcd's exec timeout.
         rill_config::set_offline_validate(true);
+        rill_config::set_offline_geodata(args.offline);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;

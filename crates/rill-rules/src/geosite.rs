@@ -319,15 +319,38 @@ fn geosite_config_dir() -> PathBuf {
 /// Both `.mrs` (MetaCubeX binary) and `.dat` (V2Ray protobuf) are accepted —
 /// the loader auto-detects via magic bytes. `.mrs` is preferred when both
 /// are present, since it parses ~10× faster and has no per-entry type
-/// fidelity loss.
+/// fidelity loss. In the home directory the names match without regard to
+/// case, as mihomo matches `GeoSite.dat` (the spelling mihomo and its GUIs
+/// write).
 pub fn default_geosite_candidates() -> Vec<PathBuf> {
     let cfg = geosite_config_dir();
     vec![
-        cfg.join("geosite.mrs"),
-        cfg.join("geosite.dat"),
+        find_in(&cfg, "geosite.mrs"),
+        find_in(&cfg, "GeoSite.dat"),
         PathBuf::from("./rill/geosite.mrs"),
         PathBuf::from("./rill/geosite.dat"),
     ]
+}
+
+/// `dir/name` if that exists, else the file in `dir` whose name matches
+/// `name` ignoring ASCII case, else `dir/name` (a path to create).
+pub fn find_in(dir: &std::path::Path, name: &str) -> PathBuf {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return exact;
+    }
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .map_or(exact, |entry| entry.path())
 }
 
 /// Resolve the geosite DB from the default discovery chain. Returns `None`
@@ -394,6 +417,33 @@ pub fn discover_and_load_from(
 
 #[cfg(test)]
 mod tests {
+    /// mihomo matches `GeoSite.dat` in its home without regard to case: an
+    /// exact name wins, another spelling is found, and a missing file
+    /// resolves to the spelling asked for (where it will be downloaded).
+    #[test]
+    fn find_in_matches_names_without_case() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            find_in(dir.path(), "GeoSite.dat"),
+            dir.path().join("GeoSite.dat")
+        );
+        std::fs::write(dir.path().join("geosite.dat"), b"x").unwrap();
+        assert_eq!(
+            find_in(dir.path(), "GeoSite.dat"),
+            dir.path().join("geosite.dat")
+        );
+        std::fs::write(dir.path().join("GeoSite.dat"), b"x").unwrap();
+        if dir.path().join("geosite.dat") != dir.path().join("GeoSite.dat")
+            && std::fs::read_dir(dir.path()).unwrap().count() == 2
+        {
+            // Case-sensitive filesystem: the exact spelling wins.
+            assert_eq!(
+                find_in(dir.path(), "GeoSite.dat"),
+                dir.path().join("GeoSite.dat")
+            );
+        }
+    }
+
     use super::*;
     use crate::mrs_parser::{write_geosite_mrs, GeositePayload};
 

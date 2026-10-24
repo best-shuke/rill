@@ -27,7 +27,7 @@ start_service() {
         return 1
     }
 
-	if ! "$PROG" --no-external-plugins -d "$work_dir" -f "$config_file" -t >/dev/null 2>&1; then
+	if ! "$PROG" --no-external-plugins --offline -d "$work_dir" -f "$config_file" -t >/dev/null 2>&1; then
 		logger -t rill "config test failed for $config_file, not starting"
 		return 1
 	fi

@@ -7,8 +7,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{info, warn};
 
+// mihomo's defaults: `geoip.metadb` is a Meta-geoip0 MMDB, `geoip.dat` the
+// V2Ray GeoIPList `geodata-mode: true` reads.
 const DEFAULT_MMDB_URL: &str =
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country.mmdb";
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb";
+const DEFAULT_GEOIP_DAT_URL: &str =
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat";
 const DEFAULT_ASN_URL: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb";
 const DEFAULT_GEOSITE_URL: &str =
@@ -26,6 +30,10 @@ pub struct GeoDataConfig {
     pub mmdb_url: String,
     pub asn_url: String,
     pub geosite_url: String,
+    /// mihomo's top-level `geodata-mode`: GEOIP (and the fallback filter's
+    /// geoip gate) read `GeoIP.dat` from `geoip_dat_url` instead of an MMDB.
+    pub geodata_mode: bool,
+    pub geoip_dat_url: String,
     /// `geodata.proxy` verbatim — resolved against the built proxy map by
     /// `resolve_geodata_download_proxy` at download time (`DIRECT` and the
     /// other built-in terminal names mean "fetch direct").
@@ -43,6 +51,8 @@ impl Default for GeoDataConfig {
             mmdb_url: DEFAULT_MMDB_URL.to_string(),
             asn_url: DEFAULT_ASN_URL.to_string(),
             geosite_url: DEFAULT_GEOSITE_URL.to_string(),
+            geodata_mode: false,
+            geoip_dat_url: DEFAULT_GEOIP_DAT_URL.to_string(),
             proxy: None,
         }
     }
@@ -54,19 +64,23 @@ impl Default for GeoDataConfig {
 /// override the download URLs.
 ///
 /// URL precedence is per key: `geodata.url.*` > `geox-url.*` > baked-in
-/// default. `geox-url.geoip` is accepted and ignored with a warning —
-/// mihomo points it at `geoip.dat` and rill has no geoip.dat consumer.
+/// default. `geodata_mode` is mihomo's top-level `geodata-mode`; with it,
+/// `geox-url.geoip` (mihomo's `geoip.dat` URL) is where GEOIP's database
+/// comes from, and without it that key has nothing to configure.
 pub fn parse_geodata(
     raw: Option<&RawGeoDataConfig>,
     geox: Option<&RawGeoXUrl>,
+    geodata_mode: bool,
 ) -> Result<GeoDataConfig, anyhow::Error> {
-    if geox.and_then(|g| g.geoip.as_ref()).is_some() {
+    if !geodata_mode && geox.and_then(|g| g.geoip.as_ref()).is_some() {
         warn!(
-            "geox-url.geoip: rill has no geoip.dat consumer — the key is \
-             ignored. To override the GeoIP MMDB download URL use \
-             `geox-url.mmdb` or `geodata.url.mmdb`"
+            "geox-url.geoip: only used with geodata-mode: true (it is the GeoIP.dat \
+             URL); the GeoIP MMDB URL is `geox-url.mmdb` or `geodata.url.mmdb`"
         );
     }
+    let geoip_dat_url = geox
+        .and_then(|g| g.geoip.clone())
+        .unwrap_or_else(|| DEFAULT_GEOIP_DAT_URL.to_string());
 
     // `geodata.url.*` wins; `geox-url.*` fills in what it leaves unset;
     // the baked-in default is last. Each key merges independently.
@@ -86,6 +100,8 @@ pub fn parse_geodata(
                 geox.and_then(|g| g.geosite.as_ref()),
                 DEFAULT_GEOSITE_URL,
             ),
+            geodata_mode,
+            geoip_dat_url,
             ..GeoDataConfig::default()
         });
     };
@@ -146,6 +162,8 @@ pub fn parse_geodata(
             geox.and_then(|g| g.geosite.as_ref()),
             DEFAULT_GEOSITE_URL,
         ),
+        geodata_mode,
+        geoip_dat_url,
         proxy: r.proxy.clone(),
     })
 }
@@ -246,7 +264,7 @@ mod tests {
     }
 
     fn parse(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, anyhow::Error> {
-        parse_geodata(raw, None)
+        parse_geodata(raw, None, false)
     }
 
     #[test]
@@ -257,7 +275,7 @@ mod tests {
         assert!(cfg.mmdb_path.is_none());
         assert!(cfg.asn_path.is_none());
         assert!(cfg.geosite_path.is_none());
-        assert!(cfg.mmdb_url.contains("country.mmdb"));
+        assert!(cfg.mmdb_url.ends_with("/geoip.metadb"), "mihomo's default");
         assert!(cfg.asn_url.contains("GeoLite2-ASN"));
         assert!(cfg.geosite_url.contains("geosite.dat"));
         assert!(cfg.proxy.is_none());
@@ -358,7 +376,7 @@ mod tests {
             geosite: None,
             geoip: None,
         };
-        let cfg = parse_geodata(None, Some(&geox)).unwrap();
+        let cfg = parse_geodata(None, Some(&geox), false).unwrap();
         assert_eq!(cfg.mmdb_url, "https://cdn.test/Country.mmdb");
         assert_eq!(cfg.asn_url, "https://cdn.test/ASN.mmdb");
         assert!(
@@ -385,7 +403,7 @@ mod tests {
             geosite: Some("https://alias.test/geosite.dat".to_string()),
             geoip: None,
         };
-        let cfg = parse_geodata(Some(&raw), Some(&geox)).unwrap();
+        let cfg = parse_geodata(Some(&raw), Some(&geox), false).unwrap();
         assert_eq!(
             cfg.mmdb_url, "https://explicit.test/Country.mmdb",
             "geodata.url.mmdb beats geox-url.mmdb"
@@ -408,18 +426,33 @@ mod tests {
             geoip: Some("https://alias.test/geoip.dat".to_string()),
             ..RawGeoXUrl::default()
         };
-        let cfg = parse_geodata(None, Some(&geox)).unwrap();
-        assert!(
-            cfg.mmdb_url.contains("country.mmdb"),
-            "geoip must not leak into the mmdb URL: {}",
-            cfg.mmdb_url
+        let cfg = parse_geodata(None, Some(&geox), false).unwrap();
+        assert_eq!(
+            cfg.mmdb_url, DEFAULT_MMDB_URL,
+            "geoip must not leak into the mmdb URL"
         );
+    }
+
+    /// mihomo's top-level `geodata-mode`: `geox-url.geoip` is the GeoIP.dat
+    /// GEOIP reads; without it the baked-in default is used.
+    #[test]
+    fn geodata_mode_takes_the_geoip_dat_url() {
+        let geox = RawGeoXUrl {
+            geoip: Some("https://alias.test/geoip.dat".to_string()),
+            ..RawGeoXUrl::default()
+        };
+        let cfg = parse_geodata(None, Some(&geox), true).unwrap();
+        assert!(cfg.geodata_mode);
+        assert_eq!(cfg.geoip_dat_url, "https://alias.test/geoip.dat");
+        let cfg = parse_geodata(Some(&raw_defaults()), None, true).unwrap();
+        assert!(cfg.geodata_mode);
+        assert_eq!(cfg.geoip_dat_url, DEFAULT_GEOIP_DAT_URL);
     }
 
     /// An empty `geox-url:` map changes nothing.
     #[test]
     fn empty_geox_url_is_a_noop() {
-        let cfg = parse_geodata(None, Some(&RawGeoXUrl::default())).unwrap();
+        let cfg = parse_geodata(None, Some(&RawGeoXUrl::default()), false).unwrap();
         assert_eq!(cfg.mmdb_url, DEFAULT_MMDB_URL);
         assert_eq!(cfg.asn_url, DEFAULT_ASN_URL);
         assert_eq!(cfg.geosite_url, DEFAULT_GEOSITE_URL);

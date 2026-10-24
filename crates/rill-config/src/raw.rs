@@ -259,6 +259,9 @@ pub struct RawConfig {
     /// into [`GeoDataConfig`](crate::GeoDataConfig) by
     /// `geodata::parse_geodata` below `geodata.url.*`.
     pub geox_url: Option<RawGeoXUrl>,
+    /// mihomo's top-level `geodata-mode`: `true` reads GEOIP from V2Ray's
+    /// `GeoIP.dat` (downloaded from `geox-url.geoip`) instead of an MMDB.
+    pub geodata_mode: Option<bool>,
     /// TUN inbound (issue #326) — mihomo-compatible `tun:` section.
     /// Requires a build with the `listener-tun` feature.
     pub tun: Option<RawTun>,

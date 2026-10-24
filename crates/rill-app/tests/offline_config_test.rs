@@ -60,7 +60,7 @@ async fn config_test_validates_cached_rules_without_refreshing() {
 }
 
 #[tokio::test]
-async fn config_test_does_not_download_missing_geodata() {
+async fn config_test_offline_does_not_download_missing_geodata() {
     let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     server.set_nonblocking(true).unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -69,15 +69,115 @@ async fn config_test_does_not_download_missing_geodata() {
         "geodata:\n  mmdb-path: '{}'\n  url:\n    mmdb: http://{}/country.mmdb\nrules: ['GEOIP,US,DIRECT']\n",
         directory.path().join("missing.mmdb").display(), server.local_addr().unwrap()
     )).unwrap();
-    let output = run_offline(directory.path(), &config).await;
+    let mut command = offline_command();
+    command
+        .arg("--offline")
+        .args(["-d"])
+        .arg(directory.path())
+        .arg("-f")
+        .arg(&config);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .expect("--offline validation must finish without network access")
+        .unwrap();
     assert!(
         output.status.success(),
-        "first-start configs must validate before geodata is downloaded: {output:?}"
+        "`-t --offline` validates before geodata is downloaded: {output:?}"
     );
     assert_eq!(
         server.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+/// `GeoIPList{GeoIP{"US", 8.8.8.0/24}}` — a minimal V2Ray GeoIP.dat.
+const GEOIP_DAT: &[u8] = &[
+    0x0a, 0x0e, // entry
+    0x0a, 0x02, b'U', b'S', // country_code
+    0x12, 0x08, // cidr
+    0x0a, 0x04, 8, 8, 8, 0, // ip
+    0x10, 24, // prefix
+];
+
+/// Serve one HTTP response to every connection, on a background thread.
+fn serve_http(status: &'static str, body: &'static [u8]) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut stream in server.incoming().flatten() {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+        }
+    });
+    addr
+}
+
+/// mihomo's config test downloads a missing database the config needs, and
+/// FlowBar reads the progress from mihomo's wording; plain `rill -t` does
+/// the same (here through `geodata-mode`'s GeoIP.dat).
+#[tokio::test]
+async fn config_test_downloads_missing_geodata_like_mihomo() {
+    let addr = serve_http("200 OK", GEOIP_DAT);
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "geodata-mode: true\ngeox-url:\n  geoip: http://{addr}/geoip.dat\n\
+             rules: ['GEOIP,US,DIRECT', 'GEOIP,LAN,DIRECT', 'MATCH,DIRECT']\n"
+        ),
+    )
+    .unwrap();
+    let output = run_offline(directory.path(), &config).await;
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.status.success(), "{log}");
+    assert!(
+        log.contains("Can't find GeoIP.dat, start download"),
+        "{log}"
+    );
+    assert!(log.contains("Download GeoIP.dat finish"), "{log}");
+    assert_eq!(
+        std::fs::read(directory.path().join("GeoIP.dat")).unwrap(),
+        GEOIP_DAT
+    );
+}
+
+/// When that download fails, the test fails — with the "can't …" wording
+/// FlowBar turns into its geo-database hint.
+#[tokio::test]
+async fn config_test_fails_when_needed_geodata_cannot_download() {
+    let addr = serve_http("404 Not Found", b"");
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "geodata-mode: true\ngeox-url:\n  geoip: http://{addr}/geoip.dat\n\
+             rules: ['GEOIP,US,DIRECT', 'MATCH,DIRECT']\n"
+        ),
+    )
+    .unwrap();
+    let output = run_offline(directory.path(), &config).await;
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+    .to_lowercase();
+    assert!(!output.status.success(), "{log}");
+    assert!(log.contains("can't download geoip.dat"), "{log}");
+    assert!(log.contains("can't load geoip.dat"), "{log}");
 }
 
 /// A `rill -t` command hardened the way this suite requires: kills the
