@@ -10,8 +10,10 @@
 use std::net::IpAddr;
 
 use ipnet::IpNet;
-use route_manager::{Route, RouteKind, RouteManager};
-use tracing::{debug, info, warn};
+#[cfg(target_os = "linux")]
+use route_manager::RouteKind;
+use route_manager::{Route, RouteManager};
+use tracing::{debug, warn};
 
 pub(super) struct RouteGuard {
     manager: RouteManager,
@@ -72,16 +74,39 @@ pub(super) fn default_route(
             r.prefix() == 0
                 && r.destination().is_ipv6() == v6
                 && r.destination().is_unspecified()
-                && r.kind() == RouteKind::Unicast
+                && unicast(r)
                 && !if_scoped(r)
                 && main_table(r)
         })
         .filter_map(|r| {
             let index = r.if_index().filter(|&i| i != tun_index)?;
-            Some((r.metric().unwrap_or(0), r.gateway(), index))
+            Some((metric(r), r.gateway(), index))
         })
+        // The first listed wins a tie — on macOS, which has no metric, the
+        // table order decides.
         .min_by_key(|(metric, _, _)| *metric)
         .map(|(_, gateway, index)| (gateway, index)))
+}
+
+/// A forwarding route — not an unreachable/blackhole one (Linux, macOS;
+/// Windows lists forwarding routes only).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unicast(route: &Route) -> bool {
+    route.kind() == route_manager::RouteKind::Unicast
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unicast(_route: &Route) -> bool {
+    true
+}
+
+/// The route's metric, lower wins; macOS routes have none.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn metric(route: &Route) -> u32 {
+    route.metric().unwrap_or(0)
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn metric(_route: &Route) -> u32 {
+    0
 }
 
 /// macOS `RTF_IFSCOPE`: a default only sockets scoped to its interface use
@@ -183,7 +208,7 @@ impl RpFilterGuard {
             );
             return None;
         }
-        info!("tun: rp_filter on '{iface}' loosened from 1 to 2 for return traffic");
+        tracing::info!("tun: rp_filter on '{iface}' loosened from 1 to 2 for return traffic");
         Some(Self {
             iface: iface.to_owned(),
             previous: own.to_string(),
@@ -215,6 +240,7 @@ impl Drop for RpFilterGuard {
 /// and bypass the proxy. Two `/1`s outrank the physical `::/0` the same
 /// way the split routes do; on-link prefixes (the LAN, link-local) stay
 /// reachable, as their IPv4 counterparts do.
+#[cfg(target_os = "linux")]
 pub(super) fn strict_ipv6_routes() -> Vec<Route> {
     ["::/1", "8000::/1"]
         .into_iter()
@@ -223,6 +249,12 @@ pub(super) fn strict_ipv6_routes() -> Vec<Route> {
             Route::new(net.network(), net.prefix_len()).with_kind(RouteKind::Unreachable)
         })
         .collect()
+}
+/// Not installed outside Linux (see the call site): macOS has no strict
+/// routing in mihomo, and Windows blocks with filters rather than routes.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn strict_ipv6_routes() -> Vec<Route> {
+    Vec::new()
 }
 
 impl Drop for RouteGuard {
