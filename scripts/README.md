@@ -7,6 +7,7 @@ root for the firewall (`nft` on Linux, `pfctl` on macOS).
 | Script | Platform | Purpose |
 |--------|----------|---------|
 | `fetch-wintun.sh` | any (writes a Windows DLL) | Download the official signed `wintun.dll` for a Rust Windows target. Official release zips already include it. |
+| `licenses.py` | any | Write `LICENSE-THIRD-PARTY.txt`: the notices of every crate (and vendored C library) the `rill` binary links for a target, from the locked sources. The release workflow ships it in every archive. |
 | `tproxy-local-linux.sh` / `tproxy-local-macos.sh` | Linux / macOS | Proxy **this host's own** outbound traffic. Runs rill; rill auto-manages the firewall. |
 | `tproxy-gateway-linux.sh` / `tproxy-gateway-macos.sh` | Linux / macOS | Make this host a **LAN gateway** that forwards & proxies **other devices'** traffic. Installs the firewall rill does *not* create. |
 | `verify-tproxy-setup.sh` + `verify-tproxy-test.sh` | Linux / macOS | Bring up a loopback rig and assert local-outbound interception works. |

@@ -17,7 +17,11 @@ meow-rs's own history is kept in `docs/history/meow-rs-CHANGELOG.md`.
   queues are 4096 frames deep and the Linux TUN txqueuelen is 4096. MTU 9000
   single flow 1.49 → 5.51 Gbps, 32-flow parallel 1.09 → 5.12 Gbps
   (docs/benchmarks/tun-inbound-2026-10.md).
-- **CI** is only the Linux `lint`, `test` and `features` jobs.
+- **CI** is the Linux `lint`, `test` and `features` jobs, plus a release
+  workflow (`v*` tags, or run by hand to only build) for static Linux
+  x86_64/aarch64, macOS arm64 and Windows x64/arm64. Each archive carries
+  `LICENSE`, `NOTICE` and `LICENSE-THIRD-PARTY.txt` (and Wintun's license
+  on Windows).
 
 ### Added
 

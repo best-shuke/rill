@@ -1,0 +1,146 @@
+name: Release
+
+# Builds `rill` for the platforms desktop front ends (FlowBar) ship it on.
+# A `v*` tag publishes the archives as a GitHub release; a manual run only
+# builds them and keeps them as workflow artifacts, to check a platform
+# compiles before tagging.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is static musl, built with cargo-zigbuild: one binary runs
+          # on any distribution.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # wintun.dll is embedded at build time (rill-listener/build.rs).
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          # rust-toolchain.toml wins inside the checkout: install its pin and
+          # add the target to it, not to floating stable.
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup target add --toolchain "$tc" "${{ matrix.target }}"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: release-${{ matrix.target }}
+
+      - name: Install zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build
+        shell: bash
+        run: |
+          # Default features = full (rill-app/Cargo.toml); TLS is BoringSSL.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rill
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --bin rill
+          fi
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ref="${{ github.ref_name }}"
+          else
+            ref="dev-${GITHUB_SHA::7}"
+          fi
+          name="rill-${ref}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cp LICENSE NOTICE README.md "${staging}/"
+          # Every linked dependency's notices, read from the locked sources.
+          cargo fetch --locked --target ${{ matrix.target }}
+          python="$(command -v python3 || command -v python)"
+          "$python" scripts/licenses.py "${staging}/LICENSE-THIRD-PARTY.txt" ${{ matrix.target }}
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # The embedded wintun.dll's own license.
+            bash scripts/fetch-wintun.sh --target ${{ matrix.target }} --outdir dist/wintun
+            cp dist/wintun/LICENSE.txt "${staging}/LICENSE-WINTUN.txt"
+            cp "target/${{ matrix.target }}/release/rill.exe" "${staging}/"
+            pwsh -Command "Compress-Archive -Path 'dist/${name}' -DestinationPath '${name}.zip'"
+            archive="${name}.zip"
+          else
+            cp "target/${{ matrix.target }}/release/rill" "${staging}/"
+            tar -C dist -czf "${name}.tar.gz" "${name}"
+            archive="${name}.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rill-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat dist/*.sha256 > dist/SHA256SUMS
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "rill ${{ github.ref_name }}" \
+            --notes "Static Linux (musl), macOS arm64 and Windows x64/arm64 builds of rill. SHA256SUMS lists every archive."
