@@ -81,7 +81,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
 | `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
-| `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. |
+| `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. As in mihomo, a match is final: no fallback-filter, no fall-through to `nameserver`/`fallback`. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP (incl. `geoip-code: LAN`)/IP-CIDR/domain/geosite gates. |
 | `dns:` — `hosts` + `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |

@@ -7,6 +7,12 @@ Depends on: M1.E-1/E-2 (`dns-doh-dot.md`) — nameserver URL parser reused here.
 See also: [`docs/specs/dns-doh-dot.md`](dns-doh-dot.md) §URL parser.
 Upstream reference: `dns/resolver.go`, `dns/client/client.go`.
 
+**2026-10-25 amendment:** a nameserver-policy match is now final, as in
+mihomo: the policy servers answer alone, ahead of the fallback-filter domain
+gate, and their answer — positive, negative or failure — is neither
+fallback-filtered nor passed on to the global or fallback servers. The
+lookup flow and resolved question 2 below describe the superseded design.
+
 ## Motivation
 
 `nameserver-policy` maps domain patterns to dedicated nameserver lists.
@@ -150,8 +156,8 @@ query(domain, qtype):
      → return result (or error if fallback also fails)
 ```
 
-Note: policy nameservers and global nameservers both pass through
-fallback-filter. A domain-pattern gate in fallback-filter bypasses
+Note (superseded 2026-10-25, see the amendment at the top): policy
+nameservers and global nameservers both pass through fallback-filter. A domain-pattern gate in fallback-filter bypasses
 steps 3 and 4 (skips primary entirely) and goes straight to step 5.
 
 ### NameserverPolicy struct
@@ -336,7 +342,7 @@ boilerplate of a manual `FuturesUnordered` loop.
    "first success wins, cancel losers" semantics. See §Parallel resolution.
 
 2. **fallback-filter gates both policy and global nameserver results** — confirmed
-   correct. A policy nameserver can be poisoned just as easily as a global one.
+   correct (superseded 2026-10-25: policy results are final, as in mihomo). A policy nameserver can be poisoned just as easily as a global one.
 
 3. **Fallback results are not re-filtered** — confirmed correct. Fallback is the
    user's explicitly-configured trusted alternate; re-filtering would create a

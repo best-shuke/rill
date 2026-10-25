@@ -31,6 +31,9 @@ dns:
   override. Like mihomo, `respect-rules` requires a non-empty
   `proxy-server-nameserver`: node hostnames must not resolve through
   nameservers the rules may route through those nodes.
+- A `nameserver-policy` match is final, as in mihomo: if its servers fail
+  or answer negatively, the query is not retried on `nameserver` or
+  `fallback`, and their answer skips `fallback-filter`.
 - `direct-nameserver` provides a separate resolver/cache for direct outbound
   hostname lookups and, as in mihomo, does not inherit `respect-rules`.
   `direct-nameserver-follow-policy: true` applies the same

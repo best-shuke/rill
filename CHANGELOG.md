@@ -20,6 +20,11 @@
   `proxy-server-nameserver` and does not apply to `direct-nameserver`.
   Preserve encryption for IP-literal `default-nameserver` entries. See
   [DNS routing](docs/dns-routing.md).
+- As in mihomo, a `nameserver-policy` match is final: its answer, failure
+  included, is no longer fallback-filtered or retried on `nameserver` /
+  `fallback`, and the policy outranks the fallback-filter domain gate. A
+  down policy upstream (say, one routed through a proxy) no longer sends
+  the query to the global nameservers.
 - DNS logs name the outbound an upstream uses instead of `#PROXY`, and
   show an SNI override as `#sni=…`.
 - Carry Vision UDP in Vision-protected VLESS CommandMux/Mux.Cool

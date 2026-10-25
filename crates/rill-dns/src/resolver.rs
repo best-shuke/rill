@@ -457,9 +457,9 @@ impl FamilySet {
 /// still completes well under 1 s.
 ///
 /// The grace period is counted **per tier**: a lookup that runs the full
-/// policy → main → fallback chain and receives a fast negative in every tier
-/// accrues up to ~3× this period (≈900 ms) of extra latency before the
-/// negative is returned.
+/// main → fallback chain and receives a fast negative in both tiers accrues
+/// up to ~2× this period (≈600 ms) of extra latency before the negative is
+/// returned. A nameserver-policy match is a single tier.
 const NEGATIVE_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 /// Query a pool of clients in parallel for the requested family set `want`,
@@ -1615,8 +1615,8 @@ impl Resolver {
     /// path and `lookup_actual_family`/`query_pool_family`/`try_fallback_family`
     /// for the per-family DNS-server path — and they had already diverged
     /// (single-flight and negative bookkeeping existed in only one each). Both
-    /// now share domain-gate → policy → main → fallback, single-flight, and
-    /// symmetric negative bookkeeping.
+    /// now share the tiers — a final nameserver-policy match, else domain-gate
+    /// → main → fallback — single-flight, and symmetric negative bookkeeping.
     ///
     /// `want` selects which families to fetch: `BOTH` uses the concurrent
     /// A+AAAA client path (for `resolve_ips`); a single family uses the
@@ -1714,6 +1714,16 @@ impl Resolver {
     ) -> (Option<FamilySet>, Option<ClientError>) {
         debug!(host, ?want, "DNS lookup");
 
+        // As in mihomo, a nameserver-policy match is final: its servers answer
+        // alone, before the fallback-filter domain gate, and their answer —
+        // positive, negative or failure — is not fallback-filtered and never
+        // falls through, so a failing policy upstream cannot hand the query
+        // to a server the policy keeps it away from.
+        if let Some(entry) = self.policy_entry(host) {
+            conn_note!(Dns, "nameserver-policy matched {host}");
+            return query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+        }
+
         // Domain-gate: skip primary entirely, go straight to fallback.
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(host) {
@@ -1725,40 +1735,9 @@ impl Resolver {
         // Symmetric first-wins negative bookkeeping (review issue F): the first
         // tier's definitive negative is kept and later tiers' negatives never
         // overwrite it, so the rcode the client sees depends on tier order
-        // (policy → main → fallback), not on an asymmetric clobber rule.
+        // (main → fallback), not on an asymmetric clobber rule.
         let mut negative: Option<FamilySet> = None;
         let mut upstream_err: Option<ClientError> = None;
-
-        // Nameserver-policy lookup.
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(host) {
-                conn_note!(Dns, "nameserver-policy matched {host}");
-                let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
-                upstream_err = prefer_errno(upstream_err, err);
-                if let Some(set) = set {
-                    if set.has_positive() {
-                        if self
-                            .fallback_filter
-                            .as_ref()
-                            .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
-                        {
-                            conn_note!(
-                                Dns,
-                                "fallback-filter rejects {}; asking the fallback servers",
-                                IpList(&set.positive_ips())
-                            );
-                            let (set, err) = self.query_fallback_set(host, want).await;
-                            return (set, prefer_errno(err, upstream_err));
-                        }
-                        return (Some(set), upstream_err);
-                    }
-                    if negative.is_none() {
-                        negative = Some(set);
-                    }
-                }
-                // Policy negative: fall through to global nameservers.
-            }
-        }
 
         // Global nameservers (parallel, first-positive / first-definitive-negative).
         {
@@ -1800,6 +1779,15 @@ impl Resolver {
             }
         }
         (negative, upstream_err)
+    }
+
+    /// The nameserver-policy entry for `domain`. An entry without servers
+    /// does not count as a match, as in mihomo.
+    fn policy_entry(&self, domain: &str) -> Option<&PolicyEntry> {
+        self.policy
+            .as_ref()?
+            .lookup(domain)
+            .filter(|entry| !entry.nameservers.is_empty())
     }
 
     async fn query_fallback_set(
@@ -1867,8 +1855,8 @@ impl Resolver {
     }
 
     /// Forward a non-A/AAAA query (TXT, MX, SRV, HTTPS, SOA, PTR, …) through
-    /// the nameserver tiers — domain-gate → policy → main → fallback — and
-    /// return the upstream `Message` so callers can relay all of its
+    /// the nameserver tiers — a final policy match, else domain-gate → main →
+    /// fallback — and return the upstream `Message` so callers can relay all of its
     /// sections — answer, authority and additional — to their own client
     /// with per-hop identity rewritten.
     ///
@@ -1886,18 +1874,13 @@ impl Resolver {
         query_name: &Name,
         record_type: RecordType,
     ) -> Option<Message> {
+        // A policy match is final here too (see `pipeline_inner`).
+        if let Some(entry) = self.policy_entry(domain) {
+            return query_pool_generic(&entry.nameservers, query_name, record_type).await;
+        }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
                 return self.try_fallback_generic(query_name, record_type).await;
-            }
-        }
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(domain) {
-                if let Some(l) =
-                    query_pool_generic(&entry.nameservers, query_name, record_type).await
-                {
-                    return Some(l);
-                }
             }
         }
         if let Some(l) = query_pool_generic(&self.main, query_name, record_type).await {
@@ -2241,6 +2224,104 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// UDP upstream answering every A query with `ip` (anything else with an
+    /// empty NOERROR), counting the queries it receives.
+    async fn counting_a_upstream(ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&queries);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let request = Message::from_bytes(&buf[..len]).unwrap();
+                let query = request.queries[0].clone();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                if query.query_type() == RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        RData::A(A(ip)),
+                    ));
+                }
+                response.add_query(query);
+                let _ = socket.send_to(&response.to_bytes().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    /// As in mihomo, a nameserver-policy match is final: its failure or
+    /// negative never reaches the global or fallback servers, its answer is
+    /// not fallback-filtered, and it outranks the fallback-filter domain gate.
+    #[tokio::test]
+    async fn nameserver_policy_match_is_final() {
+        let (global, global_queries) = counting_a_upstream(Ipv4Addr::new(203, 0, 113, 1)).await;
+        let (bogon, _) = counting_a_upstream(Ipv4Addr::new(240, 0, 0, 1)).await;
+        let mut policy = NameserverPolicy::new();
+        for (domain, client) in [
+            ("nx.corp.test", DnsClient::rcode(ResponseCode::NXDomain)),
+            ("fail.corp.test", DnsClient::rcode(ResponseCode::ServFail)),
+            ("bogon.corp.test", DnsClient::udp(bogon)),
+        ] {
+            policy.insert_exact(
+                domain.to_string(),
+                PolicyEntry {
+                    nameservers: vec![Arc::new(client)],
+                },
+            );
+        }
+        let mut gated = DomainTrie::new();
+        gated.insert("+.corp.test", ());
+        let mut resolver = Resolver::new(
+            vec![global],
+            vec![global],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            false,
+        );
+        resolver.policy = Some(policy);
+        resolver.fallback_filter = Some(FallbackFilter {
+            geoip_enabled: false,
+            geoip_code: "CN".to_string(),
+            ipcidr: vec!["240.0.0.0/4".parse().unwrap()],
+            domain: gated,
+            geosite: None,
+            geoip_trusted: None,
+        });
+
+        assert_eq!(resolver.resolve_ips("nx.corp.test").await.unwrap(), None);
+        assert!(resolver.resolve_ips("fail.corp.test").await.is_err());
+        assert_eq!(
+            resolver.resolve_ips("bogon.corp.test").await.unwrap(),
+            Some(vec![IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))]),
+            "a policy answer is not fallback-filtered"
+        );
+        let txt = resolver
+            .forward_generic(
+                "fail.corp.test",
+                &"fail.corp.test.".parse().unwrap(),
+                RecordType::TXT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(txt.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            global_queries.load(Ordering::SeqCst),
+            0,
+            "a policy match must never reach the global or fallback servers"
+        );
+
+        assert_eq!(
+            resolver.resolve_ips("unmatched.test").await.unwrap(),
+            Some(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))])
+        );
+        assert_eq!(global_queries.load(Ordering::SeqCst), 1);
     }
 
     /// Issue #695: `reset_connections` reaches every upstream the resolver
