@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 — 2026-10-25
 
 - Keep the `warning` log to what concerns the whole process: a failed
   connection, DNS reply or UDP flow, a rule target skipped for one
