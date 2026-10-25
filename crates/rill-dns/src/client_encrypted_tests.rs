@@ -118,17 +118,17 @@ async fn doh_and_dot_use_proxy_with_verified_tls_and_separate_origin_name() {
         })
         .unwrap();
         let reply = if http {
-            doh_exchange_with_tls(
+            doh_exchange(
                 address,
                 "origin.test",
                 "/dns-query",
                 b"dns-query",
                 Some(&routed),
-                tls,
+                &tls,
             )
             .await
         } else {
-            dot_exchange_with_tls(address, "origin.test", b"dns-query", Some(&routed), tls).await
+            dot_exchange(address, "origin.test", b"dns-query", Some(&routed), &tls).await
         }
         .unwrap();
         assert_eq!(reply, b"dns-answer");
@@ -149,12 +149,40 @@ async fn encrypted_dns_through_proxy_still_rejects_wrong_certificate_name() {
         ..TlsConfig::new("wrong.invalid")
     })
     .unwrap();
-    let result =
-        dot_exchange_with_tls(address, "origin.test", b"dns-query", Some(&proxy), tls).await;
+    let result = dot_exchange(address, "origin.test", b"dns-query", Some(&proxy), &tls).await;
     assert!(
         matches!(result, Err(ClientError::Tls(_))),
         "routing must preserve certificate verification"
     );
+}
+
+#[tokio::test]
+async fn skip_cert_verify_accepts_an_untrusted_certificate_only_when_asked() {
+    for skip in [false, true] {
+        let (address, _root) = tls_server(false).await;
+        let tls = tls_layer("localhost", "dot", skip).unwrap();
+        let result = dot_exchange(address, "localhost", b"dns-query", None, &tls).await;
+        if skip {
+            assert_eq!(result.unwrap(), b"dns-answer");
+        } else {
+            assert!(
+                matches!(result, Err(ClientError::Tls(_))),
+                "a self-signed certificate must be rejected by default"
+            );
+        }
+    }
+}
+
+#[test]
+fn skip_cert_verify_option_reaches_the_cached_tls_layer() {
+    let entry =
+        crate::upstream::NameServerEntry::parse("tls://127.0.0.1#skip-cert-verify=true").unwrap();
+    let client =
+        DnsClient::dot("127.0.0.1:853".parse().unwrap(), "127.0.0.1").with_options(entry.options);
+    assert!(client.options.skip_cert_verify);
+    let first: *const TlsLayer = client.tls("127.0.0.1", "dot").unwrap();
+    let second: *const TlsLayer = client.tls("127.0.0.1", "dot").unwrap();
+    assert_eq!(first, second, "one TLS layer per upstream, not per query");
 }
 
 #[test]
@@ -167,5 +195,65 @@ fn doh_chunked_body_rejects_truncation_and_oversize() {
     assert_eq!(
         decode_doh_body(header, b"3;ext=1\r\nabc\r\n0\r\n\r\n").unwrap(),
         b"abc"
+    );
+}
+
+/// A hostname DoH upstream dials its bootstrap IP but keeps the hostname as
+/// TLS name and HTTP `Host`; `skip-cert-verify=true` admits the test cert.
+#[tokio::test]
+async fn bootstrapped_doh_upstream_keeps_its_hostname() {
+    let certified = rcgen::generate_simple_self_signed(vec!["doh.test".into()]).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![certified.cert.der().clone()], key.into())
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        let sni = socket.get_ref().1.server_name().map(str::to_owned);
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(socket.read_u8().await.unwrap());
+        }
+        let header = String::from_utf8(header).unwrap();
+        let length: usize = header
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut query = vec![0; length];
+        socket.read_exact(&mut query).await.unwrap();
+        let request = Message::from_bytes(&query).unwrap();
+        let mut reply = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+        reply.add_queries(request.queries.iter().cloned());
+        let body = reply.to_bytes().unwrap();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.shutdown().await.unwrap();
+        (sni, header)
+    });
+
+    let entry = crate::upstream::NameServerEntry::parse(&format!(
+        "https://doh.test:{port}/dns-query#skip-cert-verify=true"
+    ))
+    .unwrap();
+    let resolved = HashMap::from([("doh.test".to_owned(), IpAddr::from([127, 0, 0, 1]))]);
+    let client = crate::Resolver::build_client(&entry.url, &resolved, None, entry.options);
+    client.query("example.test", RecordType::A).await.unwrap();
+    let (sni, header) = server.await.unwrap();
+    assert_eq!(sni.as_deref(), Some("doh.test"));
+    assert!(
+        header.contains(&format!("\r\nHost: doh.test:{port}\r\n")),
+        "{header}"
     );
 }

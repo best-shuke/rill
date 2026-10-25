@@ -187,7 +187,7 @@ cargo test -p rill-config --features trusttunnel-h3 --lib
 # lands `main` red.
 cargo test --lib --bin rill --bin rill-bench --bin rill-cli \
   --test socks5_udp_user \
-  --test common_test --test dns_cache_test --test config_test \
+  --test common_test --test dns_cache_test --test dns_routing_integration --test config_test \
   --test tun_config_test --test dialer_proxy_group \
   --test statistics_test --test rules_test --test api_test --test rill_cli_test \
   --test raii_guard_test --test http_connection_close \

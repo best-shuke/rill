@@ -6,10 +6,22 @@
   as well as plain DNS. Encrypted queries now support proxy transports
   with normal certificate verification; use `&sni=hostname` for an
   explicit TLS name override. Decode chunked DoH responses.
+- Understand mihomo's nameserver parameters (`#h3=true`,
+  `#skip-cert-verify=true`, `#ecs=…`, `#disable-ipv6=true`, …), which used
+  to be taken as the TLS name: `skip-cert-verify`, `ecs` and `disable-*`
+  take effect, the rest are ignored with a warning.
+- A `#name` DNS outbound the config does not define no longer fails the
+  config (`nameserver`, `fallback`) or quietly queries direct
+  (`nameserver-policy`): as in mihomo it loads with a warning and its
+  queries fail. `strict: true` rejects it.
 - Honor `dns.respect-rules`, `direct-nameserver` and
   `direct-nameserver-follow-policy`, including resolver reloads and
-  independent direct-DNS caching. Preserve encryption for IP-literal
-  `default-nameserver` entries. See [DNS routing](docs/dns-routing.md).
+  independent direct-DNS caching. As in mihomo, `respect-rules` requires
+  `proxy-server-nameserver` and does not apply to `direct-nameserver`.
+  Preserve encryption for IP-literal `default-nameserver` entries. See
+  [DNS routing](docs/dns-routing.md).
+- DNS logs name the outbound an upstream uses instead of `#PROXY`, and
+  show an SNI override as `#sni=…`.
 - Carry Vision UDP in Vision-protected VLESS CommandMux/Mux.Cool
   sessions, avoiding sing-box's missing-flow rejection. Recreate these
   sessions after outbound-interface changes.

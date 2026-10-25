@@ -1689,18 +1689,29 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
-    let tagged = |s: &String| s.contains('#');
-    let urls_tagged =
-        |urls: &Option<Vec<String>>| urls.as_deref().is_some_and(|us| us.iter().any(tagged));
+    // Only a node or group name captures adapters: option parameters
+    // (`#h3=true`), `#DIRECT` and the live `#RULES` router capture none.
+    // An entry that does not parse is counted whenever it has a fragment.
+    let tagged = |s: &str| {
+        rill_dns::upstream::NameServerEntry::parse(s).map_or(s.contains('#'), |entry| {
+            entry
+                .proxy
+                .is_some_and(|name| name != "DIRECT" && name != "RULES")
+        })
+    };
+    let urls_tagged = |urls: &Option<Vec<String>>| {
+        urls.as_deref()
+            .is_some_and(|us| us.iter().map(String::as_str).any(tagged))
+    };
     urls_tagged(&dns.nameserver)
         || urls_tagged(&dns.fallback)
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
         || urls_tagged(&dns.direct_nameserver)
-        || dns.nameserver_policy.as_ref().is_some_and(|m| {
-            m.iter()
-                .any(|(_k, v)| v.as_urls().iter().any(|u| u.contains('#')))
-        })
+        || dns
+            .nameserver_policy
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -4497,6 +4508,22 @@ mod tests {
             && !dns_uses_runtime_refs(&raw_with_tag)
             && !dns_uses_runtime_refs(&raw_with_tag);
         assert!(!unchanged, "a `#name` nameserver must force a rebuild");
+
+        // Fragments that name no adapter capture nothing, so they must not
+        // force a rebuild (and a re-bootstrap) on every commit.
+        for fragment in ["h3=true", "DIRECT&ecs=1.2.3.0/24", "RULES", "sni=one.one"] {
+            let raw: RawConfig = serde_yaml::from_str(&format!(
+                "dns:\n  enable: true\n  nameserver: ['tcp://1.1.1.1#{fragment}']\n  \
+                 nameserver-policy:\n    a.test: 'tcp://1.1.1.1#{fragment}'\n"
+            ))
+            .unwrap();
+            assert!(!dns_uses_proxy_refs(&raw), "#{fragment}");
+        }
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    a.test: 'tcp://1.1.1.1#h3=true&P'\n",
+        )
+        .unwrap();
+        assert!(dns_uses_proxy_refs(&raw));
 
         // rule-set: policy refs also force a rebuild — the matcher holds
         // provider Arcs that must track the committed generation's set.

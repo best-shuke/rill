@@ -7,10 +7,10 @@ use rill_dns::resolver::{
     FallbackFilter, HostEntry, NameserverPolicy, NameserverPolicyMatcher, PolicyEntry,
 };
 use rill_dns::upstream::{NameServerEntry, NameServerUrl};
-use rill_dns::{DnsClient, HostOrIp, Resolver};
+use rill_dns::{DnsClient, Resolver};
 use rill_rules::{RuleSet, RuleSetBehavior};
 use rill_trie::DomainTrie;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,22 +67,70 @@ pub async fn parse_dns(
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
     let respect_rules = dns.respect_rules.unwrap_or(false);
+    // mihomo refuses this too: node hostnames would resolve through the
+    // rule-routed nameservers, which the rules may send through those nodes.
+    if respect_rules
+        && dns
+            .proxy_server_nameserver
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+    {
+        anyhow::bail!(
+            "dns.respect-rules needs dns.proxy-server-nameserver: without it, proxy server \
+             hostnames resolve through rule-routed nameservers that may route through those \
+             very proxies"
+        );
+    }
     let rule_routing = Arc::new(rill_dns::routing::RoutingDnsProxy::default());
     let mut registry = proxy_registry.clone();
     registry.insert(
         "RULES".into(),
         Arc::clone(&rule_routing) as Arc<dyn rill_common::Proxy>,
     );
-    let proxy_registry = &registry;
 
     let mut main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
     let mut fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
+    // mihomo applies `respect-rules` to these lists and to nameserver-policy
+    // only; proxy-server-nameserver and direct-nameserver keep their own route.
     apply_default_dns_route(&mut main_urls, respect_rules);
     apply_default_dns_route(&mut fallback_urls, respect_rules);
     let default_ns_urls =
         parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
     let proxy_ns_urls =
         parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
+    let direct_urls = parse_nameserver_entries(dns.direct_nameserver.as_deref().unwrap_or(&[]))?;
+    // Policy values are rebuilt per key below; parse them once here for the
+    // checks that cover every list.
+    let policy_entries: Vec<(String, NameServerEntry)> = dns
+        .nameserver_policy
+        .iter()
+        .flatten()
+        .flat_map(|(key, value)| value.as_urls().into_iter().map(move |url| (key, url)))
+        .filter_map(|(key, url)| {
+            NameServerEntry::parse(url)
+                .ok()
+                .map(|entry| (format!("nameserver-policy '{key}'"), entry))
+        })
+        .collect();
+    let listed = [
+        ("nameserver", &main_urls),
+        ("fallback", &fallback_urls),
+        ("default-nameserver", &default_ns_urls),
+        ("proxy-server-nameserver", &proxy_ns_urls),
+        ("direct-nameserver", &direct_urls),
+    ]
+    .into_iter()
+    .flat_map(|(section, entries)| entries.iter().map(move |entry| (section, entry)));
+    let every_entry: Vec<(&str, &NameServerEntry)> = listed
+        .chain(
+            policy_entries
+                .iter()
+                .map(|(key, entry)| (key.as_str(), entry)),
+        )
+        .collect();
+    warn_ignored_parameters(&every_entry);
+    let missing_outbounds = stub_missing_outbounds(&every_entry, &mut registry, strict)?;
+    let proxy_registry = &registry;
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -114,7 +162,10 @@ pub async fn parse_dns(
     let proxy_resolver = if proxy_ns_urls.is_empty() {
         None
     } else {
-        for (nameserver, proxy) in circular_proxy_tags(&proxy_ns_urls, proxy_registry) {
+        for (nameserver, proxy) in circular_proxy_tags(&proxy_ns_urls, proxy_registry)
+            .into_iter()
+            .filter(|(_, proxy)| !missing_outbounds.contains(proxy))
+        {
             warn!(
                 "dns.proxy-server-nameserver '{nameserver}' is tagged #{proxy}, but '{proxy}' is \
                  itself reached by hostname — resolving that hostname is what this nameserver \
@@ -155,7 +206,9 @@ pub async fn parse_dns(
                     .into_iter()
                     .map(|url| {
                         if respect_rules
-                            && NameServerEntry::parse(url).is_ok_and(|e| e.proxy.is_none())
+                            && NameServerEntry::parse(url).is_ok_and(|e| {
+                                e.proxy.is_none() && !matches!(e.url, NameServerUrl::RCode { .. })
+                            })
                         {
                             format!("{url}{}RULES", if url.contains('#') { "&" } else { "#" })
                         } else {
@@ -228,10 +281,7 @@ pub async fn parse_dns(
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     resolver.set_rule_routing(rule_routing);
 
-    let mut direct_urls =
-        parse_nameserver_entries(dns.direct_nameserver.as_deref().unwrap_or(&[]))?;
     if !direct_urls.is_empty() {
-        apply_default_dns_route(&mut direct_urls, respect_rules);
         let direct_policy = if dns.direct_nameserver_follow_policy.unwrap_or(false) {
             if let Some(map) = &policy_map {
                 Some(
@@ -455,6 +505,65 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
     host.parse::<IpAddr>().is_ok()
+}
+
+/// Report fragment parameters an upstream accepted but does not act on.
+fn warn_ignored_parameters(entries: &[(&str, &NameServerEntry)]) {
+    for (section, entry) in entries {
+        if !entry.ignored_parameters.is_empty() {
+            warn!(
+                "dns.{section}: nameserver '{}' ignores unsupported parameter(s) {}",
+                entry.url,
+                entry.ignored_parameters.join(", ")
+            );
+        }
+    }
+}
+
+/// Give each `#name` that names no proxy a stand-in whose queries fail,
+/// returning those names. mihomo loads such a config and fails the queries;
+/// failing them here too means a typo never becomes a direct query, and a
+/// subscription whose DNS names a group it lacks still loads. Strict mode
+/// rejects it. `default-nameserver` tags are the resolver's to reject.
+fn stub_missing_outbounds(
+    entries: &[(&str, &NameServerEntry)],
+    registry: &mut HashMap<smol_str::SmolStr, Arc<dyn rill_common::Proxy>>,
+    strict: bool,
+) -> Result<HashSet<String>, anyhow::Error> {
+    let mut missing = HashSet::new();
+    for (section, entry) in entries {
+        let Some(name) = entry.proxy.as_deref() else {
+            continue;
+        };
+        if *section == "default-nameserver" || name == "DIRECT" || registry.contains_key(name) {
+            continue;
+        }
+        // rill 0.1.0 read a bare `#name` on DoT/DoH as the TLS name.
+        let encrypted = matches!(
+            entry.url,
+            NameServerUrl::Tls { .. } | NameServerUrl::Https { .. }
+        );
+        let hint = if encrypted && name.contains('.') {
+            format!(" (for a TLS name, write '#sni={name}')")
+        } else {
+            String::new()
+        };
+        let problem = format!(
+            "dns.{section}: nameserver '{}' references proxy '{name}', which is not \
+             defined{hint}",
+            entry.url
+        );
+        if strict {
+            anyhow::bail!("{problem} (strict mode)");
+        }
+        warn!("{problem}; queries through it fail");
+        registry.insert(
+            name.into(),
+            Arc::new(rill_dns::routing::MissingDnsOutbound::new(name)),
+        );
+        missing.insert(name.to_owned());
+    }
+    Ok(missing)
 }
 
 /// Parse nameserver strings into `NameServerEntry`s — every entry must
@@ -728,7 +837,11 @@ fn build_policy_bootstrap_clients(
         .filter(|entry| entry.proxy.as_deref().is_none_or(|p| p == "DIRECT"))
         .filter(|entry| entry.url.needs_bootstrap().is_none())
         .filter(|entry| !matches!(entry.url, NameServerUrl::RCode { .. }))
-        .map(|entry| Resolver::build_single_resolver(&entry.url, &empty_resolved))
+        .map(|entry| {
+            let client =
+                Resolver::build_client(&entry.url, &empty_resolved, None, entry.options.clone());
+            Arc::new(client)
+        })
         .collect()
 }
 
@@ -740,13 +853,12 @@ async fn build_policy_resolvers(
     strict: bool,
 ) -> Result<Vec<Arc<rill_dns::DnsClient>>, anyhow::Error> {
     let url_strs = value.as_urls();
-    let empty_resolved = HashMap::new();
     let mut resolvers = Vec::new();
     for url_str in &url_strs {
         match NameServerEntry::parse(url_str) {
             Ok(entry) => {
-                let Some(url) =
-                    resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
+                let Some(resolved) =
+                    resolve_policy_hostname(&entry.url, key, url_str, bootstrap_clients).await
                 else {
                     continue;
                 };
@@ -766,9 +878,8 @@ async fn build_policy_resolvers(
                         }
                     },
                 };
-                let resolver =
-                    Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
-                resolvers.push(resolver);
+                let client = Resolver::build_client(&entry.url, &resolved, proxy, entry.options);
+                resolvers.push(Arc::new(client));
             }
             Err(e) => {
                 if strict {
@@ -796,57 +907,21 @@ async fn build_policy_resolvers(
     Ok(resolvers)
 }
 
-async fn resolve_policy_hostname_url(
-    url: NameServerUrl,
+/// The bootstrap answer for a policy URL's hostname, as the `resolved` map
+/// [`Resolver::build_client`] takes — empty for an IP literal, `None` when
+/// the entry must be skipped. The URL itself keeps its hostname: it is the
+/// HTTP `Host` of a DoH request and the destination DNS routing matches.
+async fn resolve_policy_hostname(
+    url: &NameServerUrl,
     key: &str,
     url_str: &str,
     bootstrap_clients: &[Arc<DnsClient>],
-) -> Option<NameServerUrl> {
-    match url {
-        NameServerUrl::Udp {
-            addr: HostOrIp::Host(host),
-            port,
-        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
-            .await
-            .map(|ip| NameServerUrl::Udp {
-                addr: HostOrIp::Ip(ip),
-                port,
-            }),
-        NameServerUrl::Tcp {
-            addr: HostOrIp::Host(host),
-            port,
-        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
-            .await
-            .map(|ip| NameServerUrl::Tcp {
-                addr: HostOrIp::Ip(ip),
-                port,
-            }),
-        NameServerUrl::Tls {
-            addr: HostOrIp::Host(host),
-            port,
-            sni,
-        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
-            .await
-            .map(|ip| NameServerUrl::Tls {
-                addr: HostOrIp::Ip(ip),
-                port,
-                sni,
-            }),
-        NameServerUrl::Https {
-            addr: HostOrIp::Host(host),
-            port,
-            path,
-            sni,
-        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
-            .await
-            .map(|ip| NameServerUrl::Https {
-                addr: HostOrIp::Ip(ip),
-                port,
-                path,
-                sni,
-            }),
-        other => Some(other),
-    }
+) -> Option<HashMap<String, IpAddr>> {
+    let Some(host) = url.needs_bootstrap() else {
+        return Some(HashMap::new());
+    };
+    let ip = resolve_policy_host(key, url_str, host, bootstrap_clients).await?;
+    Some(HashMap::from([(host.to_owned(), ip)]))
 }
 
 async fn resolve_policy_host(
@@ -2483,6 +2558,24 @@ mod tests {
         let entries = parse_nameserver_entries(&["223.5.5.5#Auto".to_string()]).unwrap();
         let registry = stub_registry(&[("Auto", "")]);
         assert_eq!(circular_proxy_tags(&entries, &registry).len(), 1);
+    }
+
+    /// Policy hostnames bootstrap through clients that keep their entry's
+    /// options, like the main bootstrap path.
+    #[tokio::test]
+    async fn policy_bootstrap_clients_keep_their_options() {
+        // TEST-NET-1 never answers: only the local disable-ipv4 reply can.
+        let entries =
+            parse_nameserver_entries(&["tcp://192.0.2.1#disable-ipv4=true".to_string()]).unwrap();
+        let clients = build_policy_bootstrap_clients(&entries, &[]);
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            clients[0].query("bootstrap.test", hickory_proto::rr::RecordType::A),
+        )
+        .await
+        .expect("answered locally, without a network round trip")
+        .unwrap();
+        assert!(response.answers.is_empty());
     }
 
     #[test]

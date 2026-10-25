@@ -6,7 +6,9 @@
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
 use crate::cache::QueryFamilies;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use crate::upstream::NameServerOptions;
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
@@ -32,6 +34,10 @@ use rill_transport::{
 /// Default per-query timeout (matches the hickory-resolver value previously
 /// used in `Resolver::build_*`).
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// UDP payload size advertised by a query that carries EDNS Client Subnet
+/// (the DNS Flag Day 2020 value; `udp_exchange` reads up to 4096 bytes).
+const ECS_MAX_PAYLOAD: u16 = 1232;
 /// Maximum number of *idle* pooled `tcp://` streams per [`DnsClient`].
 ///
 /// This bounds only the keep-alive pool: a stream is pushed on return
@@ -231,6 +237,12 @@ pub struct DnsClient {
     proxy: Option<DnsProxy>,
     server_host: Option<Arc<str>>,
     label: Option<Arc<str>>,
+    /// The upstream's fragment options (`skip-cert-verify`, `ecs`, `disable-*`).
+    options: NameServerOptions,
+    /// DoT/DoH TLS layer, built on first use and kept, so a
+    /// `skip-cert-verify` warning is logged once per upstream, not per query.
+    #[cfg(feature = "encrypted")]
+    tls: OnceLock<Result<TlsLayer, String>>,
     /// Idle direct `tcp://` connections. Streams are checked out for the whole
     /// exchange and returned only after the DNS response is fully validated.
     tcp_pool: TcpPool,
@@ -406,73 +418,52 @@ enum Transport {
 }
 
 impl DnsClient {
-    /// Plain DNS over UDP.
-    pub fn udp(addr: SocketAddr) -> Self {
+    fn new(transport: Transport) -> Self {
         Self {
-            transport: Transport::Udp { addr },
+            transport,
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
             server_host: None,
             label: None,
+            options: NameServerOptions::default(),
+            #[cfg(feature = "encrypted")]
+            tls: OnceLock::new(),
             tcp_pool: TcpPool::new(),
         }
+    }
+
+    /// Plain DNS over UDP.
+    pub fn udp(addr: SocketAddr) -> Self {
+        Self::new(Transport::Udp { addr })
     }
 
     /// Plain DNS over TCP (RFC 7766 length-prefixed framing).
     pub fn tcp(addr: SocketAddr) -> Self {
-        Self {
-            transport: Transport::Tcp { addr },
-            timeout: DEFAULT_QUERY_TIMEOUT,
-            proxy: None,
-            server_host: None,
-            label: None,
-            tcp_pool: TcpPool::new(),
-        }
+        Self::new(Transport::Tcp { addr })
     }
 
     /// Synthetic DNS response with a fixed response code and no answers.
     pub fn rcode(code: ResponseCode) -> Self {
-        Self {
-            transport: Transport::RCode { code },
-            timeout: DEFAULT_QUERY_TIMEOUT,
-            proxy: None,
-            server_host: None,
-            label: None,
-            tcp_pool: TcpPool::new(),
-        }
+        Self::new(Transport::RCode { code })
     }
 
     /// DNS over TLS (RFC 7858).
     #[cfg(feature = "encrypted")]
     pub fn dot(addr: SocketAddr, sni: &str) -> Self {
-        Self {
-            transport: Transport::Dot {
-                addr,
-                sni: Arc::from(sni),
-            },
-            timeout: DEFAULT_QUERY_TIMEOUT,
-            proxy: None,
-            server_host: None,
-            label: None,
-            tcp_pool: TcpPool::new(),
-        }
+        Self::new(Transport::Dot {
+            addr,
+            sni: Arc::from(sni),
+        })
     }
 
     /// DNS over HTTPS (RFC 8484) — HTTP/1.1 POST application/dns-message.
     #[cfg(feature = "encrypted")]
     pub fn doh(addr: SocketAddr, sni: &str, path: &str) -> Self {
-        Self {
-            transport: Transport::Doh {
-                addr,
-                sni: Arc::from(sni),
-                path: Arc::from(path),
-            },
-            timeout: DEFAULT_QUERY_TIMEOUT,
-            proxy: None,
-            server_host: None,
-            label: None,
-            tcp_pool: TcpPool::new(),
-        }
+        Self::new(Transport::Doh {
+            addr,
+            sni: Arc::from(sni),
+            path: Arc::from(path),
+        })
     }
 
     /// Override the per-query timeout.
@@ -498,6 +489,13 @@ impl DnsClient {
     /// from the bootstrap IP so DOMAIN rules and HTTP Host keep their meaning.
     pub fn with_server_host(mut self, host: &str) -> Self {
         self.server_host = Some(Arc::from(host));
+        self
+    }
+
+    /// Apply the upstream's fragment options (`skip-cert-verify`, `ecs`,
+    /// `disable-*`).
+    pub fn with_options(mut self, options: NameServerOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -570,8 +568,10 @@ impl DnsClient {
                 }
             }
         };
-        if self.proxy.is_some() {
-            label.push_str("#PROXY");
+        if let Some(proxy) = &self.proxy {
+            // The outbound as configured: a node or group name, or `RULES`.
+            label.push(if label.contains('#') { '&' } else { '#' });
+            label.push_str(proxy.name());
         }
         label
     }
@@ -619,15 +619,32 @@ impl DnsClient {
         let id: u16 = rand::random();
         let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
         msg.metadata.recursion_desired = true;
-        if let Transport::RCode { code } = &self.transport {
+        // Answered locally: an rcode upstream's fixed code, or — as mihomo's
+        // `disable-ipv4` / `disable-ipv6` / `disable-qtype-<n>` do — an empty
+        // NOERROR for a disabled query type.
+        let local = match &self.transport {
+            Transport::RCode { code } => Some(*code),
+            _ if self.options.disables(u16::from(query.query_type())) => {
+                Some(ResponseCode::NoError)
+            }
+            _ => None,
+        };
+        if let Some(code) = local {
             let mut resp = Message::new(id, MessageType::Response, OpCode::Query);
             resp.metadata.recursion_desired = true;
             resp.metadata.recursion_available = true;
-            resp.metadata.response_code = *code;
+            resp.metadata.response_code = code;
             resp.add_query(query);
             return Ok(resp);
         }
         msg.add_query(query.clone());
+        if let Some(subnet) = self.options.ecs {
+            let mut edns = Edns::new();
+            edns.set_max_payload(ECS_MAX_PAYLOAD);
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::from(subnet)));
+            msg.set_edns(edns);
+        }
         let wire = msg.to_bytes()?;
         let expected = ExpectedResponse { id, query };
         self.exchange(&wire, &expected).await
@@ -887,10 +904,10 @@ impl DnsClient {
             Transport::Dot { addr, sni } => {
                 let response = dot_exchange(
                     *addr,
-                    sni,
+                    self.server_host.as_deref().unwrap_or(sni),
                     wire,
                     self.proxy.as_ref(),
-                    self.server_host.as_deref(),
+                    self.tls(sni, "dot")?,
                 )
                 .await?;
                 decode_validated_response(&response, expected)
@@ -899,16 +916,25 @@ impl DnsClient {
             Transport::Doh { addr, sni, path } => {
                 let response = doh_exchange(
                     *addr,
-                    sni,
+                    self.server_host.as_deref().unwrap_or(sni),
                     path,
                     wire,
                     self.proxy.as_ref(),
-                    self.server_host.as_deref(),
+                    self.tls(sni, "http/1.1")?,
                 )
                 .await?;
                 decode_validated_response(&response, expected)
             }
         }
+    }
+
+    /// This upstream's TLS layer; `alpn` is fixed by the transport.
+    #[cfg(feature = "encrypted")]
+    fn tls(&self, sni: &str, alpn: &str) -> Result<&TlsLayer, ClientError> {
+        self.tls
+            .get_or_init(|| tls_layer(sni, alpn, self.options.skip_cert_verify))
+            .as_ref()
+            .map_err(|e| ClientError::Tls(e.clone()))
     }
 }
 
@@ -1314,28 +1340,10 @@ async fn encrypted_stream(
 #[cfg(feature = "encrypted")]
 async fn dot_exchange(
     addr: SocketAddr,
-    sni: &str,
-    wire: &[u8],
-    proxy: Option<&DnsProxy>,
-    host: Option<&str>,
-) -> Result<Vec<u8>, ClientError> {
-    dot_exchange_with_tls(
-        addr,
-        host.unwrap_or(sni),
-        wire,
-        proxy,
-        tls_layer(sni, "dot")?,
-    )
-    .await
-}
-
-#[cfg(feature = "encrypted")]
-async fn dot_exchange_with_tls(
-    addr: SocketAddr,
     host: &str,
     wire: &[u8],
     proxy: Option<&DnsProxy>,
-    tls: TlsLayer,
+    tls: &TlsLayer,
 ) -> Result<Vec<u8>, ClientError> {
     let tcp = encrypted_stream(addr, host, proxy).await?;
     let mut stream = tls.connect(tcp).await.map_err(|e| match e {
@@ -1390,31 +1398,11 @@ where
 #[cfg(feature = "encrypted")]
 async fn doh_exchange(
     addr: SocketAddr,
-    sni: &str,
-    path: &str,
-    wire: &[u8],
-    proxy: Option<&DnsProxy>,
-    host: Option<&str>,
-) -> Result<Vec<u8>, ClientError> {
-    doh_exchange_with_tls(
-        addr,
-        host.unwrap_or(sni),
-        path,
-        wire,
-        proxy,
-        tls_layer(sni, "http/1.1")?,
-    )
-    .await
-}
-
-#[cfg(feature = "encrypted")]
-async fn doh_exchange_with_tls(
-    addr: SocketAddr,
     host: &str,
     path: &str,
     wire: &[u8],
     proxy: Option<&DnsProxy>,
-    tls: TlsLayer,
+    tls: &TlsLayer,
 ) -> Result<Vec<u8>, ClientError> {
     let tcp = encrypted_stream(addr, host, proxy).await?;
     let mut stream = tls.connect(tcp).await.map_err(|e| match e {
@@ -1543,21 +1531,18 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// Build the TLS layer for one DoT/DoH exchange.
+/// Build the TLS layer for a DoT/DoH upstream ([`DnsClient::tls`] keeps it).
 ///
 /// Goes through `rill_transport::tls::TlsLayer`, so DNS uses the same
-/// BoringSSL backend as every proxy handshake in the binary.  The backend
-/// memoises its per-process TLS context keyed on
-/// `(fingerprint, curves, alpn, skip_cert_verify)`, so this is a hash
-/// lookup plus a refcount bump per query — negligible next to the fresh
-/// TCP + TLS handshake each exchange performs.
+/// BoringSSL backend as every proxy handshake in the binary.
 #[cfg(feature = "encrypted")]
-fn tls_layer(sni: &str, alpn: &str) -> Result<TlsLayer, ClientError> {
+fn tls_layer(sni: &str, alpn: &str, skip_cert_verify: bool) -> Result<TlsLayer, String> {
     let config = TlsConfig {
         alpn: vec![alpn.to_owned()],
+        skip_cert_verify,
         ..TlsConfig::new(sni)
     };
-    TlsLayer::new(&config).map_err(|e| ClientError::Tls(format!("invalid SNI '{sni}': {e}")))
+    TlsLayer::new(&config).map_err(|e| format!("invalid SNI '{sni}': {e}"))
 }
 
 #[cfg(test)]
@@ -2019,6 +2004,79 @@ mod tests {
         let client = DnsClient::udp("8.8.8.8:53".parse().unwrap())
             .with_upstream_label("tls://dns.google:853");
         assert_eq!(client.upstream_label(), "tls://dns.google:853");
+    }
+
+    #[test]
+    fn routed_upstream_label_names_its_outbound() {
+        let outbound =
+            || -> DnsProxy { Arc::new(crate::routing::MissingDnsOutbound::new("香港")) };
+        let client = DnsClient::udp("8.8.8.8:53".parse().unwrap()).with_proxy(outbound());
+        assert_eq!(client.upstream_label(), "8.8.8.8#香港");
+        let client = DnsClient::udp("8.8.8.8:53".parse().unwrap())
+            .with_upstream_label("tls://8.8.8.8#sni=dns.google")
+            .with_proxy(outbound());
+        assert_eq!(client.upstream_label(), "tls://8.8.8.8#sni=dns.google&香港");
+    }
+
+    fn options(fragment: &str) -> NameServerOptions {
+        crate::upstream::NameServerEntry::parse(&format!("127.0.0.1#{fragment}"))
+            .unwrap()
+            .options
+    }
+
+    #[tokio::test]
+    async fn disabled_query_type_is_answered_locally_without_a_query() {
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = DnsClient::udp(sink.local_addr().unwrap())
+            .with_timeout(Duration::from_millis(300))
+            .with_options(options("disable-ipv6=true&disable-qtype-65=true"));
+        for record_type in [RecordType::AAAA, RecordType::HTTPS] {
+            let response = client.query("blocked.example", record_type).await.unwrap();
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert!(response.answers.is_empty());
+            assert_eq!(response.queries[0].query_type, record_type);
+        }
+        let mut buf = [0u8; 512];
+        assert!(
+            sink.try_recv_from(&mut buf).is_err(),
+            "a disabled type must never reach the upstream"
+        );
+        // Other types still go out (the sink never answers).
+        assert!(client.query("sent.example", RecordType::A).await.is_err());
+        assert!(sink.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ecs_option_is_sent_with_its_prefix_truncated() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            server
+                .send_to(&reply.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+            request
+        });
+        DnsClient::udp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .with_options(options("ecs=1.2.3.4/20&ecs-override=true"))
+            .query("ecs.example", RecordType::A)
+            .await
+            .unwrap();
+        let request = seen.await.unwrap();
+        let edns = request.edns.as_ref().expect("ECS rides an OPT record");
+        assert_eq!(
+            edns.option(hickory_proto::rr::rdata::opt::EdnsCode::Subnet),
+            Some(&EdnsOption::Subnet(ClientSubnet::new(
+                IpAddr::V4(Ipv4Addr::new(1, 2, 0, 0)),
+                20,
+                0
+            )))
+        );
     }
 
     #[tokio::test]

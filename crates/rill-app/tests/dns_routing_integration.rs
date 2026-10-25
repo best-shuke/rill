@@ -63,7 +63,7 @@ async fn configured(dns: &str) -> (Arc<Resolver>, Tunnel) {
 async fn respect_rules_and_explicit_outbound_tags_use_live_routing() {
     let (upstream, count) = dns_stub([203, 0, 113, 7]).await;
     let (resolver, tunnel) = configured(&format!(
-        "  respect-rules: true\n  nameserver: [tcp://{upstream}]\n"
+        "  respect-rules: true\n  proxy-server-nameserver: [tcp://{upstream}]\n  nameserver: [tcp://{upstream}]\n"
     ))
     .await;
     assert!(resolver.resolve_ips("rejected.test").await.is_err());
@@ -84,7 +84,7 @@ async fn respect_rules_and_explicit_outbound_tags_use_live_routing() {
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let replacement = rill_config::load_config_from_str(&format!(
-        "ipv6: false\ndns:\n  enable: true\n  respect-rules: true\n  nameserver: [tcp://{upstream}]\n"
+        "ipv6: false\ndns:\n  enable: true\n  respect-rules: true\n  proxy-server-nameserver: [tcp://{upstream}]\n  nameserver: [tcp://{upstream}]\n"
     )).await.unwrap();
     tunnel.set_resolver(Arc::clone(&replacement.dns.resolver));
     assert!(replacement
@@ -112,7 +112,7 @@ async fn respect_rules_and_explicit_outbound_tags_use_live_routing() {
     );
 
     let (resolver, _tunnel) = configured(&format!(
-        "  respect-rules: true\n  nameserver: ['tcp://{upstream}#DIRECT']\n"
+        "  respect-rules: true\n  proxy-server-nameserver: [tcp://{upstream}]\n  nameserver: ['tcp://{upstream}#DIRECT']\n"
     ))
     .await;
     assert!(resolver
@@ -226,6 +226,145 @@ async fn direct_nameserver_has_separate_cache_and_optional_policy() {
         metadata.host = "upstream.invalid".into();
         assert!(tunnel.inner().direct.dial_tcp(&metadata).await.is_ok());
     }
+}
+
+async fn load_error(dns: &str) -> String {
+    let error = rill_config::load_config_from_str(&format!(
+        "ipv6: false\nproxies: []\nrules: [\"MATCH,REJECT\"]\n{dns}"
+    ))
+    .await
+    .err()
+    .expect("config must be rejected");
+    format!("{error:#}")
+}
+
+#[tokio::test]
+async fn respect_rules_requires_proxy_server_nameserver_as_in_mihomo() {
+    let error = load_error(
+        "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [tcp://127.0.0.1:1]\n",
+    )
+    .await;
+    assert!(error.contains("proxy-server-nameserver"), "{error}");
+}
+
+#[tokio::test]
+async fn direct_nameserver_keeps_its_own_route_under_respect_rules() {
+    let (main, main_count) = dns_stub([127, 0, 0, 2]).await;
+    let (direct, direct_count) = dns_stub([127, 0, 0, 1]).await;
+    let (resolver, _tunnel) = configured(&format!(
+        "  respect-rules: true\n  proxy-server-nameserver: [tcp://{main}]\n  nameserver: [tcp://{main}]\n  direct-nameserver: [tcp://{direct}]\n"
+    ))
+    .await;
+    assert!(
+        resolver.resolve_ips("ruled.test").await.is_err(),
+        "MATCH,REJECT routes the main nameserver"
+    );
+    assert_eq!(main_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        resolver
+            .resolve_ips_direct("direct.test")
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        "direct-nameserver is not rule-routed (mihomo parses it with respect-rules off)"
+    );
+    assert_eq!(direct_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mihomo_parameters_and_missing_outbounds_still_load() {
+    let (upstream, count) = dns_stub([203, 0, 113, 9]).await;
+    // Subscriptions carry these; mihomo loads them and so must rill.
+    let (resolver, _tunnel) = configured(&format!(
+        "  nameserver: ['tcp://{upstream}#h3=true&ecs=1.2.3.0/24&disable-ipv6=true']\n"
+    ))
+    .await;
+    assert_eq!(
+        resolver.resolve_ips("params.test").await.unwrap().unwrap(),
+        vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // A group the config lacks: the config loads, the upstream fails its
+    // queries — never a direct query — and the other upstreams still answer.
+    for lists in [
+        format!("  nameserver: ['tcp://{upstream}#节点选择']\n"),
+        format!("  nameserver: [tcp://127.0.0.1:1]\n  fallback: ['tcp://{upstream}#节点选择']\n"),
+        format!("  nameserver: [tcp://127.0.0.1:1]\n  direct-nameserver: ['tcp://{upstream}#节点选择']\n"),
+    ] {
+        let (resolver, _tunnel) = configured(&lists).await;
+        assert!(resolver.resolve_ips_direct("missing.test").await.is_err());
+    }
+    let (resolver, _tunnel) = configured(&format!(
+        "  nameserver: ['tcp://{upstream}#节点选择']\n  nameserver-policy:\n    policy.test: 'tcp://{upstream}#节点选择'\n"
+    ))
+    .await;
+    assert!(resolver.resolve_ips("policy.test").await.is_err());
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "a missing outbound never dials"
+    );
+    let labels: Vec<String> = resolver
+        .nameserver_policy()
+        .unwrap()
+        .clients()
+        .iter()
+        .map(|client| client.upstream_label())
+        .collect();
+    assert_eq!(labels, [format!("{upstream}#节点选择")]);
+    let (resolver, _tunnel) = configured(&format!(
+        "  nameserver: ['tcp://{upstream}#节点选择', 'tcp://{upstream}']\n"
+    ))
+    .await;
+    assert!(resolver.resolve_ips("other.test").await.unwrap().is_some());
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "the defined upstream answers"
+    );
+
+    let error = load_error(&format!(
+        "strict: true\ndns:\n  enable: true\n  nameserver: ['tcp://{upstream}#节点选择']\n"
+    ))
+    .await;
+    assert!(
+        error.contains("节点选择") && error.contains("strict"),
+        "{error}"
+    );
+
+    // rill 0.1.0 read a bare DoT/DoH fragment as the TLS name; say how to
+    // write that now.
+    let error = load_error(
+        "strict: true\ndns:\n  enable: true\n  nameserver: ['tls://1.1.1.1#cloudflare-dns.com']\n",
+    )
+    .await;
+    assert!(error.contains("#sni=cloudflare-dns.com"), "{error}");
+}
+
+#[tokio::test]
+async fn policy_upstream_keeps_its_hostname_after_bootstrap() {
+    let (bootstrap, _) = dns_stub([127, 0, 0, 1]).await;
+    let (resolver, _tunnel) = configured(&format!(
+        "  default-nameserver: [tcp://{bootstrap}]\n  nameserver: [tcp://{bootstrap}]\n  nameserver-policy:\n    policy.test: ['https://doh.test/dns-query', 'tls://dot.test:8853']\n"
+    ))
+    .await;
+    let labels: Vec<String> = resolver
+        .nameserver_policy()
+        .unwrap()
+        .lookup("policy.test")
+        .unwrap()
+        .nameservers
+        .iter()
+        .map(|client| client.upstream_label())
+        .collect();
+    // The bootstrap IP is only where to connect: the name stays the DoH
+    // `Host`, the TLS name and the destination DNS routing matches.
+    assert_eq!(
+        labels,
+        ["https://doh.test/dns-query", "tls://dot.test:8853"]
+    );
 }
 
 #[test]

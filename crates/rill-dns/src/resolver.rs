@@ -1,7 +1,7 @@
 use crate::cache::{DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, QueryFamilies};
 use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
-use crate::upstream::{HostOrIp, NameServerEntry, NameServerUrl};
+use crate::upstream::{HostOrIp, NameServerEntry, NameServerOptions, NameServerUrl};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
@@ -625,7 +625,7 @@ fn encrypted_upstream_label(url: &NameServerUrl) -> Option<String> {
         NameServerUrl::Tls { addr, port, sni } => {
             let mut label = format!("tls://{}", authority_label(addr, *port, 853));
             if sni != &addr.to_string() {
-                label.push('#');
+                label.push_str("#sni=");
                 label.push_str(sni);
             }
             Some(label)
@@ -638,7 +638,7 @@ fn encrypted_upstream_label(url: &NameServerUrl) -> Option<String> {
         } => {
             let mut label = format!("https://{}{}", authority_label(addr, *port, 443), path);
             if sni != &addr.to_string() {
-                label.push('#');
+                label.push_str("#sni=");
                 label.push_str(sni);
             }
             Some(label)
@@ -866,9 +866,15 @@ impl Resolver {
             };
         let main_proxies = resolve_proxy(&main_urls);
         let fallback_proxies = resolve_proxy(&fallback_urls);
-        let main_urls: Vec<NameServerUrl> = main_urls.into_iter().map(|e| e.url).collect();
-        let fallback_urls: Vec<NameServerUrl> = fallback_urls.into_iter().map(|e| e.url).collect();
-        let default_ns: Vec<NameServerUrl> = default_ns.into_iter().map(|e| e.url).collect();
+        let (main_urls, main_options): (Vec<NameServerUrl>, Vec<NameServerOptions>) =
+            main_urls.into_iter().map(|e| (e.url, e.options)).unzip();
+        let (fallback_urls, fallback_options): (Vec<NameServerUrl>, Vec<NameServerOptions>) =
+            fallback_urls
+                .into_iter()
+                .map(|e| (e.url, e.options))
+                .unzip();
+        let (default_ns, default_options): (Vec<NameServerUrl>, Vec<NameServerOptions>) =
+            default_ns.into_iter().map(|e| (e.url, e.options)).unzip();
         // Step 1: default nameservers are themselves the bootstrap roots, so
         // every entry must use an IP literal regardless of transport.
         for ns in &default_ns {
@@ -930,10 +936,12 @@ impl Resolver {
             } else {
                 default_ns
                     .iter()
-                    .map(|ns| {
+                    .zip(default_options)
+                    .map(|(ns, options)| {
                         // IP-literal DoT/DoH bootstrap is valid too. Do not
                         // silently downgrade encrypted default-nameserver to UDP.
-                        Self::build_single_resolver(ns, &HashMap::new())
+                        let client = Self::build_client(ns, &HashMap::new(), None, options);
+                        Arc::new(client.with_timeout(Duration::from_secs(3)))
                     })
                     .collect()
             };
@@ -975,23 +983,20 @@ impl Resolver {
         };
 
         // Steps 5 & 6: Build main + fallback — one resolver per URL for parallel dispatch.
-        let main: Vec<Arc<DnsClient>> = main_urls
-            .iter()
-            .zip(main_proxies)
-            .map(|(url, proxy)| Self::build_single_resolver_with_proxy(url, &resolved_map, proxy))
-            .collect();
+        let build = |urls: &[NameServerUrl], proxies, options: Vec<NameServerOptions>| {
+            urls.iter()
+                .zip(proxies)
+                .zip(options)
+                .map(|((url, proxy), options)| {
+                    Arc::new(Self::build_client(url, &resolved_map, proxy, options))
+                })
+                .collect::<Vec<_>>()
+        };
+        let main = build(&main_urls, main_proxies, main_options);
         let fallback = if fallback_urls.is_empty() {
             None
         } else {
-            Some(
-                fallback_urls
-                    .iter()
-                    .zip(fallback_proxies)
-                    .map(|(url, proxy)| {
-                        Self::build_single_resolver_with_proxy(url, &resolved_map, proxy)
-                    })
-                    .collect(),
-            )
+            Some(build(&fallback_urls, fallback_proxies, fallback_options))
         };
 
         Ok(Self {
@@ -1069,6 +1074,22 @@ impl Resolver {
         resolved: &HashMap<String, IpAddr>,
         proxy: Option<Arc<dyn rill_common::Proxy>>,
     ) -> Arc<DnsClient> {
+        Arc::new(Self::build_client(
+            url,
+            resolved,
+            proxy,
+            NameServerOptions::default(),
+        ))
+    }
+
+    /// The client for one configured upstream: its URL (hostnames looked up
+    /// in `resolved`), outbound and fragment options.
+    pub fn build_client(
+        url: &NameServerUrl,
+        resolved: &HashMap<String, IpAddr>,
+        proxy: Option<Arc<dyn rill_common::Proxy>>,
+        options: NameServerOptions,
+    ) -> DnsClient {
         let socket_addr = match url {
             NameServerUrl::Udp { addr, port }
             | NameServerUrl::Tcp { addr, port }
@@ -1077,12 +1098,12 @@ impl Resolver {
                 SocketAddr::new(host_or_ip_to_addr(addr, resolved), *port)
             }
             NameServerUrl::RCode { code, .. } => {
-                let client = DnsClient::rcode(*code);
+                let client = DnsClient::rcode(*code).with_options(options);
                 let client = match proxy {
                     Some(p) => client.with_proxy(p),
                     None => client,
                 };
-                return Arc::new(client);
+                return client;
             }
         };
         let label = encrypted_upstream_label(url);
@@ -1136,7 +1157,7 @@ impl Resolver {
             Some(p) => client.with_proxy(p),
             None => client,
         };
-        Arc::new(client)
+        client.with_options(options)
     }
 
     /// Resolve `host` to every enabled address.
@@ -2066,6 +2087,9 @@ impl Resolver {
 
     pub fn clear_cache(&self) {
         self.cache.clear();
+        if let Some(direct) = &self.direct_resolver {
+            direct.clear_cache();
+        }
     }
 
     /// Drop pooled upstream connections so the next query dials a fresh
@@ -2291,7 +2315,7 @@ mod tests {
 
         let client = Resolver::build_single_resolver(&url, &resolved);
 
-        assert_eq!(client.upstream_label(), "tls://8.8.8.8#dns.google");
+        assert_eq!(client.upstream_label(), "tls://8.8.8.8#sni=dns.google");
     }
 
     #[test]
@@ -2303,7 +2327,7 @@ mod tests {
 
         assert_eq!(
             client.upstream_label(),
-            "https://1.1.1.1/dns-query#cloudflare-dns.com"
+            "https://1.1.1.1/dns-query#sni=cloudflare-dns.com"
         );
     }
 

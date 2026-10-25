@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::IpAddr;
 
 use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::RecordType;
 
 /// A parsed nameserver URL in one of the supported transport forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,17 +54,31 @@ impl fmt::Display for NameServerUrl {
         match self {
             NameServerUrl::Udp { addr, port } => write!(f, "udp://{addr}:{port}"),
             NameServerUrl::Tcp { addr, port } => write!(f, "tcp://{addr}:{port}"),
-            NameServerUrl::Tls { addr, port, sni } => write!(f, "tls://{addr}:{port}#{sni}"),
+            NameServerUrl::Tls { addr, port, sni } => {
+                write!(f, "tls://{addr}:{port}")?;
+                write_sni_override(f, addr, sni)
+            }
             NameServerUrl::Https {
                 addr,
                 port,
                 path,
                 sni,
             } => {
-                write!(f, "https://{addr}:{port}{path}#{sni}")
+                write!(f, "https://{addr}:{port}{path}")?;
+                write_sni_override(f, addr, sni)
             }
             NameServerUrl::RCode { label, .. } => write!(f, "rcode://{label}"),
         }
+    }
+}
+
+/// A bare `#name` reads as an outbound in configuration syntax, so only an
+/// SNI that differs from the URL host is shown, in its `sni=` form.
+fn write_sni_override(f: &mut fmt::Formatter<'_>, addr: &HostOrIp, sni: &str) -> fmt::Result {
+    if sni == addr.to_string() {
+        Ok(())
+    } else {
+        write!(f, "#sni={sni}")
     }
 }
 
@@ -71,17 +86,67 @@ impl fmt::Display for NameServerUrl {
 /// telling the resolver to tunnel queries through the named proxy.
 ///
 /// The fragment selects the outbound for every transport, including DoT
-/// and DoH, matching mihomo. An explicit `sni=hostname` parameter overrides
+/// and DoH, and carries mihomo's `key=value` options (see
+/// [`NameServerOptions`]). An explicit `sni=hostname` parameter overrides
 /// the TLS name without confusing it with an outbound name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
     pub proxy: Option<String>,
+    /// The `key=value` fragment parameters this upstream acts on.
+    pub options: NameServerOptions,
+    /// Fragment parameters accepted but not acted on, verbatim, so the
+    /// config layer can report them. mihomo ignores unknown parameters, and
+    /// a subscription that carries one (`h3=true` is common) must still load.
+    pub ignored_parameters: Vec<String>,
+}
+
+/// mihomo's per-nameserver fragment parameters (`#…&key=value`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NameServerOptions {
+    /// `skip-cert-verify=true`: accept any DoT/DoH certificate.
+    pub skip_cert_verify: bool,
+    /// `ecs=prefix`: the EDNS Client Subnet sent with every query. Host bits
+    /// beyond the prefix are already cleared, as RFC 7871 requires.
+    pub ecs: Option<ipnet::IpNet>,
+    /// `disable-ipv4`, `disable-ipv6` and `disable-qtype-<n>`: query types
+    /// answered locally with an empty NOERROR instead of being sent.
+    pub disabled_qtypes: Vec<u16>,
+}
+
+impl NameServerOptions {
+    /// Whether queries of `qtype` are answered locally (empty NOERROR).
+    pub fn disables(&self, qtype: u16) -> bool {
+        self.disabled_qtypes.contains(&qtype)
+    }
+
+    fn set_disabled(&mut self, qtype: u16, disabled: bool) {
+        self.disabled_qtypes.retain(|&t| t != qtype);
+        if disabled {
+            self.disabled_qtypes.push(qtype);
+        }
+    }
+}
+
+/// mihomo reads `ecs` as a prefix, or a bare address as a full-length one.
+fn parse_ecs(value: &str) -> Option<ipnet::IpNet> {
+    let net = value.parse::<ipnet::IpNet>().ok().or_else(|| {
+        let ip = value.parse::<IpAddr>().ok()?;
+        let bits = if ip.is_ipv4() { 32 } else { 128 };
+        ipnet::IpNet::new(ip, bits).ok()
+    })?;
+    Some(net.trunc())
 }
 
 impl NameServerEntry {
     pub fn plain(url: NameServerUrl) -> Self {
-        Self { url, proxy: None }
+        Self {
+            url,
+            proxy: None,
+            options: NameServerOptions::default(),
+            ignored_parameters: Vec::new(),
+        }
     }
 
     /// Parse a nameserver string, returning the parsed `NameServerUrl` plus
@@ -98,29 +163,73 @@ impl NameServerEntry {
             if fragment.trim().is_empty() {
                 return Err(NameServerParseError::InvalidHost(s.to_string()));
             }
-            for parameter in fragment.split('&') {
-                let parameter = parameter.trim();
-                if let Some(sni) = parameter.strip_prefix("sni=") {
-                    if sni.is_empty() {
-                        return Err(NameServerParseError::InvalidHost(s.to_string()));
+            // As in mihomo: `&`-separated, a bare word names the outbound
+            // (the last one wins) and `key=value` sets an option.
+            for parameter in fragment.split('&').map(str::trim) {
+                match parameter.split_once('=') {
+                    _ if parameter.is_empty() => {}
+                    None => entry.proxy = Some(parameter.to_string()),
+                    Some((key, value)) => {
+                        entry.apply_parameter(key.trim(), value.trim(), parameter);
                     }
-                    match &mut entry.url {
-                        NameServerUrl::Tls { sni: name, .. }
-                        | NameServerUrl::Https { sni: name, .. } => *name = sni.to_string(),
-                        _ => {
-                            return Err(NameServerParseError::UnsupportedParameter(
-                                parameter.into(),
-                            ))
-                        }
-                    }
-                } else if parameter.is_empty() || parameter.contains('=') || entry.proxy.is_some() {
-                    return Err(NameServerParseError::UnsupportedParameter(parameter.into()));
-                } else {
-                    entry.proxy = Some(parameter.to_string());
                 }
             }
         }
         Ok(entry)
+    }
+
+    fn apply_parameter(&mut self, key: &str, value: &str, parameter: &str) {
+        // mihomo enables a flag only on the exact value `true`.
+        let enabled = value == "true";
+        let options = &mut self.options;
+        let acted_on = match key {
+            "sni" => match &mut self.url {
+                NameServerUrl::Tls { sni, .. } | NameServerUrl::Https { sni, .. }
+                    if !value.is_empty() =>
+                {
+                    *sni = value.to_string();
+                    true
+                }
+                _ => false,
+            },
+            "skip-cert-verify" => {
+                options.skip_cert_verify = enabled;
+                true
+            }
+            "ecs" => match parse_ecs(value) {
+                Some(net) => {
+                    options.ecs = Some(net);
+                    true
+                }
+                None => false,
+            },
+            // Queries are built here, never forwarded with a client's own
+            // subnet, so `ecs` always applies and there is nothing to override.
+            "ecs-override" => true,
+            // DoH is HTTP/1.1 only; asking for HTTP/3 is reported.
+            "h3" => !enabled,
+            "disable-ipv4" => {
+                options.set_disabled(u16::from(RecordType::A), enabled);
+                true
+            }
+            "disable-ipv6" => {
+                options.set_disabled(u16::from(RecordType::AAAA), enabled);
+                true
+            }
+            _ => match key
+                .strip_prefix("disable-qtype-")
+                .and_then(|qtype| qtype.parse::<u16>().ok())
+            {
+                Some(qtype) => {
+                    options.set_disabled(qtype, enabled);
+                    true
+                }
+                None => false,
+            },
+        };
+        if !acted_on {
+            self.ignored_parameters.push(parameter.to_string());
+        }
     }
 }
 
@@ -171,11 +280,13 @@ impl NameServerUrl {
         }
 
         // Split off #fragment before any URL parsing — the fragment is NOT a
-        // standard URL anchor in this context; it carries the SNI override.
+        // standard URL anchor in this context; it carries the SNI override,
+        // bare or in the `sni=` form `Display` writes.
         let (s_no_frag, fragment) = match s.find('#') {
             Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
             None => (s, None),
         };
+        let fragment = fragment.map(|f| f.strip_prefix("sni=").unwrap_or(f));
 
         // Dispatch on scheme
         if let Some(rest) = s_no_frag.strip_prefix("tls://") {
@@ -368,8 +479,6 @@ pub enum NameServerParseError {
     EncryptedFeatureDisabled,
     #[error("unsupported rcode nameserver type '{0}'")]
     UnsupportedRCode(String),
-    #[error("unsupported nameserver parameter '{0}'")]
-    UnsupportedParameter(String),
 }
 
 #[cfg(test)]
@@ -882,7 +991,73 @@ mod tests {
         assert!(
             matches!(entry.url, NameServerUrl::Https { sni, .. } if sni == "cloudflare-dns.com")
         );
-        assert!(NameServerEntry::parse("https://1.1.1.1#proxy&ecs=1.2.3.4").is_err());
+    }
+
+    /// mihomo's fragment parameters, as subscriptions write them, must load:
+    /// the ones rill acts on become options, the rest are reported.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn mihomo_fragment_parameters_load() {
+        let entry = NameServerEntry::parse("https://dns.alidns.com/dns-query#h3=true").unwrap();
+        assert_eq!(entry.proxy, None);
+        assert_eq!(entry.options, NameServerOptions::default());
+        assert_eq!(entry.ignored_parameters, ["h3=true"]);
+        assert!(matches!(entry.url, NameServerUrl::Https { sni, .. } if sni == "dns.alidns.com"));
+
+        let entry = NameServerEntry::parse(
+            "https://1.1.1.1/dns-query#DIRECT&h3=false&skip-cert-verify=true&ecs=1.2.3.4/20\
+             &ecs-override=true&disable-ipv6=true&disable-qtype-65=true&future=1",
+        )
+        .unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("DIRECT"));
+        assert!(entry.options.skip_cert_verify);
+        assert_eq!(entry.options.ecs, Some("1.2.0.0/20".parse().unwrap()));
+        assert!(entry.options.disables(28) && entry.options.disables(65));
+        assert!(!entry.options.disables(1));
+        assert_eq!(entry.ignored_parameters, ["future=1"]);
+
+        // A bare address is a full-length prefix; a bad one is reported.
+        let entry = NameServerEntry::parse("tls://8.8.8.8#ecs=2001:db8::1").unwrap();
+        assert_eq!(entry.options.ecs, Some("2001:db8::1/128".parse().unwrap()));
+        let entry = NameServerEntry::parse("tls://8.8.8.8#ecs=bogus&disable-ipv4=1").unwrap();
+        assert_eq!(entry.options, NameServerOptions::default());
+        assert_eq!(entry.ignored_parameters, ["ecs=bogus"]);
+    }
+
+    #[test]
+    fn fragment_outbound_and_parameters_follow_mihomo() {
+        // The last bare word names the outbound; empty pieces are skipped.
+        let entry = NameServerEntry::parse("8.8.8.8#first&&second&").unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("second"));
+        assert!(entry.ignored_parameters.is_empty());
+        // Flags turn on only for `true`, and a later value wins.
+        let entry =
+            NameServerEntry::parse("8.8.8.8#disable-ipv4=true&disable-ipv4=false&sni=x").unwrap();
+        assert!(!entry.options.disables(1));
+        assert_eq!(
+            entry.ignored_parameters,
+            ["sni=x"],
+            "plain DNS has no TLS name"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn display_shows_only_an_overriding_sni() {
+        let plain = NameServerEntry::parse("tls://8.8.8.8").unwrap().url;
+        assert_eq!(plain.to_string(), "tls://8.8.8.8:853");
+        let overridden = NameServerEntry::parse("https://1.1.1.1/dns-query#sni=one.one")
+            .unwrap()
+            .url;
+        assert_eq!(
+            overridden.to_string(),
+            "https://1.1.1.1:443/dns-query#sni=one.one"
+        );
+        // The low-level parser reads that form back.
+        assert_eq!(
+            NameServerUrl::parse(&overridden.to_string()).unwrap(),
+            overridden
+        );
     }
 
     #[test]
