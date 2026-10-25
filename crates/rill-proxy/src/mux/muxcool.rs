@@ -1375,7 +1375,13 @@ impl ProxyPacketConn for PacketConn {
         }
         // The destination rides the Keep frame meta, encoded straight from
         // the IP octets (no string round-trip on the hot datagram path).
-        let frame = encode_udp_data_frame(self.sid, buf, addr.ip(), addr.port());
+        // A bound domain flow has no per-packet IP address. Retain the
+        // destination declared in its New frame instead of sending 0.0.0.0.
+        let frame = if addr.ip().is_unspecified() {
+            encode_data_frame(self.sid, buf, None).map_err(RillError::Io)?
+        } else {
+            encode_udp_data_frame(self.sid, buf, addr.ip(), addr.port())
+        };
         self.session
             .send_frame(frame)
             .await

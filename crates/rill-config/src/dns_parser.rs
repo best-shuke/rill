@@ -66,9 +66,19 @@ pub async fn parse_dns(
 
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
+    let respect_rules = dns.respect_rules.unwrap_or(false);
+    let rule_routing = Arc::new(rill_dns::routing::RoutingDnsProxy::default());
+    let mut registry = proxy_registry.clone();
+    registry.insert(
+        "RULES".into(),
+        Arc::clone(&rule_routing) as Arc<dyn rill_common::Proxy>,
+    );
+    let proxy_registry = &registry;
 
-    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
-    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
+    let mut main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
+    let mut fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
+    apply_default_dns_route(&mut main_urls, respect_rules);
+    apply_default_dns_route(&mut fallback_urls, respect_rules);
     let default_ns_urls =
         parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
     let proxy_ns_urls =
@@ -137,7 +147,27 @@ pub async fn parse_dns(
     };
 
     // Build nameserver-policy if configured.
-    let policy = if let Some(nsp_map) = &dns.nameserver_policy {
+    let policy_map = dns.nameserver_policy.as_ref().map(|map| {
+        map.iter()
+            .map(|(key, value)| {
+                let values = value
+                    .as_urls()
+                    .into_iter()
+                    .map(|url| {
+                        if respect_rules
+                            && NameServerEntry::parse(url).is_ok_and(|e| e.proxy.is_none())
+                        {
+                            format!("{url}{}RULES", if url.contains('#') { "&" } else { "#" })
+                        } else {
+                            url.to_string()
+                        }
+                    })
+                    .collect();
+                (key.clone(), crate::raw::RawNspValue::Many(values))
+            })
+            .collect::<HashMap<_, _>>()
+    });
+    let policy = if let Some(nsp_map) = &policy_map {
         if nsp_map.is_empty() {
             None
         } else {
@@ -184,7 +214,7 @@ pub async fn parse_dns(
     let mut resolver = Resolver::new_with_bootstrap_with_proxies(
         main_urls,
         fallback_urls,
-        default_ns_urls,
+        default_ns_urls.clone(),
         mode,
         hosts,
         use_hosts,
@@ -196,6 +226,52 @@ pub async fn parse_dns(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    resolver.set_rule_routing(rule_routing);
+
+    let mut direct_urls =
+        parse_nameserver_entries(dns.direct_nameserver.as_deref().unwrap_or(&[]))?;
+    if !direct_urls.is_empty() {
+        apply_default_dns_route(&mut direct_urls, respect_rules);
+        let direct_policy = if dns.direct_nameserver_follow_policy.unwrap_or(false) {
+            if let Some(map) = &policy_map {
+                Some(
+                    build_nameserver_policy(
+                        map,
+                        geosite.as_ref(),
+                        &build_policy_bootstrap_clients(&default_ns_urls, &direct_urls),
+                        proxy_registry,
+                        rule_providers,
+                        strict,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut direct_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
+        if use_hosts && use_system_hosts {
+            merge_system_hosts(&mut direct_hosts).await;
+        }
+        let direct = Resolver::new_with_bootstrap_with_proxies(
+            direct_urls,
+            vec![],
+            default_ns_urls,
+            DnsMode::Normal,
+            direct_hosts,
+            use_hosts,
+            crate::effective_ipv6(raw.ipv6),
+            direct_policy,
+            None,
+            proxy_registry,
+            crate::is_offline_validate(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("direct-nameserver: {e}"))?;
+        resolver.set_direct_resolver(Arc::new(direct));
+    }
 
     // Fake-IP wiring: only when enhanced-mode == fake-ip. Errors here are
     // fatal (Class A per ADR-0002) — a misconfigured fake-IP range would
@@ -352,6 +428,9 @@ fn circular_proxy_tags(
         .iter()
         .filter_map(|entry| {
             let name = entry.proxy.as_deref()?;
+            if name == "DIRECT" {
+                return None;
+            }
             let proxy = proxy_registry.get(name)?;
             if is_ip_literal_addr(proxy.addr()) {
                 return None;
@@ -388,6 +467,16 @@ fn parse_nameserver_entries(servers: &[String]) -> Result<Vec<NameServerEntry>, 
                 .map_err(|e| anyhow::anyhow!("failed to parse nameserver '{s}': {e}"))
         })
         .collect()
+}
+
+fn apply_default_dns_route(entries: &mut [NameServerEntry], respect_rules: bool) {
+    if respect_rules {
+        for entry in entries {
+            if entry.proxy.is_none() && !matches!(entry.url, NameServerUrl::RCode { .. }) {
+                entry.proxy = Some("RULES".into());
+            }
+        }
+    }
 }
 
 /// Pre-`NameServerEntry` shim kept for the existing tests below that build
@@ -636,7 +725,7 @@ fn build_policy_bootstrap_clients(
     let empty_resolved = HashMap::new();
     source
         .iter()
-        .filter(|entry| entry.proxy.is_none())
+        .filter(|entry| entry.proxy.as_deref().is_none_or(|p| p == "DIRECT"))
         .filter(|entry| entry.url.needs_bootstrap().is_none())
         .filter(|entry| !matches!(entry.url, NameServerUrl::RCode { .. }))
         .map(|entry| Resolver::build_single_resolver(&entry.url, &empty_resolved))
@@ -663,29 +752,19 @@ async fn build_policy_resolvers(
                 };
                 // `#PROXY` fragment: route this upstream's exchanges through
                 // the named adapter, matching the nameserver/fallback entry
-                // semantics (issue #67 phase 2, ADR-0012). An unknown name
-                // degrades to a direct dial like the main path does — under
-                // `strict` that silent downgrade is a hard error instead
-                // (issue #533 review).
+                // semantics. An unknown outbound must fail closed, just as
+                // it does in the main list; a typo cannot change the route.
                 let proxy = match entry.proxy.as_deref() {
+                    Some("DIRECT") | None => None,
                     Some(name) => match proxy_registry.get(name).cloned() {
                         Some(handle) => Some(handle),
-                        None if strict => {
+                        None => {
                             return Err(anyhow::anyhow!(
                                 "nameserver-policy entry '{key}': URL '{url_str}' references \
-                                 unknown proxy '{name}' (strict mode)"
+                                 unknown proxy '{name}'"
                             ));
                         }
-                        None => {
-                            warn!(
-                                "nameserver-policy entry '{}': URL '{}' references unknown \
-                                proxy '{}'; dialing direct",
-                                key, url_str, name
-                            );
-                            None
-                        }
                     },
-                    None => None,
                 };
                 let resolver =
                     Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
@@ -2222,29 +2301,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_resolver_unknown_proxy_name_degrades_to_direct() {
+    async fn policy_resolver_unknown_proxy_name_fails_closed() {
         let registry: HashMap<smol_str::SmolStr, Arc<dyn rill_common::Proxy>> = HashMap::new();
         let value = crate::raw::RawNspValue::Many(vec![
             "tcp://8.8.8.8#NoSuchProxy".to_string(),
             "1.1.1.1#NoSuchProxy".to_string(),
         ]);
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
-            .await
-            .expect("unknown proxy name must not fail the policy build");
-        assert_eq!(resolvers.len(), 2);
-        assert!(
-            resolvers.iter().all(|r| !r.is_proxied()),
-            "unknown names degrade to direct dials"
-        );
-
-        // Strict: the same silent direct-dial downgrade is a hard error —
-        // the upstream was proxied precisely because direct is untrusted
-        // (issue #533 review).
-        let Err(err) = build_policy_resolvers("geosite:gfw", &value, &[], &registry, true).await
-        else {
-            panic!("strict must reject an unknown #proxy reference");
-        };
-        assert!(err.to_string().contains("NoSuchProxy"), "unexpected: {err}");
+        for strict in [false, true] {
+            let Err(err) =
+                build_policy_resolvers("geosite:gfw", &value, &[], &registry, strict).await
+            else {
+                panic!("an unknown DNS outbound must never become a direct connection");
+            };
+            assert!(err.to_string().contains("NoSuchProxy"), "unexpected: {err}");
+        }
     }
 
     #[tokio::test]
@@ -2339,11 +2409,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_resolver_tls_fragment_stays_sni() {
-        // For tls:// the fragment is SNI, not a proxy name — must keep
-        // parsing as before and never consult the registry.
+    async fn policy_resolver_explicit_sni_is_separate_from_outbound() {
         let registry: HashMap<smol_str::SmolStr, Arc<dyn rill_common::Proxy>> = HashMap::new();
-        let value = crate::raw::RawNspValue::One("tls://8.8.4.4#dns.google".to_string());
+        let value = crate::raw::RawNspValue::One("tls://8.8.4.4#DIRECT&sni=dns.google".to_string());
         let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false)
             .await
             .expect("tls entry with SNI fragment builds");
@@ -2394,6 +2462,19 @@ mod tests {
         // the resolver — it works exactly as written and must not warn.
         let entries = parse_nameserver_entries(&["223.5.5.5#JP".to_string()]).unwrap();
         let registry = stub_registry(&[("JP", "1.2.3.4:443")]);
+        assert!(circular_proxy_tags(&entries, &registry).is_empty());
+    }
+
+    #[test]
+    fn explicit_direct_dns_tag_cannot_form_a_proxy_hostname_cycle() {
+        let entries = parse_nameserver_entries(&[
+            "https://223.5.5.5/dns-query#DIRECT".to_string(),
+            "https://doh.pub/dns-query#DIRECT".to_string(),
+        ])
+        .unwrap();
+        // The built-in DIRECT adapter has an empty addr(), as groups do,
+        // but the explicit DNS tag bypasses adapters and uses the socket factory.
+        let registry = stub_registry(&[("DIRECT", "")]);
         assert!(circular_proxy_tags(&entries, &registry).is_empty());
     }
 

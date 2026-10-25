@@ -96,12 +96,28 @@ impl DirectAdapter {
         self.connect_timeout
     }
 
+    fn direct_dns_override(&self, metadata: &Metadata) -> Option<Arc<Resolver>> {
+        // A DNS upstream carries its already-bootstrapped IP. Re-resolving
+        // that housekeeping dial through direct DNS would recurse.
+        if metadata.internal
+            || metadata.host.is_empty()
+            || rill_common::metadata_ip_literal(&metadata.host).is_some()
+        {
+            return None;
+        }
+        self.resolver
+            .as_ref()
+            .map(|slot| Arc::clone(&slot.read()))
+            .filter(|resolver| resolver.has_direct_resolver())
+    }
+
     /// Determine the concrete `SocketAddr` candidates to dial for `metadata`,
     /// avoiding the OS resolver whenever possible.
     async fn resolve_targets(&self, metadata: &Metadata) -> Result<Vec<SocketAddr>> {
         // 1. Destination already resolved (e.g. by rule-matching pre_resolve,
         //    or when the client supplied an IP literal).
-        if let Some(ip) = metadata.dst_ip {
+        let direct_override = self.direct_dns_override(metadata);
+        if let Some(ip) = metadata.dst_ip.filter(|_| direct_override.is_none()) {
             return Ok(vec![SocketAddr::new(ip, metadata.dst_port)]);
         }
 
@@ -116,9 +132,10 @@ impl DirectAdapter {
         //    to the OS resolver only when no resolver was injected (tests,
         //    standalone usage).
         if !metadata.host.is_empty() {
-            if let Some(resolver) = &self.resolver {
-                let resolver = Arc::clone(&resolver.read());
-                return match resolver.resolve_ips(&metadata.host).await {
+            if let Some(resolver) = direct_override
+                .or_else(|| self.resolver.as_ref().map(|slot| Arc::clone(&slot.read())))
+            {
+                return match resolver.resolve_ips_direct(&metadata.host).await {
                     Ok(Some(ips)) if !ips.is_empty() => Ok(ips
                         .into_iter()
                         .map(|ip| SocketAddr::new(ip, metadata.dst_port))
@@ -373,7 +390,7 @@ impl ProxyAdapter for DirectAdapter {
         // and *connect* the socket. The conn is bound: the caller holds no
         // literal for a name target and its write arg is only an advisory
         // placeholder.
-        if metadata.domain_udp_target().is_some() {
+        if metadata.domain_udp_target().is_some() || self.direct_dns_override(metadata).is_some() {
             let mut last_err = None;
             for addr in self.resolve_targets(metadata).await? {
                 let bind: SocketAddr = if addr.is_ipv4() {

@@ -233,6 +233,7 @@ jobs:
             --test common_test \
             --test socks5_udp_user \
             --test dns_cache_test \
+            --test dns_routing_integration \
             --test config_test \
             --test tun_config_test \
             --test dialer_proxy_group \

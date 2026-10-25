@@ -828,7 +828,7 @@ impl Tunnel {
     /// `inner.direct` observe `set_resolver` swaps identically.
     pub fn new_with_slot(resolver: rill_dns::ResolverSlot) -> Self {
         let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
-        Self {
+        let tunnel = Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
                 route: RwLock::new(Arc::new(RouteTable::empty())),
@@ -846,7 +846,11 @@ impl Tunnel {
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
             }),
-        }
+        };
+        tunnel
+            .resolver()
+            .install_rule_routing(Arc::new(crate::dns::DnsRuleProxy::new(&tunnel.inner)));
+        tunnel
     }
 
     /// Record per-connection notes from now on: a timestamped account of
@@ -1188,6 +1192,7 @@ impl Tunnel {
     /// persisted a new `dns:` section while the process kept resolving
     /// through the old one.
     pub fn set_resolver(&self, resolver: Arc<Resolver>) {
+        resolver.install_rule_routing(Arc::new(crate::dns::DnsRuleProxy::new(&self.inner)));
         // One write updates the routing snapshot, `inner.direct`, and every
         // rebuilt `DIRECT` — they all share this slot.
         *self.inner.resolver.write() = resolver;

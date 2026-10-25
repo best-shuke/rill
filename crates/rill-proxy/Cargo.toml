@@ -14,7 +14,8 @@ ss = ["dep:shadowsocks", "rill-transport/simple-obfs", "rill-transport/shadow-tl
 trojan = []
 vless = []
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
-vless-vision = ["vless"]
+# Vision's UDP carrier is XUDP over a Vision-protected Mux.Cool connection.
+vless-vision = ["vless", "mux"]
 # VLESS post-quantum Encryption layer (`encryption: mlkem768x25519plus...`),
 # the ML-KEM-768 + X25519 hybrid handshake used by Xray-core / mihomo. Adds the
 # BLAKE3 / ML-KEM / X25519 / AES-CTR crypto stack, so it is opt-in (bundled into

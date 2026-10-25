@@ -81,6 +81,7 @@ async fn run_large_transfer(
 /// single connection never does: many flows competing for the proxy's
 /// stack and its shared buffers (the tun workload's lwIP core is a single
 /// task with one fixed heap).
+#[cfg(target_os = "linux")]
 pub async fn bench_parallel(
     dial: Dial,
     echo: SocketAddr,

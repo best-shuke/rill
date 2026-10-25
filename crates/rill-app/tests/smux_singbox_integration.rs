@@ -464,3 +464,185 @@ async fn fast_roundtrip(mixed: SocketAddr, echo_addr: SocketAddr) {
     .await
     .expect("fast roundtrip must not be blocked by a slow sibling stream");
 }
+
+/// A real sing-box Vision user rejects bare CommandUDP (missing flow),
+/// and rejects Vision + CommandUDP too. Datagram forwarding must use the
+/// Vision-protected CommandMux/XUDP carrier instead.
+#[cfg(feature = "vless-vision")]
+#[tokio::test]
+async fn vision_udp_interoperates_with_a_real_singbox_server() {
+    use rill_common::{Metadata, Network};
+    use tokio::net::UdpSocket;
+
+    let Some(bin) = require_singbox() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let generated = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .output()
+        .expect("openssl generates the isolated test certificate");
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let peer_port = free_port();
+    let config = serde_json::json!({
+        "log": { "level": "info" },
+        "dns": {"servers": [{"type": "hosts", "tag": "hosts", "predefined": {"vision-echo.test": ["127.0.0.1"]}}]},
+        "route": {"default_domain_resolver": "hosts"},
+        "inbounds": [{
+            "type": "vless", "listen": "127.0.0.1", "listen_port": peer_port,
+            "users": [{"name": "vision-e2e", "uuid": TEST_UUID, "flow": "xtls-rprx-vision"}],
+            "tls": {"enabled": true, "server_name": "localhost", "certificate_path": cert, "key_path": key}
+        }],
+        "outbounds": [{"type": "direct", "tag": "direct"}]
+    });
+    let path = dir.path().join("vision-server.json");
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let server = SingBoxServer {
+        child: Command::new(bin)
+            .arg("run")
+            .arg("-c")
+            .arg(path)
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(dir.path().join("singbox.log")).unwrap(),
+            ))
+            .spawn()
+            .unwrap(),
+        log_path: dir.path().join("singbox.log"),
+    };
+    wait_listening(&server, peer_port).await;
+
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let mut buffer = [0; 8192];
+        while let Ok((length, peer)) = echo.recv_from(&mut buffer).await {
+            if echo.send_to(&buffer[..length], peer).await.is_err() {
+                break;
+            }
+        }
+    });
+    let config = rill_config::load_config_from_str(&format!(
+        r#"
+ipv6: false
+proxies:
+  - name: vision
+    type: vless
+    server: 127.0.0.1
+    port: {peer_port}
+    uuid: {TEST_UUID}
+    flow: xtls-rprx-vision
+    tls: true
+    servername: localhost
+    skip-cert-verify: true
+    udp: true
+proxy-groups: []
+rules: ["MATCH,vision"]
+"#
+    ))
+    .await
+    .unwrap();
+    let proxy = config.proxies.get("vision").unwrap();
+    let metadata = Metadata {
+        network: Network::Udp,
+        dst_ip: Some(destination.ip()),
+        dst_port: destination.port(),
+        ..Metadata::default()
+    };
+    let packets = proxy.dial_udp(&metadata).await.unwrap();
+    for size in [64, 1400, 4096, 8192] {
+        let payload = pattern(size);
+        packets.write_packet(&payload, &destination).await.unwrap();
+        let mut received = vec![0; size];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(10), packets.read_packet(&mut received))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("Vision UDP timed out; peer log:\n{}", singbox_log(&server))
+                })
+                .unwrap();
+        assert_eq!(source, destination);
+        assert_eq!(&received[..length], payload);
+    }
+    // A second association shares the Vision carrier while preserving its own UDP flow.
+    let second = proxy.dial_udp(&metadata).await.unwrap();
+    second
+        .write_packet(b"second-association", &destination)
+        .await
+        .unwrap();
+    let mut received = [0; 64];
+    let (length, _) =
+        tokio::time::timeout(Duration::from_secs(10), second.read_packet(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(&received[..length], b"second-association");
+    // SOCKS/fake-IP flows may keep only a domain until the remote resolves it.
+    let domain = proxy
+        .dial_udp(&Metadata {
+            network: Network::Udp,
+            host: "vision-echo.test".into(),
+            dst_port: destination.port(),
+            ..Metadata::default()
+        })
+        .await
+        .unwrap();
+    domain
+        .write_packet(
+            b"domain-association",
+            &SocketAddr::from(([0, 0, 0, 0], destination.port())),
+        )
+        .await
+        .unwrap();
+    let (length, source) =
+        tokio::time::timeout(Duration::from_secs(10), domain.read_packet(&mut received))
+            .await
+            .unwrap_or_else(|_| panic!("domain UDP timed out; peer log:\n{}", singbox_log(&server)))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "domain UDP failed: {e}; peer log:\n{}",
+                    singbox_log(&server)
+                )
+            });
+    // The packet API uses an unspecified source when the peer echoes a
+    // domain address rather than an IP; the inbound retains the original target.
+    assert!(source.ip().is_unspecified() || source == destination);
+    assert_eq!(&received[..length], b"domain-association");
+    proxy.reset_sessions();
+    let after_reset = proxy.dial_udp(&metadata).await.unwrap();
+    after_reset
+        .write_packet(b"after-reset", &destination)
+        .await
+        .unwrap();
+    let (length, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        after_reset.read_packet(&mut received),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&received[..length], b"after-reset");
+    assert!(!singbox_log(&server).contains("flow mismatch"));
+    echo_task.abort();
+}

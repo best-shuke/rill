@@ -229,6 +229,7 @@ pub struct DnsClient {
     transport: Transport,
     timeout: Duration,
     proxy: Option<DnsProxy>,
+    server_host: Option<Arc<str>>,
     label: Option<Arc<str>>,
     /// Idle direct `tcp://` connections. Streams are checked out for the whole
     /// exchange and returned only after the DNS response is fully validated.
@@ -411,6 +412,7 @@ impl DnsClient {
             transport: Transport::Udp { addr },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            server_host: None,
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -422,6 +424,7 @@ impl DnsClient {
             transport: Transport::Tcp { addr },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            server_host: None,
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -433,6 +436,7 @@ impl DnsClient {
             transport: Transport::RCode { code },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            server_host: None,
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -448,6 +452,7 @@ impl DnsClient {
             },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            server_host: None,
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -464,6 +469,7 @@ impl DnsClient {
             },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
+            server_host: None,
             label: None,
             tcp_pool: TcpPool::new(),
         }
@@ -485,6 +491,13 @@ impl DnsClient {
     ///   semantics in ADR-0012.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Original URL hostname, kept separate from a TLS-name override and
+    /// from the bootstrap IP so DOMAIN rules and HTTP Host keep their meaning.
+    pub fn with_server_host(mut self, host: &str) -> Self {
+        self.server_host = Some(Arc::from(host));
         self
     }
 
@@ -854,33 +867,17 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
-        if let Some(proxy) = self.proxy.as_ref() {
-            let addr = match &self.transport {
-                Transport::Udp { addr } | Transport::Tcp { addr } => *addr,
-                Transport::RCode { .. } => {
-                    return Err(ClientError::Protocol(
-                        "rcode transport should not perform network exchange",
-                    ));
-                }
-                #[cfg(feature = "encrypted")]
-                Transport::Dot { .. } | Transport::Doh { .. } => {
-                    // DoT/DoH-over-proxy needs TLS layered on a Box<dyn
-                    // ProxyConn>; the upstream tokio_rustls TlsConnector
-                    // is generic over the IO stream but the call sites
-                    // here aren't wired yet. ADR-0012 marks it
-                    // follow-up. Refuse so misconfiguration is loud.
-                    return Err(ClientError::Tls(
-                        "DoT/DoH routing through a proxy is not implemented yet \
-                        (issue #67 phase 2 follow-up); use plain udp:// or tcp:// for \
-                        a #PROXY-tagged nameserver"
-                            .to_string(),
-                    ));
-                }
-            };
-            let response = proxy_tcp_exchange(proxy, addr, wire).await?;
-            return decode_validated_response(&response, expected);
-        }
         match &self.transport {
+            Transport::Udp { addr } | Transport::Tcp { addr } if self.proxy.is_some() => {
+                let response = proxy_tcp_exchange(
+                    self.proxy.as_ref().expect("proxy guard above"),
+                    *addr,
+                    wire,
+                    self.server_host.as_deref(),
+                )
+                .await?;
+                decode_validated_response(&response, expected)
+            }
             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
             Transport::Tcp { addr } => self.tcp_exchange_pooled(*addr, wire, expected).await,
             Transport::RCode { .. } => Err(ClientError::Protocol(
@@ -888,12 +885,27 @@ impl DnsClient {
             )),
             #[cfg(feature = "encrypted")]
             Transport::Dot { addr, sni } => {
-                let response = dot_exchange(*addr, sni, wire).await?;
+                let response = dot_exchange(
+                    *addr,
+                    sni,
+                    wire,
+                    self.proxy.as_ref(),
+                    self.server_host.as_deref(),
+                )
+                .await?;
                 decode_validated_response(&response, expected)
             }
             #[cfg(feature = "encrypted")]
             Transport::Doh { addr, sni, path } => {
-                let response = doh_exchange(*addr, sni, path, wire).await?;
+                let response = doh_exchange(
+                    *addr,
+                    sni,
+                    path,
+                    wire,
+                    self.proxy.as_ref(),
+                    self.server_host.as_deref(),
+                )
+                .await?;
                 decode_validated_response(&response, expected)
             }
         }
@@ -961,12 +973,16 @@ async fn proxy_tcp_exchange(
     proxy: &DnsProxy,
     addr: SocketAddr,
     wire: &[u8],
+    host: Option<&str>,
 ) -> Result<Vec<u8>, ClientError> {
     use rill_common::{ConnType, Metadata, Network};
     let metadata = Metadata {
         network: Network::Tcp,
         conn_type: ConnType::Inner,
-        host: smol_str::SmolStr::from(addr.ip().to_string()),
+        host: host.map_or_else(
+            || smol_str::SmolStr::from(addr.ip().to_string()),
+            smol_str::SmolStr::new,
+        ),
         dst_ip: Some(addr.ip()),
         dst_port: addr.port(),
         // DNS-via-proxy exchanges are resolver housekeeping — a `lazy`
@@ -1270,10 +1286,59 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 }
 
 #[cfg(feature = "encrypted")]
-async fn dot_exchange(addr: SocketAddr, sni: &str, wire: &[u8]) -> Result<Vec<u8>, ClientError> {
-    let tls = tls_layer(sni, "dot")?;
-    let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
+async fn encrypted_stream(
+    addr: SocketAddr,
+    host: &str,
+    proxy: Option<&DnsProxy>,
+) -> Result<Box<dyn rill_transport::Stream>, ClientError> {
+    if let Some(proxy) = proxy {
+        let metadata = rill_common::Metadata {
+            network: rill_common::Network::Tcp,
+            conn_type: rill_common::ConnType::Inner,
+            host: host.into(),
+            dst_ip: Some(addr.ip()),
+            dst_port: addr.port(),
+            internal: true,
+            ..Default::default()
+        };
+        let stream = proxy
+            .dial_tcp(&metadata)
+            .await
+            .map_err(|e| e.into_io_error("dns-via-proxy dial"))?;
+        Ok(Box::new(stream))
+    } else {
+        Ok(Box::new(factory().connect_tcp(addr).await?))
+    }
+}
+
+#[cfg(feature = "encrypted")]
+async fn dot_exchange(
+    addr: SocketAddr,
+    sni: &str,
+    wire: &[u8],
+    proxy: Option<&DnsProxy>,
+    host: Option<&str>,
+) -> Result<Vec<u8>, ClientError> {
+    dot_exchange_with_tls(
+        addr,
+        host.unwrap_or(sni),
+        wire,
+        proxy,
+        tls_layer(sni, "dot")?,
+    )
+    .await
+}
+
+#[cfg(feature = "encrypted")]
+async fn dot_exchange_with_tls(
+    addr: SocketAddr,
+    host: &str,
+    wire: &[u8],
+    proxy: Option<&DnsProxy>,
+    tls: TlsLayer,
+) -> Result<Vec<u8>, ClientError> {
+    let tcp = encrypted_stream(addr, host, proxy).await?;
+    let mut stream = tls.connect(tcp).await.map_err(|e| match e {
         // `TransportError::Io` still carries the raw errno (#680);
         // stringifying it here would re-flatten an `EMFILE`-class
         // handshake failure into a context-less `Tls` (#682).
@@ -1328,10 +1393,31 @@ async fn doh_exchange(
     sni: &str,
     path: &str,
     wire: &[u8],
+    proxy: Option<&DnsProxy>,
+    host: Option<&str>,
 ) -> Result<Vec<u8>, ClientError> {
-    let tls = tls_layer(sni, "http/1.1")?;
-    let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
+    doh_exchange_with_tls(
+        addr,
+        host.unwrap_or(sni),
+        path,
+        wire,
+        proxy,
+        tls_layer(sni, "http/1.1")?,
+    )
+    .await
+}
+
+#[cfg(feature = "encrypted")]
+async fn doh_exchange_with_tls(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    wire: &[u8],
+    proxy: Option<&DnsProxy>,
+    tls: TlsLayer,
+) -> Result<Vec<u8>, ClientError> {
+    let tcp = encrypted_stream(addr, host, proxy).await?;
+    let mut stream = tls.connect(tcp).await.map_err(|e| match e {
         // `TransportError::Io` still carries the raw errno (#680);
         // stringifying it here would re-flatten an `EMFILE`-class
         // handshake failure into a context-less `Tls` (#682).
@@ -1339,8 +1425,17 @@ async fn doh_exchange(
         other => ClientError::Tls(other.to_string()),
     })?;
 
-    // Minimal HTTP/1.1 POST. Connection: close so the server EOFs and we can
-    // read-to-end without parsing chunked transfer-encoding.
+    // HTTP/1.1 POST; read a bounded response to EOF, then decode its body framing.
+    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let authority = if addr.port() == 443 {
+        authority
+    } else {
+        format!("{authority}:{}", addr.port())
+    };
     let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -1350,7 +1445,7 @@ async fn doh_exchange(
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          \r\n",
-        host = sni,
+        host = authority,
         len = wire.len(),
     );
     stream.write_all(head.as_bytes()).await?;
@@ -1379,8 +1474,66 @@ async fn doh_exchange(
     if status != "200" {
         return Err(ClientError::Protocol("doh: non-200 status"));
     }
+    decode_doh_body(head_str, body)
+}
+
+#[cfg(feature = "encrypted")]
+fn decode_doh_body(headers: &str, body: &[u8]) -> Result<Vec<u8>, ClientError> {
+    let fields: Vec<_> = headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .collect();
+    if fields.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("transfer-encoding")
+            && value.trim().eq_ignore_ascii_case("chunked")
+    }) {
+        let mut rest = body;
+        let mut decoded = Vec::new();
+        loop {
+            let end = find_subseq(rest, b"\r\n")
+                .ok_or(ClientError::Protocol("doh: incomplete chunk length"))?;
+            let text = std::str::from_utf8(&rest[..end])
+                .map_err(|_| ClientError::Protocol("doh: invalid chunk length"))?;
+            let length = usize::from_str_radix(text.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| ClientError::Protocol("doh: invalid chunk length"))?;
+            rest = &rest[end + 2..];
+            if length == 0 {
+                if rest == b"\r\n" || rest.ends_with(b"\r\n\r\n") {
+                    return Ok(decoded);
+                }
+                return Err(ClientError::Protocol("doh: incomplete chunk trailers"));
+            }
+            if length > 65535 - decoded.len() {
+                return Err(ClientError::Protocol("doh: DNS body too large"));
+            }
+            if rest.len() < length + 2 || &rest[length..length + 2] != b"\r\n" {
+                return Err(ClientError::Protocol("doh: incomplete chunk body"));
+            }
+            decoded.extend_from_slice(&rest[..length]);
+            rest = &rest[length + 2..];
+        }
+    }
+    for (key, value) in fields {
+        if key.eq_ignore_ascii_case("content-length") {
+            let length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ClientError::Protocol("doh: invalid content length"))?;
+            if length != body.len() {
+                return Err(ClientError::Protocol("doh: content length mismatch"));
+            }
+        }
+    }
+    if body.len() > 65535 {
+        return Err(ClientError::Protocol("doh: DNS body too large"));
+    }
     Ok(body.to_vec())
 }
+
+#[cfg(all(test, feature = "encrypted"))]
+#[path = "client_encrypted_tests.rs"]
+mod encrypted_tests;
 
 #[cfg(feature = "encrypted")]
 fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2432,7 +2585,7 @@ mod tests {
             health: rill_common::ProxyHealth::new(),
         });
         let dyn_proxy: DnsProxy = std::sync::Arc::<CapturingMetaProxy>::clone(&proxy);
-        let _ = proxy_tcp_exchange(&dyn_proxy, "8.8.8.8:53".parse().unwrap(), b"\x00").await;
+        let _ = proxy_tcp_exchange(&dyn_proxy, "8.8.8.8:53".parse().unwrap(), b"\x00", None).await;
         let seen = proxy.seen.lock().unwrap();
         let meta = seen.first().expect("the exchange must reach dial_tcp");
         assert!(
@@ -2524,7 +2677,7 @@ mod tests {
         let proxy: DnsProxy = std::sync::Arc::new(ErrnoProxy {
             health: rill_common::ProxyHealth::new(),
         });
-        let err = proxy_tcp_exchange(&proxy, "8.8.8.8:53".parse().unwrap(), b"\x00")
+        let err = proxy_tcp_exchange(&proxy, "8.8.8.8:53".parse().unwrap(), b"\x00", None)
             .await
             .unwrap_err();
         let ClientError::Io(e) = err else {

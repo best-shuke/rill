@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased fixes
+
+- Interpret `#proxy`, `#DIRECT` and `#RULES` as DNS outbounds for DoH/DoT
+  as well as plain DNS. Encrypted queries now support proxy transports
+  with normal certificate verification; use `&sni=hostname` for an
+  explicit TLS name override. Decode chunked DoH responses.
+- Honor `dns.respect-rules`, `direct-nameserver` and
+  `direct-nameserver-follow-policy`, including resolver reloads and
+  independent direct-DNS caching. Preserve encryption for IP-literal
+  `default-nameserver` entries. See [DNS routing](docs/dns-routing.md).
+- Carry Vision UDP in Vision-protected VLESS CommandMux/Mux.Cool
+  sessions, avoiding sing-box's missing-flow rejection. Recreate these
+  sessions after outbound-interface changes.
+
 ## 0.1.0 — unreleased
 
 First version of rill, started from meow-rs 0.26.1 (`62525d4`; see NOTICE).

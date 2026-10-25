@@ -1446,17 +1446,10 @@ proxies:
     );
 }
 
-// ─── D17: vision + udp: true → warn + loads ──────────────────────────────────
-
-/// D17: `parse_vless_vision_udp_true_warns_once`
-///
-/// `flow: "xtls-rprx-vision"` + `udp: true` + `tls: true` → parse succeeds;
-/// at least one warn mentioning both "UDP" and "Vision" (or lowercase equivalents).
-/// Class B per ADR-0002 row #7: Vision is TCP-only; UDP uses plain VLESS.
-/// NOT hard-error: crypto and routing are unchanged on the UDP path.
-/// upstream: upstream UDP also silently uses plain VLESS; we warn once at load.
+/// Vision UDP has a real XUDP carrier and must not report a plain-VLESS fallback.
+#[cfg(feature = "vless-vision")]
 #[tokio::test]
-async fn parse_vless_vision_udp_true_warns_once() {
+async fn parse_vless_vision_udp_loads_without_fallback_warning() {
     let yaml = r#"
 proxies:
   - name: v
@@ -1469,7 +1462,8 @@ proxies:
     udp: true
 "#;
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    result.expect("vision + udp must not be a hard error");
+    let config = result.expect("vision + udp must load");
+    assert!(config.proxies["v"].support_udp());
     let warn_count = lines
         .iter()
         .filter(|l| {
@@ -1477,9 +1471,9 @@ proxies:
                 && (l.to_lowercase().contains("udp") || l.to_lowercase().contains("vision"))
         })
         .count();
-    assert!(
-        warn_count >= 1,
-        "at least one WARN about UDP/Vision must be emitted; captured lines: {lines:?}"
+    assert_eq!(
+        warn_count, 0,
+        "Vision UDP is supported; captured lines: {lines:?}"
     );
 }
 

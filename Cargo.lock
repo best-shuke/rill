@@ -3324,6 +3324,7 @@ dependencies = [
  "rill-rules",
  "rill-trie",
  "rill-tunnel",
+ "serde_json",
  "serde_yaml",
  "smol_str",
  "tempfile",
@@ -3445,9 +3446,11 @@ dependencies = [
  "lru 0.18.5",
  "parking_lot",
  "rand 0.9.5",
+ "rcgen 0.13.2",
  "rill-common",
  "rill-transport",
  "rill-trie",
+ "rustls",
  "serde",
  "serde_json",
  "smallvec",
@@ -3455,6 +3458,7 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

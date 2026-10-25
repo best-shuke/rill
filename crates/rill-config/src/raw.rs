@@ -462,6 +462,11 @@ pub struct RawDns {
     /// (mihomo `proxy-server-nameserver`). When set, proxy adapters resolve
     /// their `server:` through these instead of the main `nameserver` list.
     pub proxy_server_nameserver: Option<Vec<String>>,
+    /// Route untagged DNS connections through the live rule engine.
+    pub respect_rules: Option<bool>,
+    /// Upstreams used only for DIRECT outbound hostname resolution.
+    pub direct_nameserver: Option<Vec<String>>,
+    pub direct_nameserver_follow_policy: Option<bool>,
     pub fake_ip_filter: Option<Vec<String>>,
     /// If false, the hosts trie lookup is skipped entirely at query time.
     pub use_hosts: Option<bool>,

@@ -428,9 +428,11 @@ mod tests {
             dir.path().join("GeoSite.dat")
         );
         std::fs::write(dir.path().join("geosite.dat"), b"x").unwrap();
+        // Case-insensitive filesystems may return the preferred spelling
+        // for the same file; compare the resolved filesystem paths.
         assert_eq!(
-            find_in(dir.path(), "GeoSite.dat"),
-            dir.path().join("geosite.dat")
+            find_in(dir.path(), "GeoSite.dat").canonicalize().unwrap(),
+            dir.path().join("geosite.dat").canonicalize().unwrap()
         );
         std::fs::write(dir.path().join("GeoSite.dat"), b"x").unwrap();
         if dir.path().join("geosite.dat") != dir.path().join("GeoSite.dat")

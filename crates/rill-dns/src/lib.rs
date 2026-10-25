@@ -8,6 +8,7 @@ pub mod client;
 pub mod fakeip;
 pub mod host_resolver_hook;
 pub mod resolver;
+pub mod routing;
 pub mod server;
 pub mod tcp;
 pub mod upstream;

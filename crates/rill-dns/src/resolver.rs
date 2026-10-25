@@ -41,7 +41,7 @@ impl From<Vec<IpAddr>> for HostEntry {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BootstrapError {
-    #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
+    #[error("default-nameserver entry '{entry}' must use an IP literal so its hostname does not need bootstrap resolution")]
     DefaultNameserverNotPlain { entry: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
     CannotResolve { host: String, source: BoxError },
@@ -52,11 +52,8 @@ pub enum BootstrapError {
     },
     #[error("nameserver '{nameserver}' references proxy '{proxy}', which is not defined")]
     UnknownProxy { nameserver: String, proxy: String },
-    #[error(
-        "nameserver '{nameserver}' uses proxy '{proxy}' on a tls:///https:// entry; \
-        DoT/DoH routing through a proxy is not implemented yet — use plain udp:// or tcp:// \
-        (issue #67 phase 2 follow-up)"
-    )]
+    /// Retained for source compatibility; constructors no longer emit it.
+    #[error("encrypted nameserver '{nameserver}' rejected proxy '{proxy}'")]
     EncryptedProxyUnsupported { nameserver: String, proxy: String },
 }
 
@@ -266,6 +263,9 @@ pub struct Resolver {
     /// Whether IPv6 resolution is enabled. Driven by the top-level `ipv6`
     /// config flag and fixed at construction time.
     ipv6: bool,
+    /// Separate cache/upstreams for direct outbounds; never used for proxy-server DNS.
+    direct_resolver: Option<Arc<Resolver>>,
+    rule_routing: Option<Arc<crate::routing::RoutingDnsProxy>>,
 }
 
 impl Resolver {
@@ -316,32 +316,6 @@ fn host_or_ip_to_addr(addr: &HostOrIp, resolved: &HashMap<String, IpAddr>) -> Ip
         HostOrIp::Host(h) => *resolved
             .get(h)
             .expect("bootstrap must resolve all hostnames"),
-    }
-}
-
-fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
-    match url {
-        NameServerUrl::Udp { addr, port } | NameServerUrl::Tcp { addr, port } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, *port)
-        }
-        NameServerUrl::Tls { addr, .. } | NameServerUrl::Https { addr, .. } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, 53)
-        }
-        NameServerUrl::RCode { .. } => {
-            unreachable!("rcode default-nameserver does not have a socket address")
-        }
     }
 }
 
@@ -775,6 +749,8 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            direct_resolver: None,
+            rule_routing: None,
         }
     }
 
@@ -854,7 +830,7 @@ impl Resolver {
         // hostname, so routing them through a proxy would create the
         // chicken-and-egg loop ADR-0012 warns about.
         for entry in &default_ns {
-            if let Some(p) = entry.proxy.as_ref() {
+            if let Some(p) = entry.proxy.as_ref().filter(|p| p.as_str() != "DIRECT") {
                 return Err(BootstrapError::UnknownProxy {
                     nameserver: entry.url.to_string(),
                     proxy: format!("{p} (default-nameserver may not use #PROXY)"),
@@ -865,16 +841,7 @@ impl Resolver {
             let Some(p) = entry.proxy.as_ref() else {
                 continue;
             };
-            if matches!(
-                entry.url,
-                NameServerUrl::Tls { .. } | NameServerUrl::Https { .. }
-            ) {
-                return Err(BootstrapError::EncryptedProxyUnsupported {
-                    nameserver: entry.url.to_string(),
-                    proxy: p.clone(),
-                });
-            }
-            if !proxy_registry.contains_key(p.as_str()) {
+            if p != "DIRECT" && !proxy_registry.contains_key(p.as_str()) {
                 return Err(BootstrapError::UnknownProxy {
                     nameserver: entry.url.to_string(),
                     proxy: p.clone(),
@@ -892,6 +859,7 @@ impl Resolver {
                     .map(|e| {
                         e.proxy
                             .as_ref()
+                            .filter(|p| p.as_str() != "DIRECT")
                             .and_then(|p| proxy_registry.get(p.as_str()).cloned())
                     })
                     .collect()
@@ -963,14 +931,9 @@ impl Resolver {
                 default_ns
                     .iter()
                     .map(|ns| {
-                        let c = match ns {
-                            NameServerUrl::RCode { code, .. } => DnsClient::rcode(*code),
-                            NameServerUrl::Tcp { .. } => {
-                                DnsClient::tcp(url_to_plain_socketaddr(ns))
-                            }
-                            _ => DnsClient::udp(url_to_plain_socketaddr(ns)),
-                        };
-                        Arc::new(c.with_timeout(Duration::from_secs(3)))
+                        // IP-literal DoT/DoH bootstrap is valid too. Do not
+                        // silently downgrade encrypted default-nameserver to UDP.
+                        Self::build_single_resolver(ns, &HashMap::new())
                     })
                     .collect()
             };
@@ -1046,7 +1009,35 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            direct_resolver: None,
+            rule_routing: None,
         })
+    }
+
+    pub fn set_direct_resolver(&mut self, resolver: Arc<Resolver>) {
+        self.direct_resolver = Some(resolver);
+    }
+
+    pub fn has_direct_resolver(&self) -> bool {
+        self.direct_resolver.is_some()
+    }
+
+    pub fn set_rule_routing(&mut self, routing: Arc<crate::routing::RoutingDnsProxy>) {
+        self.rule_routing = Some(routing);
+    }
+
+    /// The tunnel installs a weakly-owned live router, including after config reload.
+    pub fn install_rule_routing(&self, target: Arc<dyn rill_common::Proxy>) {
+        if let Some(routing) = &self.rule_routing {
+            routing.install(target);
+        }
+    }
+
+    pub async fn resolve_ips_direct(&self, host: &str) -> io::Result<Option<Vec<IpAddr>>> {
+        match &self.direct_resolver {
+            Some(resolver) => resolver.resolve_ips(host).await,
+            None => self.resolve_ips(host).await,
+        }
     }
 
     pub(crate) fn ipv6_enabled(&self) -> bool {
@@ -1133,6 +1124,13 @@ impl Resolver {
         let client = match label {
             Some(label) => client.with_upstream_label(label),
             None => client,
+        };
+        let client = match url {
+            NameServerUrl::Udp { addr, .. }
+            | NameServerUrl::Tcp { addr, .. }
+            | NameServerUrl::Tls { addr, .. }
+            | NameServerUrl::Https { addr, .. } => client.with_server_host(&addr.to_string()),
+            NameServerUrl::RCode { .. } => client,
         };
         let client = match proxy {
             Some(p) => client.with_proxy(p),
@@ -2090,12 +2088,18 @@ impl Resolver {
             .policy
             .as_ref()
             .map_or(&[][..], NameserverPolicy::clients);
-        self.main
+        let closed: usize = self
+            .main
             .iter()
             .chain(fallback)
             .chain(policy)
             .map(|client| client.reset_connections())
-            .sum()
+            .sum();
+        closed
+            + self
+                .direct_resolver
+                .as_ref()
+                .map_or(0, |resolver| resolver.reset_connections())
     }
 
     pub fn dns_results(&self, search: Option<&str>, limit: usize) -> Vec<DnsCacheSnapshotEntry> {
@@ -3482,6 +3486,42 @@ mod tests {
             result.is_ok(),
             "tls:// IP-literal in default_ns must be accepted"
         );
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn encrypted_bootstrap_uses_tls_on_the_configured_port() {
+        use tokio::io::AsyncReadExt;
+        for scheme in ["tls", "https"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let default = NameServerUrl::parse(&format!("{scheme}://{address}")).unwrap();
+            let bootstrap = tokio::spawn(Resolver::new_with_bootstrap(
+                vec![NameServerUrl::parse("https://bootstrap-target.invalid/dns-query").unwrap()],
+                vec![],
+                vec![default],
+                DnsMode::Normal,
+                DomainTrie::new(),
+                true,
+                false,
+                None,
+                None,
+            ));
+            let observed = tokio::time::timeout(Duration::from_secs(3), async {
+                let (mut stream, _) = listener.accept().await?;
+                stream.read_u8().await
+            })
+            .await;
+            bootstrap.abort();
+            let _ = bootstrap.await;
+            assert_eq!(
+                observed
+                    .expect("encrypted bootstrap must dial its TCP port")
+                    .unwrap(),
+                0x16,
+                "the first record must be a TLS handshake, never plain DNS"
+            );
+        }
     }
 
     // B6: Https hostname in default_ns → same error.

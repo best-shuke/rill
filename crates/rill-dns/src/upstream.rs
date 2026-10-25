@@ -70,11 +70,9 @@ impl fmt::Display for NameServerUrl {
 /// A nameserver entry — a [`NameServerUrl`] plus an optional `#PROXY` tag
 /// telling the resolver to tunnel queries through the named proxy.
 ///
-/// See [ADR-0012](../../../../docs/adr/0012-dns-via-proxy.md) for the
-/// design (issue #67 phase 2). Only the plain `Udp` / `Tcp` URL forms
-/// accept a `#PROXY` fragment in this slice; `Tls` / `Https` already use
-/// `#` for SNI and need the `?proxy=NAME` query-string disambiguator
-/// from the ADR, which is left for a follow-up.
+/// The fragment selects the outbound for every transport, including DoT
+/// and DoH, matching mihomo. An explicit `sni=hostname` parameter overrides
+/// the TLS name without confusing it with an outbound name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
@@ -87,34 +85,42 @@ impl NameServerEntry {
     }
 
     /// Parse a nameserver string, returning the parsed `NameServerUrl` plus
-    /// the optional proxy name if a `#PROXY` fragment was present on a
-    /// plain (Udp/Tcp) entry.
+    /// the optional outbound name from the `#PROXY` fragment.
     pub fn parse(s: &str) -> Result<Self, NameServerParseError> {
         let s = s.trim();
         if s.is_empty() {
             return Err(NameServerParseError::EmptyInput);
         }
 
-        // Only plain forms (no scheme, `udp://`, `tcp://`) treat the `#`
-        // fragment as a proxy name. For `tls://` / `https://` the
-        // fragment is SNI — leave it intact and let NameServerUrl::parse
-        // consume it normally.
-        let is_plain_form = !(s.starts_with("tls://") || s.starts_with("https://"));
-        if is_plain_form {
-            if let Some(idx) = s.find('#') {
-                let head = &s[..idx];
-                let proxy = s[idx + 1..].trim();
-                if proxy.is_empty() {
-                    return Err(NameServerParseError::InvalidHost(s.to_string()));
+        let (head, fragment) = s.split_once('#').map_or((s, None), |(h, f)| (h, Some(f)));
+        let mut entry = Self::plain(NameServerUrl::parse(head)?);
+        if let Some(fragment) = fragment {
+            if fragment.trim().is_empty() {
+                return Err(NameServerParseError::InvalidHost(s.to_string()));
+            }
+            for parameter in fragment.split('&') {
+                let parameter = parameter.trim();
+                if let Some(sni) = parameter.strip_prefix("sni=") {
+                    if sni.is_empty() {
+                        return Err(NameServerParseError::InvalidHost(s.to_string()));
+                    }
+                    match &mut entry.url {
+                        NameServerUrl::Tls { sni: name, .. }
+                        | NameServerUrl::Https { sni: name, .. } => *name = sni.to_string(),
+                        _ => {
+                            return Err(NameServerParseError::UnsupportedParameter(
+                                parameter.into(),
+                            ))
+                        }
+                    }
+                } else if parameter.is_empty() || parameter.contains('=') || entry.proxy.is_some() {
+                    return Err(NameServerParseError::UnsupportedParameter(parameter.into()));
+                } else {
+                    entry.proxy = Some(parameter.to_string());
                 }
-                let url = NameServerUrl::parse(head)?;
-                return Ok(Self {
-                    url,
-                    proxy: Some(proxy.to_string()),
-                });
             }
         }
-        Ok(Self::plain(NameServerUrl::parse(s)?))
+        Ok(entry)
     }
 }
 
@@ -362,6 +368,8 @@ pub enum NameServerParseError {
     EncryptedFeatureDisabled,
     #[error("unsupported rcode nameserver type '{0}'")]
     UnsupportedRCode(String),
+    #[error("unsupported nameserver parameter '{0}'")]
+    UnsupportedParameter(String),
 }
 
 #[cfg(test)]
@@ -856,14 +864,25 @@ mod tests {
 
     #[test]
     #[cfg(feature = "encrypted")]
-    fn entry_tls_fragment_is_sni_not_proxy() {
-        // For tls:// the `#` is SNI per the existing parser; the
-        // NameServerEntry layer must NOT steal that fragment as a proxy
-        // name. ADR-0012 reserves `?proxy=NAME` for TLS/HTTPS — not yet
-        // implemented, but the existing SNI semantics must keep working.
-        let e = NameServerEntry::parse("tls://1.1.1.1:853#dns.google").unwrap();
-        assert!(e.proxy.is_none());
-        assert!(matches!(e.url, NameServerUrl::Tls { .. }));
+    fn encrypted_entry_fragments_select_outbound_without_changing_tls_name() {
+        for (scheme, tag) in [("tls", "proxy"), ("https", "DIRECT"), ("https", "RULES")] {
+            let entry = NameServerEntry::parse(&format!("{scheme}://1.1.1.1#{tag}")).unwrap();
+            assert_eq!(entry.proxy.as_deref(), Some(tag));
+            match entry.url {
+                NameServerUrl::Tls { sni, .. } | NameServerUrl::Https { sni, .. } => {
+                    assert_eq!(sni, "1.1.1.1");
+                }
+                _ => panic!("expected encrypted upstream"),
+            }
+        }
+        let entry =
+            NameServerEntry::parse("https://1.1.1.1/dns-query#proxy&sni=cloudflare-dns.com")
+                .unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("proxy"));
+        assert!(
+            matches!(entry.url, NameServerUrl::Https { sni, .. } if sni == "cloudflare-dns.com")
+        );
+        assert!(NameServerEntry::parse("https://1.1.1.1#proxy&ecs=1.2.3.4").is_err());
     }
 
     #[test]

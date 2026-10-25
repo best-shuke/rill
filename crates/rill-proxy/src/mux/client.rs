@@ -406,7 +406,7 @@ impl MuxClient {
         !self.options.only_tcp
     }
 
-    fn metadata_host(metadata: &Metadata, adapter: &str) -> Result<String> {
+    pub(crate) fn metadata_host(metadata: &Metadata, adapter: &str) -> Result<String> {
         if !metadata.host.is_empty() {
             Ok(metadata.host.to_string())
         } else if let Some(ip) = metadata.dst_ip {

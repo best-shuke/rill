@@ -1,9 +1,16 @@
 # ADR 0012: Route DNS clients through a proxy adapter (`#PROXY` nameserver suffix)
 
-- **Status:** Proposed
+- **Status:** Implemented; syntax amended 2026-10-25
 - **Date:** 2026-05-19
 - **Author:** Claude (on behalf of @madeye)
 - **Related:** issue #67, PR #88 (per-proxy DNS for `type: direct`)
+
+**2026-10-25 amendment:** the current YAML syntax uses `#outbound` for
+every DNS transport, with `&sni=hostname` for a TLS-name override. The
+proposed `?proxy=` syntax and bare encrypted `#sni` fragments below were
+superseded. DoT/DoH use the shared BoringSSL TLS layer over proxy IO.
+`respect-rules`, direct DNS and encrypted IP-literal bootstrap are now
+implemented; see [DNS routing](../dns-routing.md) for the current contract.
 
 ## Context
 

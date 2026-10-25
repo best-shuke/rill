@@ -1,5 +1,11 @@
 # Spec: Encrypted DNS upstreams (DoH / DoT) and bootstrap
 
+**Current implementation (2026-10-25):** this historical design predates
+the BoringSSL client and DNS outbound tags. YAML encrypted `#name` fragments
+now select outbounds, not SNI; use `&sni=hostname` explicitly. IP-literal
+DoT/DoH bootstrap remains encrypted. See [DNS routing](../dns-routing.md)
+for current syntax and behavior.
+
 Status: Approved (architect 2026-04-18, amendments applied)
 Owner: pm
 Tracks roadmap items: **M1.E-1** (DoH / DoT upstream clients) and

@@ -62,6 +62,8 @@ pub struct VlessAdapter {
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
+    #[cfg(feature = "vless-vision")]
+    vision_udp: std::sync::OnceLock<Arc<MuxClient>>,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -101,6 +103,8 @@ impl VlessAdapter {
             dialer,
             #[cfg(feature = "mux")]
             mux: None,
+            #[cfg(feature = "vless-vision")]
+            vision_udp: std::sync::OnceLock::new(),
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
@@ -117,6 +121,12 @@ impl VlessAdapter {
     ///   (CommandMux 0x03, no address); server must be Xray / sing-box.
     #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: MuxOptions) -> Self {
+        self.mux = Some(self.new_mux_client(options));
+        self
+    }
+
+    #[cfg(feature = "mux")]
+    fn new_mux_client(&self, options: MuxOptions) -> Arc<MuxClient> {
         use crate::mux::{MuxClient, Protocol, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
         use crate::vless::header::VlessAddr;
         use std::sync::Arc as StdArc;
@@ -209,8 +219,7 @@ impl VlessAdapter {
                 }
             })
         });
-        self.mux = Some(MuxClient::new(dial, options));
-        self
+        MuxClient::new(dial, options)
     }
 
     /// Attach a VLESS Encryption client (`encryption: mlkem768x25519plus…`).
@@ -392,7 +401,21 @@ impl ProxyAdapter for VlessAdapter {
             }
         }
 
-        // Vision is TCP-only; UDP always uses plain VlessConn regardless of flow.
+        // A Vision user cannot issue a plain CommandUDP request: sing-box
+        // correctly refuses the missing flow. Carry datagrams in XUDP/Mux.Cool
+        // frames over CommandMux with the same Vision handshake as mihomo.
+        #[cfg(feature = "vless-vision")]
+        if self.flow == Some(VlessFlow::XtlsRprxVision) {
+            let mux = self.vision_udp.get_or_init(|| {
+                self.new_mux_client(MuxOptions {
+                    protocol: crate::mux::Protocol::MuxCool,
+                    ..MuxOptions::default()
+                })
+            });
+            let host = MuxClient::metadata_host(metadata, "vless vision UDP")?;
+            return mux.open_packet_stream(&host, metadata.dst_port).await;
+        }
+
         debug!(
             "VLESS UDP connecting to {} via {}",
             metadata.remote_address(),
@@ -417,6 +440,10 @@ impl ProxyAdapter for VlessAdapter {
     #[cfg(feature = "mux")]
     fn reset_sessions(&self) {
         if let Some(mux) = &self.mux {
+            mux.reset();
+        }
+        #[cfg(feature = "vless-vision")]
+        if let Some(mux) = self.vision_udp.get() {
             mux.reset();
         }
     }
@@ -541,13 +568,9 @@ mod tests {
         let _a = make_adapter(Some(VlessFlow::XtlsRprxVision), false);
     }
 
-    // ─── E6: dial_udp ignores Vision flow (guard-rail) ───────────────────────
-
-    // This is tested at runtime in the integration tests.
-    // The compile-time check: dial_udp should always compile regardless of flow.
+    // Runtime wire interoperability is covered by smux_singbox_integration.
     #[test]
-    fn vless_udp_ignores_vision_flow_compiles() {
-        // Just verify the adapter compiles with XtlsRprxVision + udp: true.
+    fn vless_udp_can_be_constructed_with_or_without_vision() {
         #[cfg(feature = "vless-vision")]
         let _ = make_adapter(Some(VlessFlow::XtlsRprxVision), true);
         let _ = make_adapter(None, true);
