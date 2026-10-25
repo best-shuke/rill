@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased fixes
+## 0.1.1 — 2026-10-25
 
 - Interpret `#proxy`, `#DIRECT` and `#RULES` as DNS outbounds for DoH/DoT
   as well as plain DNS. Encrypted queries now support proxy transports
@@ -31,7 +31,7 @@
   sessions, avoiding sing-box's missing-flow rejection. Recreate these
   sessions after outbound-interface changes.
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-10-25
 
 First version of rill, started from meow-rs 0.26.1 (`62525d4`; see NOTICE).
 meow-rs's own history is kept in `docs/history/meow-rs-CHANGELOG.md`.

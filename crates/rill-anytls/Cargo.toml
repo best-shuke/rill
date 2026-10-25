@@ -12,7 +12,7 @@
 # dependents' `use anytls_rs::...` paths are unchanged.
 [package]
 name = "rill-anytls"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Vendored AnyTLS protocol implementation (madeye fork) for the rill proxy kernel."
@@ -43,7 +43,7 @@ server = [
 ]
 
 [dependencies]
-rill-common = { path = "../rill-common", version = "0.1.0" }
+rill-common = { path = "../rill-common", version = "0.1.1" }
 tokio = { version = "1.48", features = [
     "macros",
     "rt-multi-thread",
