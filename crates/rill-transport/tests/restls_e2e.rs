@@ -1009,7 +1009,10 @@ async fn e2e_tls12_tagged_inner(
                 while pos + RECORD_HDR <= produced.len() {
                     let len = u16::from_be_bytes([produced[pos + 3], produced[pos + 4]]) as usize;
                     let mut rec = produced[pos..pos + RECORD_HDR + len].to_vec();
-                    if rec[0] == 22 && rec.len() > 43 && rec[RECORD_HDR] == 2 {
+                    // Only before the cover's CCS: TLS 1.2 keeps the Finished a
+                    // handshake (22) record under encryption, and its explicit
+                    // nonce starts with 2 about once in 256 handshakes.
+                    if rec[0] == 22 && !cover_ccs && rec.len() > 43 && rec[RECORD_HDR] == 2 {
                         server_random.copy_from_slice(&rec[RECORD_HDR + 6..RECORD_HDR + 38]);
                     }
                     if rec[0] == 20 {
