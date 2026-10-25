@@ -1032,7 +1032,7 @@ impl BoundDnsServer {
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Err(e) => warn!("DNS send error: {e}"),
+                        Err(e) => debug!("DNS send error: {e}"),
                         Ok(_) => {}
                     }
                     continue;
@@ -1080,7 +1080,7 @@ impl BoundDnsServer {
                             return;
                         };
                         if let Err(e) = sock.send_to(&response, src).await {
-                            warn!("DNS send error: {}", e);
+                            debug!("DNS send error: {}", e);
                         }
                     }
                     Ok(Err(e)) => {

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 pub use rill_common::ProxyHealth;
 
@@ -93,11 +93,11 @@ pub async fn url_test(
             Ok(delay)
         }
         Ok(Err(e)) => {
-            warn!("{} URL test transport error: {}", adapter.name(), e);
+            debug!("{} URL test transport error: {}", adapter.name(), e);
             Err(UrlTestError::Transport(e))
         }
         Err(_) => {
-            warn!("{} URL test timeout after {:?}", adapter.name(), timeout);
+            debug!("{} URL test timeout after {:?}", adapter.name(), timeout);
             Err(UrlTestError::Timeout)
         }
     }
@@ -588,7 +588,7 @@ async fn check_chain(round: &ChainRound<'_>, owner: &str, reason: &'static str) 
     } else {
         format!("{reason}; unreachable through {tried} members of '{front}' tried")
     };
-    warn!("health-check: '{owner}' is down: {why}");
+    info!("health-check: '{owner}' is down: {why}");
     let message = if tried == 0 {
         format!("'{owner}' failed its health check ({reason}) and no member of '{front}' was left to try")
     } else {

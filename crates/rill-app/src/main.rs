@@ -273,8 +273,15 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
             let log_layer = LogBroadcastLayer { tx: tx.clone() }.with_filter(LevelFilter::TRACE);
             let (filter_layer, reload_handle) =
                 tracing_subscriber::reload::Layer::new(env_filter());
+            // Colour only a terminal: a front end that keeps the output as a
+            // log file (FlowBar's core.log) must not get escape codes in it.
+            let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_filter(filter_layer))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(ansi)
+                        .with_filter(filter_layer),
+                )
                 .with(log_layer)
                 .init();
             rill_api::log_stream::install_log_reloader(move |level| {

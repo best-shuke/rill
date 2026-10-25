@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub async fn handle_http(
     tunnel: &Tunnel,
@@ -358,7 +358,7 @@ async fn handle_http_inner(
                         }
                     }
                     Err(e) => {
-                        warn!("{}:{} HTTP dial error: {}", host, port, e);
+                        info!("{}:{} HTTP dial error: {}", host, port, e);
                         write_bad_gateway(stream).await?;
                     }
                 }

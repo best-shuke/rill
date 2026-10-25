@@ -432,12 +432,12 @@ async fn route_inbound_tcp_scoped<C>(
                     // (e.g. pipelined TLS ClientHello after a CONNECT 200). Counted
                     // as upload so the connection stats stay accurate. A failure
                     // here kills the connection (the remote half is unusable), so it
-                    // must be visible at `warn` — the pre-refactor code propagated
-                    // it to the caller instead of swallowing it at `debug`
-                    // (review M9).
+                    // is logged rather than swallowed at `debug` (review M9) — at
+                    // `info`, like every per-connection failure, so a `warning`
+                    // log keeps only what concerns the whole process.
                     if !prefix.is_empty() {
                         if let Err(e) = remote.write_all(prefix).await {
-                            warn!(
+                            info!(
                                 "{} {} prefix write error: {}",
                                 metadata.conn_type,
                                 metadata.remote_address(),
@@ -490,7 +490,7 @@ async fn route_inbound_tcp_scoped<C>(
                     }
                 }
                 Err(e) => {
-                    warn!(
+                    info!(
                         "{} {} dial error: {}",
                         metadata.conn_type,
                         metadata.remote_address(),

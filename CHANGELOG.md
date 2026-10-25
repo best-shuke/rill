@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Keep the `warning` log to what concerns the whole process: a failed
+  connection, DNS reply or UDP flow, a rule target skipped for one
+  connection, and each health-check probe now log at `info` or `debug`.
+  A group logs one warning when none of its members is reachable any more
+  and one `info` line when it recovers, instead of every member every
+  round. Ignored nameserver parameters (`h3=true`) are noted at `info`.
+- Console output carries no colour escape codes unless it is a terminal,
+  so a front end's log file (FlowBar's `core.log`) stays plain text.
+
 ## 0.1.1 — 2026-10-25
 
 - Interpret `#proxy`, `#DIRECT` and `#RULES` as DNS outbounds for DoH/DoT

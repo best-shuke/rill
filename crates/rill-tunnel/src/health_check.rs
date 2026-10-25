@@ -62,6 +62,29 @@ impl HealthCheckSupervisor {
     }
 }
 
+/// A group's reachability change worth logging once.
+#[derive(Debug, PartialEq, Eq)]
+enum Reachability {
+    /// No member answered this round, though one did before (or this is the
+    /// first round).
+    Lost,
+    /// A member answered again after a round with none.
+    Regained,
+}
+
+/// Compare a round with the previous one; a round that probed nothing
+/// changes nothing.
+fn reachability_change(none_alive_before: bool, alive: u32, total: u32) -> Option<Reachability> {
+    if total == 0 {
+        return None;
+    }
+    match (none_alive_before, alive == 0) {
+        (false, true) => Some(Reachability::Lost),
+        (true, false) => Some(Reachability::Regained),
+        _ => None,
+    }
+}
+
 fn should_probe(lazy: bool, generation: u64, last_probed_generation: u64) -> bool {
     !lazy || (generation != 0 && generation != last_probed_generation)
 }
@@ -83,6 +106,10 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
     // missed-tick probe storm right after system suspend.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_probed_generation = 0;
+    // Whether the last round reached no member. Only the change is logged
+    // at `warn`, so a group with dead nodes does not repeat itself every
+    // interval; each member's verdict stays at `debug`.
+    let mut none_alive = false;
 
     if spec.lazy {
         ticker.tick().await;
@@ -165,7 +192,7 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             if member.delay > 0 {
                 alive_count += 1;
             } else {
-                warn!(
+                debug!(
                     "health-check: {} / {} is dead (probe failed)",
                     spec.group_name, member.name
                 );
@@ -185,6 +212,20 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             "health-check: {} — {}/{} alive",
             spec.group_name, alive_count, total_count
         );
+        match reachability_change(none_alive, alive_count, total_count) {
+            Some(Reachability::Lost) => warn!(
+                "health-check: no member of {} is reachable ({} probed)",
+                spec.group_name, total_count
+            ),
+            Some(Reachability::Regained) => info!(
+                "health-check: {} is reachable again ({}/{} alive)",
+                spec.group_name, alive_count, total_count
+            ),
+            None => {}
+        }
+        if total_count > 0 {
+            none_alive = alive_count == 0;
+        }
 
         if let Some(chain) = group.chain_health() {
             // A block outlives the gap to the next round, which probes
@@ -262,6 +303,21 @@ mod tests {
     use crate::Tunnel;
     use rill_common::{Metadata, Proxy, ProxyAdapter};
     use rill_config::extract_health_check_specs as extract_specs;
+
+    /// A group with dead nodes is reported once when it loses its last
+    /// reachable member and once when it regains one — not every round.
+    #[test]
+    fn reachability_is_logged_only_when_it_changes() {
+        assert_eq!(reachability_change(false, 0, 3), Some(Reachability::Lost));
+        assert_eq!(reachability_change(true, 0, 3), None, "still down: quiet");
+        assert_eq!(
+            reachability_change(true, 1, 3),
+            Some(Reachability::Regained)
+        );
+        assert_eq!(reachability_change(false, 2, 3), None, "still up: quiet");
+        assert_eq!(reachability_change(false, 0, 0), None, "nothing probed");
+        assert_eq!(reachability_change(true, 0, 0), None);
+    }
 
     fn stub_tunnel() -> Tunnel {
         let resolver = std::sync::Arc::new(rill_dns::Resolver::new(

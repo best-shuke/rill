@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Below this size, trie probing costs more than it saves for common configs
 /// with early matches. Compile small configs to straight-line ordered IR scan.
@@ -308,7 +308,7 @@ fn process_missing(metadata: &Metadata) -> bool {
 /// forwards only the `message` field. Keep the wording in sync with the
 /// legacy engine's copy in `match_engine::warn_missing_target`.
 fn warn_missing_target(m: &CompiledMatchResult<'_>) {
-    warn!(
+    info!(
         "rule {} matched target '{}' which is unavailable for this \
          connection (absent from the registry, or no UDP support); \
          skipping it",
@@ -3253,9 +3253,10 @@ mod tests {
         }
     }
 
-    /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines.
-    fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+    /// Scoped capture down to INFO, the level of the per-connection
+    /// skipped-target line — `with_default` is thread-local, so parallel
+    /// tests in this binary don't see each other's lines.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -3277,7 +3278,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(sink.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(tracing::Level::INFO)
             .finish();
         let out = tracing::subscriber::with_default(subscriber, f);
         let captured = sink.0.lock().unwrap();
@@ -3305,7 +3306,7 @@ mod tests {
 
         // Phase 1: the dead-target domain rule matches and the IP-CIDR slot
         // blocks → NeedsEnrichment. The warn must be deferred to phase 2.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(
             matches!(
                 outcome,
@@ -3320,7 +3321,7 @@ mod tests {
 
         // Phase 2: the strict re-match warns exactly once.
         meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &usable));
         assert_eq!(
             result.map(|m| m.adapter_name),
             Some("CidrProxy"),
@@ -3348,7 +3349,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         let warns = logs.matches("unavailable").count();
         assert_eq!(
@@ -3379,7 +3380,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3390,7 +3391,7 @@ mod tests {
         );
 
         meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &usable));
         assert_eq!(result.map(|m| m.adapter_name), Some("CidrProxy"));
         // The trie hit and the second matching domain rule in the tail each
         // warn exactly once — buffer order equals scan order.
@@ -3418,11 +3419,11 @@ mod tests {
             ..Default::default()
         };
 
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &usable));
         assert_eq!(result.map(|m| m.adapter_name), Some("LIVE"));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "strict: {logs}");
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "lazy: {logs}");
     }
@@ -3446,7 +3447,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3454,7 +3455,7 @@ mod tests {
         assert!(!logs.contains("PASS"), "got: {logs}");
 
         meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &BuiltinProbe));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &BuiltinProbe));
         assert_eq!(result.map(|m| m.adapter_name), Some("CidrProxy"));
         assert!(!logs.contains("PASS"), "got: {logs}");
     }
@@ -3471,7 +3472,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(outcome, LazyMatchOutcome::NoMatch));
         let warns = logs.matches("unavailable").count();
         assert_eq!(
@@ -3499,7 +3500,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3509,7 +3510,7 @@ mod tests {
         // The enriched IP misses the CIDR, so the strict re-scan walks past
         // the previously blocked slot and reaches the dead domain rule.
         meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &usable));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &usable));
         assert_eq!(result.map(|m| m.adapter_name), Some("DIRECT"));
         assert_eq!(
             logs.matches("DEAD").count(),
@@ -3552,7 +3553,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &BuiltinProbe));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &BuiltinProbe));
         assert_eq!(result.map(|m| m.adapter_name), Some("REJECT"));
         assert!(
             !logs.contains("PASS"),
@@ -3572,7 +3573,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &BuiltinProbe));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &BuiltinProbe));
         assert_eq!(result.map(|m| m.adapter_name), Some("DIRECT"));
         assert!(!logs.contains("PASS"), "got: {logs}");
     }
@@ -3593,7 +3594,7 @@ mod tests {
             network: Network::Udp,
             ..Default::default()
         };
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &BuiltinProbe));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &BuiltinProbe));
         assert_eq!(result.map(|m| m.adapter_name), Some("DIRECT"));
         assert!(
             !logs.contains("PASS"),
@@ -3618,7 +3619,7 @@ mod tests {
         };
         // Phase 1: PASS rule skipped, then the scan hits the IP-demanding
         // slot → NeedsEnrichment with no warns.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3627,7 +3628,7 @@ mod tests {
         // Phase 2 (strict re-scan after enrichment): PASS skipped again —
         // still silent — then the IP rule wins.
         meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        let (result, logs) = capture_warns(|| set.match_rules(&meta, &rules, &BuiltinProbe));
+        let (result, logs) = capture_logs(|| set.match_rules(&meta, &rules, &BuiltinProbe));
         assert_eq!(result.map(|m| m.adapter_name), Some("CidrProxy"));
         assert!(!logs.contains("PASS"), "got: {logs}");
     }
@@ -3647,7 +3648,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
@@ -4202,7 +4203,7 @@ mod tests {
         // exactly once on the terminal outcome (the hit-slot arm reports
         // through the same on_missing sink; dropping it silently loses
         // this warn since no strict re-scan runs on Matched).
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &present));
+        let (outcome, logs) = capture_logs(|| set.match_rules_lazy(&meta, &rules, &present));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "REJECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {

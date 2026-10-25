@@ -290,7 +290,7 @@ pub async fn handle_udp(
     // after that (resolution failure or unresolvable host), we cannot track
     // the session and must discard the packet.
     let Some(dst_ip) = metadata.dst_ip else {
-        warn!(
+        info!(
             "UDP {}: dst_ip not resolved after pre_resolve — dropping",
             metadata.remote_address()
         );
@@ -406,14 +406,14 @@ pub async fn handle_udp(
                 }
             }
             if let Err(e) = winner.conn.write_packet(data, &dst_addr).await {
-                warn!("UDP initial write error for {} -> {}: {}", src, dst_addr, e);
+                info!("UDP initial write error for {} -> {}: {}", src, dst_addr, e);
                 tunnel
                     .nat_table
                     .remove_if(&key, |_, s| Arc::ptr_eq(s, &winner));
             }
         }
         Err(e) => {
-            warn!("UDP dial error for {} -> {}: {}", src, dst_addr, e);
+            info!("UDP dial error for {} -> {}: {}", src, dst_addr, e);
         }
     }
 }

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Upstream Go mihomo default for v4 fake-IP CIDR. Used when
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
@@ -507,11 +507,12 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
 }
 
-/// Report fragment parameters an upstream accepted but does not act on.
+/// Report fragment parameters an upstream accepted but does not act on —
+/// at `info`: mihomo is silent about them, and none changes the answers.
 fn warn_ignored_parameters(entries: &[(&str, &NameServerEntry)]) {
     for (section, entry) in entries {
         if !entry.ignored_parameters.is_empty() {
-            warn!(
+            info!(
                 "dns.{section}: nameserver '{}' ignores unsupported parameter(s) {}",
                 entry.url,
                 entry.ignored_parameters.join(", ")
