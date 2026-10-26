@@ -45,7 +45,7 @@ debug = 1
 opt-level = 1
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -149,7 +149,7 @@ tun-rs = { version = "2.8", features = ["async_tokio"] }
 # poll_next UAF / poll_flush deadlock / FIN_WAIT_2 leak / livelock fixes that
 # upstream `lwip` lacks. Registry version, not a `git =` pin — crates.io
 # forbids git deps in a published manifest (see docs/RELEASING.md).
-lwip = { package = "rill-lwip", path = "crates/rill-lwip", version = "0.1.3" }
+lwip = { package = "rill-lwip", path = "crates/rill-lwip", version = "0.1.4" }
 route_manager = "0.2"
 
 # Crypto
@@ -268,18 +268,18 @@ proptest = "1"
 # Workspace crates
 # default-features = false on feature-gated crates so each consumer controls
 # which optional protocols/listeners are compiled (M2.E feature-flag infra).
-rill-common = { path = "crates/rill-common", version = "0.1.3" }
-rill-trie = { path = "crates/rill-trie", version = "0.1.3" }
+rill-common = { path = "crates/rill-common", version = "0.1.4" }
+rill-trie = { path = "crates/rill-trie", version = "0.1.4" }
 # Vendored anytls fork (lib name `anytls_rs`); optional, pulled in only by
 # rill-proxy's `anytls` feature.
-rill-anytls = { path = "crates/rill-anytls", version = "0.1.3" }
-rill-dns = { path = "crates/rill-dns", version = "0.1.3", default-features = false }
-rill-rules = { path = "crates/rill-rules", version = "0.1.3" }
+rill-anytls = { path = "crates/rill-anytls", version = "0.1.4" }
+rill-dns = { path = "crates/rill-dns", version = "0.1.4", default-features = false }
+rill-rules = { path = "crates/rill-rules", version = "0.1.4" }
 # default-features = false so each consumer names the layers it needs
 # (rill-dns wants only `tls`; rill-listener only `simple-obfs`).
-rill-transport = { path = "crates/rill-transport", version = "0.1.3", default-features = false }
-rill-proxy = { path = "crates/rill-proxy", version = "0.1.3", default-features = false }
-rill-tunnel = { path = "crates/rill-tunnel", version = "0.1.3" }
-rill-listener = { path = "crates/rill-listener", version = "0.1.3", default-features = false }
-rill-api = { path = "crates/rill-api", version = "0.1.3" }
-rill-config = { path = "crates/rill-config", version = "0.1.3", default-features = false }
+rill-transport = { path = "crates/rill-transport", version = "0.1.4", default-features = false }
+rill-proxy = { path = "crates/rill-proxy", version = "0.1.4", default-features = false }
+rill-tunnel = { path = "crates/rill-tunnel", version = "0.1.4" }
+rill-listener = { path = "crates/rill-listener", version = "0.1.4", default-features = false }
+rill-api = { path = "crates/rill-api", version = "0.1.4" }
+rill-config = { path = "crates/rill-config", version = "0.1.4", default-features = false }

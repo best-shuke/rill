@@ -1,6 +1,34 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 — 2026-10-26
+
+Daily use below 1 Gbps: what a page waits on before its first byte. See
+[daily-experience-2026-10](docs/benchmarks/daily-experience-2026-10.md).
+
+- DoH upstreams are queried over one kept HTTP/2 connection instead of a
+  new TCP + TLS connection (and, for a `#PROXY` upstream, a new proxy dial)
+  per query: a lookup against Cloudflare went from 56 to 3.7 ms (mihomo
+  4.1). The connection is pinged after 30 s of silence, closed after 5 min
+  unused and retired on a network change; servers without `h2` keep
+  HTTP/1.1. The `minimal` bundle leaves this out (rill-dns `doh-h2`) to
+  stay within its size budget.
+- An expired DNS answer is served at once for up to an hour past its TTL
+  while a background lookup refreshes it — to a `DIRECT` dial and rule
+  matching, and to DNS clients with TTL 1 — as mihomo does. A name whose
+  TTL ran out no longer stalls the next connection on a full lookup.
+- `DIRECT` and proxy-server dials race a host's addresses per RFC 8305
+  (families interleaved, 250 ms apart, the next at once on failure) instead
+  of trying them in turn: a blackholed first address now costs 250 ms
+  where it used to fail the connection after 5 s. `tcp-concurrent: true`,
+  previously ignored, starts every attempt at once.
+- A dial cut by a reset, abort or early EOF is retried up to twice within
+  its 5 s deadline, so a proxy group can also move to a healthy member; a
+  refusal, DNS failure or timeout still fails at once.
+- `DIRECT` and DNS-upstream TCP sockets disable Nagle, as Go does, and
+  outbound sockets use TCP keepalive (30 s idle, 15 s interval), so a peer
+  that vanished without a FIN or RST is noticed in about two minutes.
+
+## 0.1.3 — 2026-10-26
 
 - Disable Nagle on accepted mixed/SOCKS/HTTP, TProxy and Shadowsocks
   connections, as Go does: the tail of each response written back to the
