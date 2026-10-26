@@ -203,37 +203,62 @@ pub fn response_body_keys(req_key: &[u8; 16], req_iv: &[u8; 16]) -> ([u8; 16], [
 /// per-connection response-verification byte (`resp_v`).
 ///
 /// upstream: `transport/vmess/conn.go` (`recvResponse`)
-pub async fn read_aead_response_header<R: AsyncRead + Unpin>(
-    rd: &mut R,
-    resp_body_key: &[u8; 16],
-    resp_body_iv: &[u8; 16],
-    resp_v: u8,
-) -> std::io::Result<()> {
-    let invalid = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
-
-    // Length block.
-    let len_key = kdf16(resp_body_key, &[b"AEAD Resp Header Len Key"]);
-    let len_iv = kdf12(resp_body_iv, &[b"AEAD Resp Header Len IV"]);
-    let mut len_ct = [0u8; 2 + TAG_LEN];
-    rd.read_exact(&mut len_ct).await?;
-    let (len_pt, len_tag) = len_ct.split_at_mut(2);
+pub(super) fn open_response_length(
+    block: &mut [u8; 2 + TAG_LEN],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> std::io::Result<usize> {
+    let len_key = kdf16(key, &[b"AEAD Resp Header Len Key"]);
+    let len_iv = kdf12(iv, &[b"AEAD Resp Header Len IV"]);
+    let (data, tag) = block.split_at_mut(2);
     Aead::aes_128_gcm(&len_key)
-        .open_detached(&len_iv, &[], len_pt, len_tag)
-        .map_err(|_| invalid("vmess: response length AEAD open failed"))?;
-    let hdr_len = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
+        .open_detached(&len_iv, &[], data, tag)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vmess: response length AEAD open failed",
+            )
+        })?;
+    Ok(usize::from(u16::from_be_bytes([data[0], data[1]])))
+}
 
-    // Header block (L plaintext + 16 tag).
-    let hdr_key = kdf16(resp_body_key, &[b"AEAD Resp Header Key"]);
-    let hdr_iv = kdf12(resp_body_iv, &[b"AEAD Resp Header IV"]);
-    let mut hdr = vec![0u8; hdr_len + TAG_LEN];
-    rd.read_exact(&mut hdr).await?;
+pub(super) fn open_response_header(
+    block: &mut Vec<u8>,
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    expected: u8,
+) -> std::io::Result<()> {
+    let hdr_key = kdf16(key, &[b"AEAD Resp Header Key"]);
+    let hdr_iv = kdf12(iv, &[b"AEAD Resp Header IV"]);
     Aead::aes_128_gcm(&hdr_key)
-        .open_trailing(&hdr_iv, &[], &mut hdr)
-        .map_err(|_| invalid("vmess: response header AEAD open failed"))?;
-    if hdr.first() != Some(&resp_v) {
-        return Err(invalid("vmess: response header verification byte mismatch"));
+        .open_trailing(&hdr_iv, &[], block)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vmess: response header AEAD open failed",
+            )
+        })?;
+    if block.first() != Some(&expected) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vmess: response header verification byte mismatch",
+        ));
     }
     Ok(())
+}
+
+pub async fn read_aead_response_header<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    resp_v: u8,
+) -> std::io::Result<()> {
+    let mut length = [0; 2 + TAG_LEN];
+    rd.read_exact(&mut length).await?;
+    let len = open_response_length(&mut length, key, iv)?;
+    let mut header = vec![0; len + TAG_LEN];
+    rd.read_exact(&mut header).await?;
+    open_response_header(&mut header, key, iv, resp_v)
 }
 
 fn build_auth_id(cmd_key: &[u8; 16], rng: &mut impl RngCore) -> [u8; 16] {

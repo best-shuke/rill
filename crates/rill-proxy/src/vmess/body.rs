@@ -1,4 +1,5 @@
 use md5::{Digest, Md5};
+#[cfg(any(not(target_os = "macos"), test))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
@@ -272,42 +273,70 @@ impl BodyCipher {
         Ok(nonce)
     }
 
-    /// Encrypt and write one body record: [len(2 BE)][ciphertext + tag(16)].
-    /// Length includes the tag.
-    pub async fn write_record<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-        plaintext: &[u8],
-    ) -> std::io::Result<()> {
+    /// Seal one complete frame into reusable storage. The caller must drain it
+    /// before preparing another frame; nonce advancement happens once here.
+    pub(super) fn prepare_record(&mut self, plaintext: &[u8]) -> std::io::Result<()> {
         if matches!(self.write, RecordCipher::Unbuilt) {
             return Err(std::io::Error::other(
                 "vmess body: write direction not built (reader cipher)",
             ));
         }
-        if matches!(self.write, RecordCipher::None) {
-            // OPT_STANDARD advertises chunk streaming even when the security
-            // type is none, so the payload still carries the 2-byte size.
-            let len = u16::try_from(plaintext.len())
-                .map_err(|_| std::io::Error::other("vmess plaintext record too large"))?;
-            writer.write_all(&len.to_be_bytes()).await?;
-            writer.write_all(plaintext).await?;
-            return writer.flush().await;
-        }
-
-        // Seal in place inside the finished frame, so the record leaves in
-        // one write rather than a 2-byte length write and a body write.
-        let len = u16::try_from(plaintext.len() + TAG_LEN)
+        let tag_len = if matches!(self.write, RecordCipher::None) {
+            0
+        } else {
+            TAG_LEN
+        };
+        let len = u16::try_from(plaintext.len() + tag_len)
             .map_err(|_| std::io::Error::other("vmess body record too large"))?;
-        let nonce = self.write_nonce()?;
+        let nonce = if tag_len == 0 {
+            None
+        } else {
+            Some(self.write_nonce()?)
+        };
         let frame = &mut self.write_buf;
         frame.clear();
         frame.reserve(2 + usize::from(len));
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(plaintext);
-        frame.resize(2 + usize::from(len), 0);
-        let (data, tag) = frame[2..].split_at_mut(plaintext.len());
-        self.write.seal(&nonce, data, tag)?;
-        writer.write_all(frame).await?;
+        if let Some(nonce) = nonce {
+            frame.resize(2 + usize::from(len), 0);
+            let (data, tag) = frame[2..].split_at_mut(plaintext.len());
+            self.write.seal(&nonce, data, tag)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn pending_record(&self) -> &[u8] {
+        &self.write_buf
+    }
+
+    pub(super) fn finish_record(&mut self) {
+        self.write_buf.clear();
+    }
+
+    pub(super) fn open_record(&mut self, buf: &mut Vec<u8>) -> std::io::Result<()> {
+        match self.read {
+            RecordCipher::Unbuilt => Err(std::io::Error::other(
+                "vmess body: read direction not built (writer cipher)",
+            )),
+            RecordCipher::None => Ok(()),
+            RecordCipher::Aead(_) => {
+                let nonce = self.read_nonce()?;
+                self.read.open(&nonce, buf)
+            }
+        }
+    }
+
+    /// Encrypt and write one body record: [len(2 BE)][ciphertext + tag(16)].
+    #[cfg(any(not(target_os = "macos"), test))]
+    pub async fn write_record<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        plaintext: &[u8],
+    ) -> std::io::Result<()> {
+        self.prepare_record(plaintext)?;
+        writer.write_all(self.pending_record()).await?;
+        self.finish_record();
         writer.flush().await
     }
 
@@ -337,6 +366,7 @@ impl BodyCipher {
     /// The relay keeps this buffer across records, avoiding one allocation for
     /// every encrypted chunk. `Some(())` means `buf` contains a record;
     /// `None` is the clean close or explicit terminator.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub async fn read_record_into<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -377,8 +407,7 @@ impl BodyCipher {
 
         buf.resize(len, 0);
         reader.read_exact(buf).await?;
-        let nonce = self.read_nonce()?;
-        self.read.open(&nonce, buf)?;
+        self.open_record(buf)?;
         Ok(Some(()))
     }
 

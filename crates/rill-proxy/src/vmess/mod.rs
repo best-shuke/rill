@@ -1,6 +1,8 @@
 mod body;
 mod conn;
 pub mod header;
+#[cfg(target_os = "macos")]
+mod inline;
 mod kdf;
 
 use async_trait::async_trait;
@@ -196,6 +198,11 @@ async fn vmess_over(
         sealed.req_iv,
         sealed.resp_v,
     );
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(duplex))
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
 }
 

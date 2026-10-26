@@ -26,9 +26,21 @@ use tracing::debug;
 
 #[cfg(feature = "mux")]
 use crate::mux::{MuxClient, MuxOptions};
+#[cfg(not(target_os = "macos"))]
 use crate::stream_conn::StreamConn;
 use crate::transport_to_proxy_err;
 use std::sync::Arc;
+
+fn tcp_conn(stream: Box<dyn TransportStream>) -> Box<dyn ProxyConn> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::coalesced::CoalescedRead::new(stream))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(StreamConn(stream))
+    }
+}
 
 /// SOCKS5-style command bytes used inside the Trojan request header.
 const CMD_CONNECT: u8 = 0x01;
@@ -163,7 +175,7 @@ impl TrojanAdapter {
                     .await
                     .map_err(transport_to_proxy_err)?;
                 stream.write_all(header).await.map_err(RillError::Io)?;
-                Ok(Box::new(StreamConn(stream)) as Box<dyn ProxyConn>)
+                Ok(tcp_conn(stream))
             })
         });
         self.mux = Some(MuxClient::new(dial, options));
@@ -557,7 +569,7 @@ impl ProxyAdapter for TrojanAdapter {
             return Ok(Box::new(conn));
         }
         let stream = self.open_tls_with_header(metadata, CMD_CONNECT).await?;
-        Ok(Box::new(StreamConn(stream)))
+        Ok(tcp_conn(stream))
     }
 
     /// Run TLS + the Trojan request header over an existing stream (relay
@@ -575,7 +587,7 @@ impl ProxyAdapter for TrojanAdapter {
         let stream = self
             .tls_header_over(Box::new(stream), metadata, CMD_CONNECT)
             .await?;
-        Ok(Box::new(StreamConn(stream)))
+        Ok(tcp_conn(stream))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {

@@ -1,6 +1,7 @@
 //! Bidirectional relay with zero allocations at setup and no per-connection
-//! idle buffers (ADR-0008 HP-1 / ADR-0011 T6). Each worker has 32 KiB of
-//! thread-local scratch, borrowed only during a synchronous read/write poll.
+//! idle buffers (ADR-0008 HP-1 / ADR-0011 T6). Each worker has thread-local
+//! scratch (128 KiB on macOS, 32 KiB elsewhere), borrowed only during a
+//! synchronous read/write poll.
 //! A direction owns storage only after backpressure leaves unwritten bytes;
 //! that spill buffer is retained and reused for the connection's lifetime.
 //!
@@ -24,8 +25,17 @@ mod splice;
 
 /// Copy chunk size before a direction proves bulk; no buffer is held at setup.
 pub const RELAY_BUF_SIZE: usize = 4 * 1024;
+// macOS has no socket-to-socket splice. Larger copy chunks amortize its
+// syscalls and accounting; the byte budget below still bounds every poll.
+#[cfg(target_os = "macos")]
+const RELAY_BULK_BUF_SIZE: usize = 128 * 1024;
+#[cfg(not(target_os = "macos"))]
 const RELAY_BULK_BUF_SIZE: usize = 32 * 1024;
-/// Keep short request/response flows free of pipe creation and descriptor costs.
+// Promote macOS copies early enough to help medium transfers. Other targets
+// keep the threshold that avoids Linux pipe setup for short connections.
+#[cfg(target_os = "macos")]
+const RELAY_BULK_UPGRADE_BYTES: u64 = 16 * 1024;
+#[cfg(not(target_os = "macos"))]
 const RELAY_BULK_UPGRADE_BYTES: u64 = 128 * 1024;
 /// Bytes one socket → pipe splice may move. The kernel caps each call at the
 /// pipe's free space (64 KiB by default), so this only asks for "as much as
@@ -75,9 +85,9 @@ pub const RELAY_HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
 /// deterministic: at 4 KiB per cycle it bounds one poll at 256 KiB relayed.
 const RELAY_CYCLES_PER_POLL: u32 = 64;
 
-/// Byte-based companion to [`RELAY_CYCLES_PER_POLL`]: a bulk copy or splice
-/// cycle moves up to 32 KiB, so 64 cycles would stretch one poll to
-/// 2 MiB. Yield once this many bytes have moved in a poll instead, keeping
+/// Byte-based companion to [`RELAY_CYCLES_PER_POLL`]: bulk copies grow to
+/// 128 KiB on macOS (32 KiB elsewhere), and splice can move more. Yield
+/// once this many bytes have moved in a poll instead, keeping
 /// the pre-upgrade 256 KiB-per-poll bound regardless of buffer size.
 const RELAY_BYTES_PER_POLL: u64 = 256 * 1024;
 
@@ -94,11 +104,24 @@ struct HalfCopy {
     cap: usize,
     amt: u64,
     need_flush: bool,
+    #[cfg(target_os = "macos")]
+    cycle_limit: usize,
     #[cfg(target_os = "linux")]
     pipe: Option<splice::Pipe>,
 }
 
 impl HalfCopy {
+    fn copy_limit(&self) -> usize {
+        let limit = if self.amt < RELAY_BULK_UPGRADE_BYTES {
+            RELAY_BUF_SIZE
+        } else {
+            RELAY_BULK_BUF_SIZE
+        };
+        #[cfg(target_os = "macos")]
+        let limit = limit.min(self.cycle_limit);
+        limit
+    }
+
     fn new() -> Self {
         Self {
             spill: None,
@@ -107,6 +130,8 @@ impl HalfCopy {
             cap: 0,
             amt: 0,
             need_flush: false,
+            #[cfg(target_os = "macos")]
+            cycle_limit: RELAY_BULK_BUF_SIZE,
             #[cfg(target_os = "linux")]
             pipe: None,
         }
@@ -264,11 +289,7 @@ impl HalfCopy {
             self.pos = 0;
             self.cap = 0;
             // Keep the original small-flow and bulk fairness granularity.
-            let limit = if self.amt < RELAY_BULK_UPGRADE_BYTES {
-                RELAY_BUF_SIZE
-            } else {
-                RELAY_BULK_BUF_SIZE
-            };
+            let limit = self.copy_limit();
             let mut rb = ReadBuf::new(&mut buf[..limit]);
             #[cfg(target_os = "linux")]
             if let Some(pipe) = &mut self.pipe {
@@ -300,8 +321,19 @@ impl HalfCopy {
             }
             self.cap = rb.filled().len();
         }
+        #[cfg(target_os = "macos")]
+        let cycle_start = self.amt;
         while self.pos < self.cap {
-            match writer.as_mut().poll_write(cx, &buf[self.pos..self.cap]) {
+            let end = self.cap;
+            #[cfg(target_os = "macos")]
+            let end = {
+                let remaining = self.cycle_limit - (self.amt - cycle_start) as usize;
+                if remaining == 0 {
+                    return Ok(Cycle::Progress);
+                }
+                end.min(self.pos + remaining)
+            };
+            match writer.as_mut().poll_write(cx, &buf[self.pos..end]) {
                 Poll::Ready(Ok(0)) => return Err(write_zero()),
                 Poll::Ready(Ok(n)) => {
                     self.pos += n;
@@ -424,6 +456,22 @@ where
         let mut a_parked = false;
         let mut b_parked = false;
         loop {
+            // Share the remaining budget between active directions. Limiting
+            // the actual reads/writes avoids an early self-wake when a stream
+            // has transferred many small messages and is eligible for bulk
+            // buffers, but its next read still only contains a small message.
+            #[cfg(target_os = "macos")]
+            {
+                let active = u64::from(!a_done && !a_parked) + u64::from(!b_done && !b_parked);
+                let remaining = RELAY_BYTES_PER_POLL - (a_to_b.amt + b_to_a.amt - poll_start_bytes);
+                let allowance = remaining / active.max(1);
+                if allowance == 0 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                a_to_b.cycle_limit = allowance as usize;
+                b_to_a.cycle_limit = allowance as usize;
+            }
             let mut progressed = false;
 
             if !a_done && !a_parked {
@@ -547,7 +595,7 @@ mod tests {
     async fn bulk_copy_survives_backpressure_and_chunk_size_transition() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        const TOTAL: usize = (RELAY_BULK_UPGRADE_BYTES as usize) * 4;
+        const TOTAL: usize = (RELAY_BULK_UPGRADE_BYTES as usize + RELAY_BULK_BUF_SIZE) * 4;
 
         let (mut client, mut a) = duplex(16 * 1024);
         let (mut b, mut upstream) = duplex(16 * 1024);
@@ -891,14 +939,14 @@ mod scratch_tests {
 
     #[tokio::test]
     async fn always_ready_streams_yield_within_cycle_and_byte_budgets() {
-        struct Endless;
+        struct Endless(usize);
         impl AsyncRead for Endless {
             fn poll_read(
                 self: Pin<&mut Self>,
                 _: &mut Context<'_>,
                 buf: &mut ReadBuf<'_>,
             ) -> Poll<io::Result<()>> {
-                let n = buf.remaining();
+                let n = buf.remaining().min(self.0);
                 buf.initialize_unfilled().fill(0);
                 buf.advance(n);
                 Poll::Ready(Ok(()))
@@ -919,25 +967,33 @@ mod scratch_tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let mut a = Endless;
-        let mut b = Endless;
-        let up = std::cell::Cell::new(0);
-        let down = std::cell::Cell::new(0);
-        let relay = copy_bidirectional_tracked(
-            &mut a,
-            &mut b,
-            |_| None,
-            |_| None,
-            |n| up.set(up.get() + n),
-            |n| down.set(down.get() + n),
-        );
-        tokio::pin!(relay);
-        for _ in 0..3 {
-            let before = up.get() + down.get();
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            assert!(relay.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(up.get(), down.get(), "directions must alternate fairly");
-            assert!(up.get() + down.get() - before <= RELAY_BYTES_PER_POLL);
+        for read_cap in [usize::MAX, 4096] {
+            let mut a = Endless(read_cap);
+            let mut b = Endless(read_cap);
+            let up = std::cell::Cell::new(0);
+            let down = std::cell::Cell::new(0);
+            let relay = copy_bidirectional_tracked(
+                &mut a,
+                &mut b,
+                |_| None,
+                |_| None,
+                |n| up.set(up.get() + n),
+                |n| down.set(down.get() + n),
+            );
+            tokio::pin!(relay);
+            for _ in 0..3 {
+                let before = up.get() + down.get();
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(relay.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(up.get(), down.get(), "directions must alternate fairly");
+                assert!(up.get() + down.get() - before <= RELAY_BYTES_PER_POLL);
+                if read_cap == 4096 {
+                    assert!(
+                        up.get() + down.get() - before >= 128 * 1024,
+                        "small reads must not yield early after becoming bulk eligible"
+                    );
+                }
+            }
         }
     }
 }

@@ -826,7 +826,7 @@ mod tests {
     /// v2ray-plugin / xhttp `headers` (issue #648).
     #[test]
     fn parse_opts_caps_header_count() {
-        let mut opts = String::from("mode=websocket");
+        let mut opts = String::from("mode=websocket;mux=false");
         for i in 0..rill_transport::MAX_EXTRA_HEADERS {
             use std::fmt::Write;
             write!(opts, ";header=H{i}:v").unwrap();

@@ -17,7 +17,10 @@ pub mod mux;
 pub mod reject;
 pub mod socks5_adapter;
 pub mod stream_conn;
-#[cfg(any(feature = "vmess", feature = "vless-encryption"))]
+#[cfg(any(
+    all(feature = "vmess", not(target_os = "macos")),
+    feature = "vless-encryption"
+))]
 pub(crate) mod tasked_duplex;
 pub mod transport_chain;
 #[cfg(feature = "trusttunnel")]
@@ -34,6 +37,11 @@ pub mod jls_plugin;
 pub mod kcptun_plugin;
 #[cfg(feature = "ss")]
 mod plugin_util;
+#[cfg(all(any(feature = "ss", feature = "vmess"), target_os = "macos"))]
+mod record_io;
+
+#[cfg(all(target_os = "macos", any(feature = "ss", feature = "trojan")))]
+mod coalesced;
 #[cfg(feature = "ss")]
 pub mod restls_plugin;
 #[cfg(feature = "ss")]

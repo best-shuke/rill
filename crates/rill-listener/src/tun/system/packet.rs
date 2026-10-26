@@ -255,6 +255,8 @@ mod tests {
                     };
                     assert_eq!(header.syn, flags & 2 != 0);
                     assert_eq!(header.ack, flags & 16 != 0);
+                    assert_eq!(header.fin, flags & 1 != 0);
+                    assert_eq!(header.rst, flags & 4 != 0);
                     let (src, dst) = if v6 {
                         ("[fd01::2]:65535", "[fd01::1]:12345")
                     } else {

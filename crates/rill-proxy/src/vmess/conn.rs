@@ -1,7 +1,12 @@
+#[cfg(not(target_os = "macos"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(not(target_os = "macos"))]
 use super::body::BodyCipher;
-use super::header::{read_aead_response_header, response_body_keys, Security};
+use super::header::Security;
+#[cfg(not(target_os = "macos"))]
+use super::header::{read_aead_response_header, response_body_keys};
+#[cfg(not(target_os = "macos"))]
 use crate::tasked_duplex::TaskedDuplex;
 
 /// Spawn a VMess relay task that handles AEAD body record framing.
@@ -22,6 +27,7 @@ use crate::tasked_duplex::TaskedDuplex;
 /// cleanup path for a silent upstream that never sends data, FIN, or RST
 /// (issue #514). A write-side `shutdown()` alone does not cancel anything:
 /// the read direction keeps delivering upstream data (half-close download).
+#[cfg(not(target_os = "macos"))]
 pub fn spawn_vmess_relay(
     stream: Box<dyn rill_transport::Stream>,
     security: Security,
@@ -32,7 +38,7 @@ pub fn spawn_vmess_relay(
     let (resp_body_key, resp_body_iv) = response_body_keys(&req_key, &req_iv);
     let mut read_cipher = BodyCipher::from_response_keys(security, &resp_body_key, &resp_body_iv);
     let mut write_cipher = BodyCipher::new_writer(security, &req_key, &req_iv);
-    let (client, proxy) = tokio::io::duplex(32768);
+    let (client, proxy) = tokio::io::duplex(32 * 1024);
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (mut proxy_rd, mut proxy_wr) = tokio::io::split(proxy);
 
@@ -127,6 +133,17 @@ pub fn spawn_vmess_relay(
     });
 
     TaskedDuplex::new(client, read_abort, write_task)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn spawn_vmess_relay(
+    stream: Box<dyn rill_transport::Stream>,
+    security: Security,
+    req_key: [u8; 16],
+    req_iv: [u8; 16],
+    resp_v: u8,
+) -> super::inline::VmessConn {
+    super::inline::VmessConn::new(stream, security, req_key, req_iv, resp_v)
 }
 
 #[cfg(test)]

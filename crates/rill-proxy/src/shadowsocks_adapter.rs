@@ -36,6 +36,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 use tracing::{debug, warn};
 
+#[cfg(target_os = "macos")]
+#[path = "ss_parallel.rs"]
+mod parallel;
+
 /// Built-in (native, no external process) simple-obfs configuration.
 #[derive(Debug, Clone)]
 pub enum BuiltinObfs {
@@ -435,6 +439,8 @@ impl SsCore {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
+        #[cfg(target_os = "macos")]
+        let transport = crate::record_io::RecordIo::new(transport);
         Box::new(SsConn::new(ProxyClientStream::from_stream(
             Arc::clone(&self.context),
             transport,
@@ -554,6 +560,21 @@ impl SsCore {
                     }
                 }
                 .map_err(|e| RillError::io_with("ss tcp connect", e))?;
+                #[cfg(target_os = "macos")]
+                if self.server_config.method() == CipherKind::CHACHA20_POLY1305
+                    && tcp.as_ref().type_id() == std::any::TypeId::of::<tokio::net::TcpStream>()
+                {
+                    let tcp: Box<dyn std::any::Any + Send + Sync> = tcp;
+                    let tcp = *tcp
+                        .downcast::<tokio::net::TcpStream>()
+                        .expect("checked TCP type");
+                    return Ok(Box::new(SsConn::new(parallel::PlainAeadConn::new(
+                        tcp,
+                        Arc::clone(&self.context),
+                        &self.server_config,
+                        addr,
+                    ))));
+                }
                 Ok(self.ss_conn(tcp, addr))
             }
             PluginKind::External(_) => {
@@ -858,15 +879,19 @@ enum HeaderState {
 /// (`snell/v6.rs` `poll_send_request`) adapters, the deferred header is
 /// flushed from `poll_read`, which the relay polls from the start.
 struct SsConn<T> {
-    inner: ProxyClientStream<T>,
+    inner: T,
     header: HeaderState,
+    #[cfg(target_os = "macos")]
+    read_error: Option<std::io::Error>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> SsConn<T> {
-    fn new(inner: ProxyClientStream<T>) -> Self {
+    fn new(inner: T) -> Self {
         Self {
             inner,
             header: HeaderState::Deferred(None),
+            #[cfg(target_os = "macos")]
+            read_error: None,
         }
     }
 
@@ -928,6 +953,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsConn<T> {
         // Read even while the header is pending: a server close or reset
         // still surfaces, and the read waker is registered next to the
         // timer's or the header write's.
+        // The macOS transport batches large encrypted records. Drive those
+        // writes before waiting for a reply, including a prefix written by
+        // the tunnel before the relay started. A blocked flush must still
+        // allow reads: full-duplex peers can both be write-backpressured.
+        #[cfg(target_os = "macos")]
+        if let Poll::Ready(Err(error)) = Pin::new(&mut this.inner).poll_flush(cx) {
+            return Poll::Ready(Err(error));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::coalesced::poll_read(&mut this.inner, &mut this.read_error, cx, buf)
+        }
+        #[cfg(not(target_os = "macos"))]
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
@@ -2981,7 +3019,7 @@ mod ss_conn_tests {
     }
 
     struct Pair {
-        client: SsConn<Recorder>,
+        client: SsConn<ProxyClientStream<Recorder>>,
         writes: Arc<Mutex<Vec<usize>>>,
         server: ProxyServerStream<DuplexStream>,
     }
