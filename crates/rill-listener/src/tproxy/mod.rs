@@ -442,6 +442,7 @@ where
                 continue;
             }
         };
+        crate::set_inbound_nodelay(&stream);
 
         let fut = handle(stream, src_addr);
         tokio::spawn(async move {

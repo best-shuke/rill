@@ -187,12 +187,14 @@ impl ShadowsocksListener {
         let proxy_listener = {
             // Convert the already-bound tokio listener into the shadowsocks
             // crate's listener wrapper (preserves the OS-assigned port for
-            // `port: 0` ephemeral listeners). AcceptOpts::default() keeps the
-            // system TCP defaults (no TFO/MPTCP forcing) — with TFO off the
-            // only fallible step in `from_listener` is unreachable, so this
-            // `?` cannot fire today.
-            let ss_listener =
-                SsTcpListener::from_listener(listener, shadowsocks::net::AcceptOpts::default())?;
+            // `port: 0` ephemeral listeners). Otherwise system TCP defaults
+            // (no TFO/MPTCP forcing) — with TFO off the only fallible step in
+            // `from_listener` is unreachable, so this `?` cannot fire today —
+            // except TCP_NODELAY on each accepted socket, which every inbound
+            // sets (see `set_inbound_nodelay`).
+            let mut accept_opts = shadowsocks::net::AcceptOpts::default();
+            accept_opts.tcp.nodelay = true;
+            let ss_listener = SsTcpListener::from_listener(listener, accept_opts)?;
             ProxyListener::from_listener(Arc::clone(&self.ctx), ss_listener, self.svr_cfg.as_ref())
         };
 

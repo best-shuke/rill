@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Disable Nagle on accepted mixed/SOCKS/HTTP, TProxy and Shadowsocks
+  connections, as Go does: the tail of each response written back to the
+  client no longer waits for its 40 ms delayed ACK. Sequential 1 MB relays
+  went from 0.38 to 13 Gbps on loopback.
+
 ## 0.1.2 — 2026-10-25
 
 - Keep the `warning` log to what concerns the whole process: a failed

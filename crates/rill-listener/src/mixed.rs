@@ -142,6 +142,7 @@ impl MixedListener {
                     continue;
                 }
             };
+            crate::set_inbound_nodelay(&stream);
 
             let tunnel = self.tunnel.clone();
             let sniffer = self.sniffer.clone();

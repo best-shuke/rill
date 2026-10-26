@@ -19,6 +19,18 @@ pub(crate) fn monotonic_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Disable Nagle on an accepted inbound socket, as Go (and so mihomo) does
+/// for every TCP conn. With Nagle on, the tail of each response written back
+/// to the client waits for the client's delayed ACK (40 ms on Linux), which
+/// capped sequential 1 MiB relays at ~0.4 Gbps on loopback. Best effort: a
+/// socket that refuses the option still relays, just with Nagle.
+#[cfg(any(feature = "listener-mixed", feature = "listener-tproxy"))]
+pub(crate) fn set_inbound_nodelay(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("TCP_NODELAY on inbound socket failed: {e}");
+    }
+}
+
 #[cfg(feature = "listener-http")]
 pub mod http_proxy;
 #[cfg(feature = "listener-mixed")]
@@ -43,6 +55,23 @@ pub use sniffer::SnifferRuntime;
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope};
+
+#[cfg(all(test, any(feature = "listener-mixed", feature = "listener-tproxy")))]
+#[tokio::test]
+async fn inbound_nodelay_disables_nagle() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    assert!(
+        !server.nodelay().unwrap(),
+        "accepted sockets start with Nagle on"
+    );
+    set_inbound_nodelay(&server);
+    assert!(server.nodelay().unwrap());
+    drop(client);
+}
 
 #[cfg(all(
     test,
