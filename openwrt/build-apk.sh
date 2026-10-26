@@ -19,7 +19,7 @@
 # <ver> uses apk syntax, which OpenWrt spells X.Y.Z-rN (not opkg's X.Y.Z-N).
 #
 # Examples:
-#   build-apk.sh rill --binary target/aarch64-unknown-linux-musl/release/rill \
+#   build-apk.sh rill --binary target/aarch64-unknown-linux-musl/release-small/rill \
 #       --version 0.22.0-r1 --arch aarch64_generic --outdir dist
 #   build-apk.sh luci --version 0.22.0-r1 --outdir dist
 

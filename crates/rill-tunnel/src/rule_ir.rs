@@ -1578,8 +1578,8 @@ fn matches_native_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelp
     }
 }
 
-/// `#[inline(always)]`: the workspace ships at `opt-level = "z"`, whose
-/// inline threshold rejects this function once it has a full opcode match —
+/// `#[inline(always)]`: router builds ship at `opt-level = "z"`
+/// (`release-small`), whose inline threshold rejects this function once it has a full opcode match —
 /// leaving the scan loop paying an outlined call per slot even for
 /// one-comparison predicates (measured 2.3x on a 10k wildcard-rule scan).
 /// The body is deliberately kept slim by routing every fat arm through

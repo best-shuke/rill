@@ -302,9 +302,9 @@ reach the container.
 the OpenWrt SDK:
 
 ```sh
-cargo zigbuild --release --target aarch64-unknown-linux-musl --bin rill
+cargo zigbuild --profile release-small --target aarch64-unknown-linux-musl --bin rill
 openwrt/build-ipk.sh rill \
-    --binary target/aarch64-unknown-linux-musl/release/rill \
+    --binary target/aarch64-unknown-linux-musl/release-small/rill \
     --version 0.16.0-1 --arch aarch64_generic --outdir dist
 openwrt/build-ipk.sh luci --version 0.16.0-1 --outdir dist
 ```
@@ -317,7 +317,7 @@ needs apk-tools 3 (`apk mkpkg`) and root, and takes the apk-style
 # one-time: fetch a pinned static apk-tools 3 (Linux x86_64 / aarch64)
 openwrt/install-apk-tools.sh ~/.cache/apk-tools
 sudo APK=$HOME/.cache/apk-tools/apk openwrt/build-apk.sh rill \
-    --binary target/aarch64-unknown-linux-musl/release/rill \
+    --binary target/aarch64-unknown-linux-musl/release-small/rill \
     --version 0.16.0-r1 --arch aarch64_generic --outdir dist
 sudo APK=$HOME/.cache/apk-tools/apk openwrt/build-apk.sh luci --version 0.16.0-r1 --outdir dist
 ```

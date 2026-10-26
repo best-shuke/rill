@@ -129,8 +129,8 @@ else
     command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1 ||
         skip "no RILL_BINARY and cargo-zigbuild/zig not available"
     echo "=== Building $RUST_TARGET rill binary ==="
-    ( cd "$ROOT_DIR" && cargo zigbuild --release --target "$RUST_TARGET" --bin rill )
-    BINARY="$ROOT_DIR/target/$RUST_TARGET/release/rill"
+    ( cd "$ROOT_DIR" && cargo zigbuild --profile release-small --target "$RUST_TARGET" --bin rill )
+    BINARY="$ROOT_DIR/target/$RUST_TARGET/release-small/rill"
 fi
 [ -f "$BINARY" ] || { echo "FAIL: rill binary not found: $BINARY"; exit 1; }
 

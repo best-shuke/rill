@@ -18,11 +18,22 @@ members = [
     "crates/rill-cli",
 ]
 
+# Desktop / server builds (FlowBar ships this one). opt-level 3, as ADR-0007
+# §3 specifies: against "z" it cut proxy CPU 15% per GB relayed and per
+# connection and p50 latency 16% on a Neoverse-N1 loopback A/B, at +52%
+# binary size (12.8 → 19.4 MB stripped, aarch64-linux-gnu).
 [profile.release]
 lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+opt-level = 3
+
+# Size-capped builds: OpenWrt routers and other flash-limited targets, which
+# the ADR-0007 per-target caps measure. `cargo build --profile release-small`
+# → target/<triple>/release-small/rill.
+[profile.release-small]
+inherits = "release"
 opt-level = "z"
 
 # Profile for dhat heap profiling — keeps debug symbols, no strip, no LTO.

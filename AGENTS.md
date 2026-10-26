@@ -12,6 +12,8 @@ rill is a Rust implementation of the [mihomo](https://github.com/MetaCubeX/mihom
 # Build (requires Rust 1.89+ via workspace rust-version; the checkout
 # resolves the pinned channel in rust-toolchain.toml automatically)
 cargo build --release
+# Size-capped router build (opt-level "z"; ADR-0007 caps, OpenWrt packages)
+cargo build --profile release-small
 
 # Run with config
 ./target/release/rill -f config.yaml

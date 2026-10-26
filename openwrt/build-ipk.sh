@@ -10,7 +10,7 @@
 #   build-ipk.sh luci --version <ver> [--outdir <dir>]
 #
 # Examples:
-#   build-ipk.sh rill --binary target/aarch64-unknown-linux-musl/release/rill \
+#   build-ipk.sh rill --binary target/aarch64-unknown-linux-musl/release-small/rill \
 #       --version 0.16.0 --arch aarch64_generic --outdir dist
 #   build-ipk.sh luci --version 0.16.0 --outdir dist
 

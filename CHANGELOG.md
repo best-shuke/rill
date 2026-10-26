@@ -6,6 +6,10 @@
   connections, as Go does: the tail of each response written back to the
   client no longer waits for its 40 ms delayed ACK. Sequential 1 MB relays
   went from 0.38 to 13 Gbps on loopback.
+- Release builds use `opt-level = 3` again (ADR-0007 §3): about 15% less
+  CPU per byte and per connection and lower latency, for a 19 MB instead of
+  a 13 MB binary. Size-capped router builds use the new `release-small`
+  profile (`opt-level = "z"`), which the OpenWrt packaging now builds.
 
 ## 0.1.2 — 2026-10-25
 

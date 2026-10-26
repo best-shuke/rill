@@ -2,8 +2,9 @@
 //!
 //! Every relayed byte of those protocols passes through here, so the cipher
 //! is BoringSSL's (the library rill-transport already links), not a generic
-//! Rust AEAD: the release profile's `opt-level = "z"` leaves generic cipher
-//! code ~25× slower than BoringSSL's assembly (issue #659).
+//! Rust AEAD: the size-capped `release-small` profile's `opt-level = "z"`
+//! (router builds) leaves generic cipher code ~25× slower than BoringSSL's
+//! assembly (issue #659).
 //!
 //! All three algorithms share a 12-byte nonce and a 16-byte tag.
 

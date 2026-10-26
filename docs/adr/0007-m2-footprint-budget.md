@@ -368,6 +368,25 @@ Feature-set tuning (which Cargo features belong to `minimal` vs
 `default`) is per-crate engineer-b work in M2; the sets in §1 are the
 architect commitment, the `Cargo.toml` flags are the implementation.
 
+## Amendment (2026-10): two release profiles
+
+The workspace had drifted to `opt-level = "z"` in `[profile.release]`,
+contrary to §3. A same-host A/B (Neoverse-N1, aarch64-linux-gnu, loopback
+SOCKS5 → DIRECT, NODELAY fixed on both sides) measured `opt-level = 3`
+against `"z"`: −15% proxy CPU per GB relayed (1.687 → 1.434 s) and per
+connection (167 → 142 µs), −16% / −21% p50 / p99 latency, +10% conn/s —
+for +52% stripped size (12.8 → 19.4 MB), which would breach the aarch64
+`default` cap.
+
+So the release profile is split rather than the caps raised:
+
+- `[profile.release]` — `opt-level = 3`, as §3 always said. Desktop and
+  server artefacts (FlowBar's kernel), which carry no flash cap.
+- `[profile.release-small]` — inherits `release` with `opt-level = "z"`.
+  The §2 caps are measured on this profile; OpenWrt packaging
+  (`docs/openwrt.md`, `openwrt/build-{ipk,apk}.sh`,
+  `tests/test_openwrt_docker.sh`) builds with `--profile release-small`.
+
 ## Open questions deferred
 
 - **Windows + macOS binary sizes.** Not in scope for M2 release matrix.
