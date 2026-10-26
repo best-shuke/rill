@@ -343,6 +343,31 @@ impl TlsLayer {
     }
 }
 
+impl TlsLayer {
+    /// [`Transport::connect`] that also reports the ALPN protocol the server
+    /// selected (`None` when it selected none, and always on the REALITY
+    /// backend). For callers outside this crate that pick a protocol by
+    /// ALPN — a DoH client choosing HTTP/2 or HTTP/1.1 — without linking a
+    /// second copy of the generic [`Self::connect_typed`] handshake.
+    pub async fn connect_negotiated(
+        &self,
+        inner: Box<dyn Stream>,
+    ) -> Result<(Box<dyn Stream>, Option<Vec<u8>>)> {
+        match &self.backend {
+            #[cfg(feature = "reality")]
+            TlsBackend::Reality(r) => Ok((r.connect(inner).await?, None)),
+            TlsBackend::Boring(lazy) => {
+                let tls = lazy
+                    .connect_typed(inner)
+                    .await
+                    .map_err(ConnectTypedError::into_transport)?;
+                let alpn = tls.ssl().selected_alpn_protocol().map(<[u8]>::to_vec);
+                Ok((Box::new(boring_stream::BoringTlsStream::new(tls)), alpn))
+            }
+        }
+    }
+}
+
 /// Result of [`TlsLayer::connect_typed`].
 pub type TypedConnectResult<S> =
     std::result::Result<tokio_boring::SslStream<S>, ConnectTypedError<S>>;

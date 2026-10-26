@@ -88,7 +88,7 @@ const TCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `proxy-server-nameserver` host hook, a retained standalone DNS server).
 static CONNECTION_GENERATION: AtomicU = AtomicU::new(0);
 
-fn connection_generation() -> Uint {
+pub(crate) fn connection_generation() -> Uint {
     CONNECTION_GENERATION.load(Ordering::Acquire)
 }
 
@@ -149,6 +149,16 @@ static DEFAULT_FACTORY: DefaultSocketFactory = DefaultSocketFactory;
 /// programming error.
 pub fn set_socket_factory(factory: Arc<dyn SocketFactory>) -> Result<(), Arc<dyn SocketFactory>> {
     SOCKET_FACTORY.set(factory)
+}
+
+/// Open a TCP connection to a DNS upstream through the [`SocketFactory`],
+/// with Nagle off: a DNS message, and the HTTP/2 frames of concurrent DoH
+/// queries, must not wait for the previous segment's ACK (Go — and so
+/// mihomo — disables Nagle on every connection).
+async fn connect_upstream(addr: SocketAddr) -> io::Result<TcpStream> {
+    let stream = factory().connect_tcp(addr).await?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 fn factory() -> &'static dyn SocketFactory {
@@ -246,6 +256,9 @@ pub struct DnsClient {
     /// Idle direct `tcp://` connections. Streams are checked out for the whole
     /// exchange and returned only after the DNS response is fully validated.
     tcp_pool: TcpPool,
+    /// The kept HTTP/2 connection of a DoH upstream (`crate::doh`).
+    #[cfg(feature = "doh-h2")]
+    doh: crate::doh::DohSession,
 }
 
 struct TcpPool {
@@ -429,6 +442,8 @@ impl DnsClient {
             #[cfg(feature = "encrypted")]
             tls: OnceLock::new(),
             tcp_pool: TcpPool::new(),
+            #[cfg(feature = "doh-h2")]
+            doh: crate::doh::DohSession::new(),
         }
     }
 
@@ -519,15 +534,18 @@ impl DnsClient {
         self.proxy.as_ref()
     }
 
-    /// Drop this client's pooled `tcp://` connections so the next query
-    /// dials a fresh socket (issue #695). Idle streams close now unless the
-    /// pool is mid-checkout, in which case they close on the next checkout;
-    /// a stream an in-flight query holds finishes that query (bounded by the
-    /// per-query timeout) and is then closed instead of pooled. Non-blocking.
-    /// Returns the idle streams closed now. UDP, DoT and DoH open a socket
-    /// per query and pool nothing.
+    /// Drop this client's pooled `tcp://` connections and its kept DoH
+    /// connection so the next query dials a fresh socket (issue #695). Idle
+    /// streams close now unless the pool is mid-checkout, in which case they
+    /// close on the next checkout; a stream an in-flight query holds
+    /// finishes that query (bounded by the per-query timeout) and is then
+    /// closed instead of pooled. Non-blocking. Returns the connections
+    /// closed now. UDP and DoT open a socket per query and pool nothing.
     pub fn reset_connections(&self) -> usize {
-        self.tcp_pool.reset()
+        let closed = self.tcp_pool.reset();
+        #[cfg(feature = "doh-h2")]
+        let closed = closed + self.doh.reset();
+        closed
     }
 
     /// Human-readable upstream identifier for API/UI surfaces.
@@ -834,9 +852,9 @@ impl DnsClient {
     /// [`TCP_POOL_IDLE_TIMEOUT`] closes a stream before it has been idle
     /// long enough to be silently dropped, so the common path after a quiet
     /// period is a plain connect rather than a reuse attempt that has to
-    /// time out first. Pooling is intentionally scoped to plain
-    /// `tcp://`; DoT/DoH keep a full TLS handshake per query and are out of
-    /// scope.
+    /// time out first. This pool serves plain `tcp://`; DoH keeps one
+    /// HTTP/2 connection instead (`crate::doh`) and DoT still pays a TLS
+    /// handshake per query, as in mihomo.
     /// Test hook: shorten the pooled-stream idle window so reaping can be
     /// exercised without sleeping for the production timeout.
     #[cfg(test)]
@@ -873,7 +891,7 @@ impl DnsClient {
         // Captured before the socket exists: a reset racing the connect
         // must retire this stream too (issue #695).
         let generation = self.tcp_pool.generation();
-        let mut stream = factory().connect_tcp(addr).await?;
+        let mut stream = connect_upstream(addr).await?;
         let response = tcp_message_exchange(&mut stream, wire, expected).await?;
         self.tcp_pool.push(PooledTcp { stream, generation }).await;
         Ok(response)
@@ -907,22 +925,34 @@ impl DnsClient {
                     self.server_host.as_deref().unwrap_or(sni),
                     wire,
                     self.proxy.as_ref(),
-                    self.tls(sni, "dot")?,
+                    self.tls(sni, DOT_ALPN)?,
                 )
                 .await?;
                 decode_validated_response(&response, expected)
             }
             #[cfg(feature = "encrypted")]
             Transport::Doh { addr, sni, path } => {
-                let response = doh_exchange(
-                    *addr,
-                    self.server_host.as_deref().unwrap_or(sni),
-                    path,
-                    wire,
-                    self.proxy.as_ref(),
-                    self.tls(sni, "http/1.1")?,
-                )
-                .await?;
+                let host = self.server_host.as_deref().unwrap_or(sni);
+                let tls = self.tls(sni, DOH_ALPN)?;
+                let authority = doh_authority(host, *addr);
+                let proxy = self.proxy.as_ref();
+                #[cfg(feature = "doh-h2")]
+                let response = {
+                    let uri = format!("https://{authority}{path}");
+                    self.doh
+                        .exchange(
+                            || doh_connect(*addr, host, proxy, tls),
+                            |stream| doh_h1_on_stream(stream, &authority, path, wire),
+                            &uri,
+                            wire,
+                        )
+                        .await?
+                };
+                #[cfg(not(feature = "doh-h2"))]
+                let response = {
+                    let (stream, _) = doh_connect(*addr, host, proxy, tls).await?;
+                    doh_h1_on_stream(stream, &authority, path, wire).await?
+                };
                 decode_validated_response(&response, expected)
             }
         }
@@ -930,7 +960,7 @@ impl DnsClient {
 
     /// This upstream's TLS layer; `alpn` is fixed by the transport.
     #[cfg(feature = "encrypted")]
-    fn tls(&self, sni: &str, alpn: &str) -> Result<&TlsLayer, ClientError> {
+    fn tls(&self, sni: &str, alpn: &[&str]) -> Result<&TlsLayer, ClientError> {
         self.tls
             .get_or_init(|| tls_layer(sni, alpn, self.options.skip_cert_verify))
             .as_ref()
@@ -1287,7 +1317,7 @@ async fn udp_exchange(
             // RFC 7766 §0: retry a truncated UDP answer over TCP with a
             // one-off connection (the truncation fallback is intentionally
             // not pooled).
-            let mut stream = factory().connect_tcp(addr).await?;
+            let mut stream = connect_upstream(addr).await?;
             return tcp_message_exchange(&mut stream, wire, expected).await;
         }
         return Ok(response);
@@ -1333,7 +1363,7 @@ async fn encrypted_stream(
             .map_err(|e| e.into_io_error("dns-via-proxy dial"))?;
         Ok(Box::new(stream))
     } else {
-        Ok(Box::new(factory().connect_tcp(addr).await?))
+        Ok(Box::new(connect_upstream(addr).await?))
     }
 }
 
@@ -1395,7 +1425,58 @@ where
     Ok(all)
 }
 
+/// ALPN of a DoT upstream (RFC 7858 §3.2).
 #[cfg(feature = "encrypted")]
+const DOT_ALPN: &[&str] = &["dot"];
+
+/// ALPN offered to a DoH upstream: HTTP/2 for the kept connection
+/// (`crate::doh`), HTTP/1.1 for servers that do not speak it.
+#[cfg(feature = "doh-h2")]
+const DOH_ALPN: &[&str] = &["h2", "http/1.1"];
+
+/// ALPN offered to a DoH upstream without the `doh-h2` feature.
+#[cfg(all(feature = "encrypted", not(feature = "doh-h2")))]
+const DOH_ALPN: &[&str] = &["http/1.1"];
+
+/// The HTTP authority (`Host` / `:authority`) of a DoH upstream.
+#[cfg(feature = "encrypted")]
+fn doh_authority(host: &str, addr: SocketAddr) -> String {
+    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if addr.port() == 443 {
+        authority
+    } else {
+        format!("{authority}:{}", addr.port())
+    }
+}
+
+/// Open the TLS stream of a DoH upstream and report whether the server
+/// negotiated `h2`.
+#[cfg(feature = "encrypted")]
+async fn doh_connect(
+    addr: SocketAddr,
+    host: &str,
+    proxy: Option<&DnsProxy>,
+    tls: &TlsLayer,
+) -> Result<(Box<dyn rill_transport::Stream>, bool), ClientError> {
+    let tcp = encrypted_stream(addr, host, proxy).await?;
+    let (stream, alpn) = tls.connect_negotiated(tcp).await.map_err(|e| match e {
+        // `TransportError::Io` still carries the raw errno (#680);
+        // stringifying it here would re-flatten an `EMFILE`-class
+        // handshake failure into a context-less `Tls` (#682).
+        rill_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
+        other => ClientError::Tls(other.to_string()),
+    })?;
+    Ok((stream, alpn.as_deref() == Some(b"h2".as_slice())))
+}
+
+/// One HTTP/1.1 DoH exchange on its own connection. The client itself goes
+/// through `crate::doh::DohSession`, which falls back to
+/// [`doh_h1_on_stream`] for servers without HTTP/2.
+#[cfg(all(test, feature = "encrypted"))]
 async fn doh_exchange(
     addr: SocketAddr,
     host: &str,
@@ -1405,25 +1486,25 @@ async fn doh_exchange(
     tls: &TlsLayer,
 ) -> Result<Vec<u8>, ClientError> {
     let tcp = encrypted_stream(addr, host, proxy).await?;
-    let mut stream = tls.connect(tcp).await.map_err(|e| match e {
-        // `TransportError::Io` still carries the raw errno (#680);
-        // stringifying it here would re-flatten an `EMFILE`-class
-        // handshake failure into a context-less `Tls` (#682).
+    let stream = tls.connect(tcp).await.map_err(|e| match e {
         rill_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
         other => ClientError::Tls(other.to_string()),
     })?;
+    doh_h1_on_stream(stream, &doh_authority(host, addr), path, wire).await
+}
 
-    // HTTP/1.1 POST; read a bounded response to EOF, then decode its body framing.
-    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let authority = if addr.port() == 443 {
-        authority
-    } else {
-        format!("{authority}:{}", addr.port())
-    };
+/// HTTP/1.1 `POST` of `wire` on `stream` with `Connection: close`; reads a
+/// bounded response to EOF, then decodes its body framing.
+#[cfg(feature = "encrypted")]
+async fn doh_h1_on_stream<S>(
+    mut stream: S,
+    authority: &str,
+    path: &str,
+    wire: &[u8],
+) -> Result<Vec<u8>, ClientError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -1536,9 +1617,9 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Goes through `rill_transport::tls::TlsLayer`, so DNS uses the same
 /// BoringSSL backend as every proxy handshake in the binary.
 #[cfg(feature = "encrypted")]
-fn tls_layer(sni: &str, alpn: &str, skip_cert_verify: bool) -> Result<TlsLayer, String> {
+fn tls_layer(sni: &str, alpn: &[&str], skip_cert_verify: bool) -> Result<TlsLayer, String> {
     let config = TlsConfig {
-        alpn: vec![alpn.to_owned()],
+        alpn: alpn.iter().map(|&id| id.to_owned()).collect(),
         skip_cert_verify,
         ..TlsConfig::new(sni)
     };

@@ -9,12 +9,17 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["encrypted", "dns-server"]
+default = ["encrypted", "doh-h2", "dns-server"]
 # DoT / DoH upstreams. TLS goes through `rill_transport::tls::TlsLayer`, so
 # DNS shares the process-wide backend (BoringSSL when the app is built with
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
 encrypted = ["dep:rill-transport"]
+# DoH over one kept HTTP/2 connection per upstream (`doh`). Without it each
+# DoH query opens its own HTTP/1.1 connection. The `minimal` bundle leaves it
+# out: it is the first user of h2's client there, ~0.5 MB at opt-level "z"
+# (ADR-0007 caps).
+doh-h2 = ["encrypted", "dep:h2", "dep:http", "dep:bytes", "rill-transport/h2"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
 # only `hickory-proto`, so the feature is a no-op kept for API stability.
 dns-server = []
@@ -25,6 +30,9 @@ rill-trie = { workspace = true }
 tokio = { workspace = true }
 hickory-proto = { workspace = true }
 rill-transport = { workspace = true, features = ["tls"], optional = true }
+h2 = { version = "0.4", optional = true }
+http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 rand = { workspace = true }
 lru = { workspace = true }
 dashmap = { workspace = true }

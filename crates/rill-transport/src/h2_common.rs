@@ -78,6 +78,50 @@ pub fn client_builder() -> h2::client::Builder {
     builder
 }
 
+/// An HTTP/2 client connection over a boxed stream, for callers outside
+/// this crate (rill-dns's DoH client). The h2 connection machinery is
+/// generic over the I/O type and instantiated once per crate that names it;
+/// going through these non-generic wrappers reuses this crate's
+/// `Connection<Box<dyn Stream>, Bytes>` instead of linking another copy
+/// (about 0.5 MB in a release build).
+pub struct ClientConnection(h2::client::Connection<Box<dyn crate::Stream>, Bytes>);
+
+impl ClientConnection {
+    /// The connection's ping handle; `Some` only on the first call.
+    pub fn ping_pong(&mut self) -> Option<h2::PingPong> {
+        self.0.ping_pong()
+    }
+}
+
+impl Future for ClientConnection {
+    type Output = Result<(), h2::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// HTTP/2 client handshake over `io` with [`client_builder`]'s windows.
+pub async fn client_handshake(
+    io: Box<dyn crate::Stream>,
+) -> Result<(h2::client::SendRequest<Bytes>, ClientConnection), h2::Error> {
+    let (send, connection) = client_builder().handshake::<_, Bytes>(io).await?;
+    Ok((send, ClientConnection(connection)))
+}
+
+/// Send `request` with `body` as its complete body once the connection has
+/// stream capacity, and wait for the response head.
+pub async fn send_with_body(
+    send: &h2::client::SendRequest<Bytes>,
+    request: http::Request<()>,
+    body: Bytes,
+) -> Result<http::Response<h2::RecvStream>, h2::Error> {
+    let mut send = send.clone().ready().await?;
+    let (response, mut stream) = send.send_request(request, false)?;
+    stream.send_data(body, true)?;
+    response.await
+}
+
 /// Accepted response status for a lazily resolved HTTP/2 body.
 #[derive(Clone, Copy)]
 pub enum StatusPolicy {

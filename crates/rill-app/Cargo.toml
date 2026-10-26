@@ -64,7 +64,7 @@ kcptun = ["rill-config/kcptun", "rill-proxy/kcptun"]
 
 # DNS
 dns-server = ["rill-dns/dns-server"]
-dns-encrypted = ["rill-dns/encrypted"]
+dns-encrypted = ["rill-dns/encrypted", "rill-dns/doh-h2"]
 
 # Listener features — forwarded to rill-listener
 listener-http = ["rill-listener/listener-http"]

@@ -5,6 +5,8 @@
 
 pub mod cache;
 pub mod client;
+#[cfg(feature = "doh-h2")]
+mod doh;
 pub mod fakeip;
 pub mod host_resolver_hook;
 pub mod resolver;

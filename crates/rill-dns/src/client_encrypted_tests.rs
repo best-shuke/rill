@@ -160,7 +160,7 @@ async fn encrypted_dns_through_proxy_still_rejects_wrong_certificate_name() {
 async fn skip_cert_verify_accepts_an_untrusted_certificate_only_when_asked() {
     for skip in [false, true] {
         let (address, _root) = tls_server(false).await;
-        let tls = tls_layer("localhost", "dot", skip).unwrap();
+        let tls = tls_layer("localhost", DOT_ALPN, skip).unwrap();
         let result = dot_exchange(address, "localhost", b"dns-query", None, &tls).await;
         if skip {
             assert_eq!(result.unwrap(), b"dns-answer");
@@ -180,8 +180,8 @@ fn skip_cert_verify_option_reaches_the_cached_tls_layer() {
     let client =
         DnsClient::dot("127.0.0.1:853".parse().unwrap(), "127.0.0.1").with_options(entry.options);
     assert!(client.options.skip_cert_verify);
-    let first: *const TlsLayer = client.tls("127.0.0.1", "dot").unwrap();
-    let second: *const TlsLayer = client.tls("127.0.0.1", "dot").unwrap();
+    let first: *const TlsLayer = client.tls("127.0.0.1", DOT_ALPN).unwrap();
+    let second: *const TlsLayer = client.tls("127.0.0.1", DOT_ALPN).unwrap();
     assert_eq!(first, second, "one TLS layer per upstream, not per query");
 }
 
@@ -256,4 +256,86 @@ async fn bootstrapped_doh_upstream_keeps_its_hostname() {
         header.contains(&format!("\r\nHost: doh.test:{port}\r\n")),
         "{header}"
     );
+}
+
+/// A DoH upstream that negotiates `h2` serves every query on one TLS
+/// connection instead of a handshake per query.
+#[cfg(feature = "doh-h2")]
+#[tokio::test]
+async fn doh_over_h2_keeps_one_connection() {
+    let certified = rcgen::generate_simple_self_signed(vec!["doh.test".into()]).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![certified.cert.der().clone()], key.into())
+    .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let socket = acceptor.accept(socket).await.unwrap();
+                let mut server = h2::server::handshake(socket).await.unwrap();
+                while let Some(Ok((request, mut respond))) = server.accept().await {
+                    tokio::spawn(async move {
+                        assert_eq!(
+                            request.uri().authority().unwrap().as_str(),
+                            format!("doh.test:{port}")
+                        );
+                        let mut body = request.into_body();
+                        let mut query = Vec::new();
+                        while let Some(chunk) = body.data().await {
+                            query.extend_from_slice(&chunk.unwrap());
+                        }
+                        let request = Message::from_bytes(&query).unwrap();
+                        let mut reply =
+                            Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                        reply.add_queries(request.queries.iter().cloned());
+                        reply.add_answer(Record::from_rdata(
+                            request.queries[0].name().clone(),
+                            60,
+                            RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
+                                192, 0, 2, 53,
+                            ))),
+                        ));
+                        let mut stream = respond
+                            .send_response(http::Response::new(()), false)
+                            .unwrap();
+                        stream
+                            .send_data(bytes::Bytes::from(reply.to_bytes().unwrap()), true)
+                            .unwrap();
+                    });
+                }
+            });
+        }
+    });
+
+    let entry = crate::upstream::NameServerEntry::parse(&format!(
+        "https://doh.test:{port}/dns-query#skip-cert-verify=true"
+    ))
+    .unwrap();
+    let resolved = HashMap::from([("doh.test".to_owned(), IpAddr::from([127, 0, 0, 1]))]);
+    let client = crate::Resolver::build_client(&entry.url, &resolved, None, entry.options);
+    for name in ["a.example", "b.example", "c.example"] {
+        let answer = client.query(name, RecordType::A).await.unwrap();
+        assert_eq!(answer.answers.len(), 1, "{name}");
+    }
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "three queries, one TLS connection"
+    );
+    assert_eq!(client.reset_connections(), 1);
+    client.query("d.example", RecordType::A).await.unwrap();
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
