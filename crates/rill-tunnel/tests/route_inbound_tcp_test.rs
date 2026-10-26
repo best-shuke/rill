@@ -328,3 +328,57 @@ async fn route_inbound_tcp_drop_verdict_never_dials() {
         "a routable destination must still reach GLOBAL's dial_tcp"
     );
 }
+
+/// A pipelined CONNECT prefix must stay ahead of bulk data when DIRECT opts
+/// into splice; upload statistics include the prefix exactly once.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn prefix_precedes_bulk_splice_and_counts_exactly() {
+    const TOTAL: usize = 1024 * 1024;
+    let prefix = b"pipelined application prefix";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(&request[..prefix.len()], prefix);
+        assert_eq!(request.len(), prefix.len() + TOTAL);
+        assert!(request[prefix.len()..].iter().all(|byte| *byte == 73));
+        stream.write_all(&request).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let tunnel = direct_tunnel();
+    let (mut inbound, mut client) = loopback_pair().await;
+    let meta = Metadata {
+        dst_ip: Some(addr.ip()),
+        dst_port: addr.port(),
+        ..Default::default()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let relay = rill_tunnel::route_inbound_tcp_with_socket(
+            tunnel.inner(),
+            &mut inbound,
+            meta,
+            prefix,
+            |s| Some(s),
+        );
+        let client = async {
+            client.write_all(&vec![73; TOTAL]).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(&response[..prefix.len()], prefix);
+            assert_eq!(response.len(), TOTAL + prefix.len());
+            assert!(response[prefix.len()..].iter().all(|byte| *byte == 73));
+        };
+        tokio::join!(relay, client);
+        server.await.unwrap();
+    })
+    .await
+    .expect("bulk prefix relay stalled");
+    let (upload, download) = tunnel.statistics().snapshot();
+    let expected = (TOTAL + prefix.len()) as rill_common::atomic::Int;
+    assert_eq!(upload, expected);
+    assert_eq!(download, expected);
+}

@@ -5,7 +5,7 @@ mod udp;
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use rill_common::{with_dial_timeout, ConnType, Metadata, Network};
-use rill_tunnel::{copy_bidirectional_buf_tracked, ResolvedTarget, Tunnel, RELAY_BUF_SIZE};
+use rill_tunnel::{copy_bidirectional_tracked, ResolvedTarget, Tunnel};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -551,7 +551,7 @@ async fn handle_tproxy_flow(
     // 1. SnifferRuntime (TLS SNI or HTTP Host) — replaces the old enable_sni path
     // 2. Fall back to DNS snooping reverse lookup (IP → domain from recent DNS queries)
     if let Some(rt) = sniffer.as_deref() {
-        rt.sniff(&stream, &mut metadata).await;
+        Box::pin(rt.sniff(&stream, &mut metadata)).await;
     }
 
     let mut hostname = metadata.sniff_host.clone();
@@ -618,23 +618,19 @@ async fn handle_tproxy_flow(
         return Ok(());
     };
 
-    // Relay buffers on the future's stack — zero per-relay heap allocation (ADR-0011 T6).
-    let mut relay_buf_up = [0u8; RELAY_BUF_SIZE];
-    let mut relay_buf_dn = [0u8; RELAY_BUF_SIZE];
-
     _guard
         .run_until_closed(async {
-            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            let dial = Box::pin(with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))).await;
             drop(route.take());
             match dial {
                 Ok(mut remote) => {
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());
-                    match copy_bidirectional_buf_tracked(
+                    match copy_bidirectional_tracked(
                         &mut stream,
                         &mut remote,
-                        &mut relay_buf_up,
-                        &mut relay_buf_dn,
+                        |s| Some(s),
+                        rill_common::ProxyConn::as_tcp_stream,
                         |n| {
                             inner
                                 .stats
@@ -668,6 +664,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{mpsc, Notify};
+
+    #[tokio::test]
+    async fn connection_future_stays_compact() {
+        let resolver = Arc::new(rill_dns::Resolver::new(
+            vec![],
+            vec![],
+            rill_common::DnsMode::Normal,
+            rill_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let _client = client.unwrap();
+        let (stream, peer) = accepted.unwrap();
+        let future = handle_tproxy_conn(tunnel, stream, peer, addr, None, String::new());
+        let size = std::mem::size_of_val(&future);
+        println!("tproxy handle_tproxy_conn future: {size} bytes");
+        assert!(
+            size <= 4 * 1024,
+            "tproxy connection future grew to {size} bytes"
+        );
+    }
 
     /// Regression test for issue #435: a `max_connections: N` cap must never
     /// let more than `N` handler futures run concurrently, even when far more

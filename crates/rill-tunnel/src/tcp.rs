@@ -1,4 +1,4 @@
-use crate::relay::{copy_bidirectional_buf_tracked, RELAY_BUF_SIZE};
+use crate::relay::{copy_bidirectional_tracked, TcpAccess};
 use crate::statistics::Statistics;
 use crate::tunnel::{ResolvedTarget, TunnelInner};
 use rill_common::conn_note;
@@ -266,8 +266,20 @@ pub async fn handle_tcp(
     mut conn: Box<dyn ProxyConn>,
     mut metadata: Metadata,
 ) {
-    let prefix = crate::sniff::sniff_unnamed(tunnel, &mut conn, &mut metadata).await;
-    route_inbound_tcp(tunnel, &mut conn, metadata, &prefix).await;
+    let prefix = Box::pin(crate::sniff::sniff_unnamed(
+        tunnel,
+        &mut conn,
+        &mut metadata,
+    ))
+    .await;
+    route_inbound_tcp_with_socket(
+        tunnel,
+        &mut conn,
+        metadata,
+        &prefix,
+        ProxyConn::as_tcp_stream,
+    )
+    .await;
 }
 
 /// Route a decrypted inbound TCP connection through the rule engine and relay
@@ -288,8 +300,8 @@ pub async fn handle_tcp(
 /// the remote before the copy loop and counted as upload. Pass `&[]` when the
 /// listener hands over a clean stream.
 ///
-/// Relay scratch buffers are stack-allocated in this frame — zero
-/// per-relay-setup heap allocation (ADR-0008 HP-1/HP-2/HP-3). The generic
+/// Relay scratch is shared per worker and borrowed only during synchronous
+/// polls, with no per-relay-setup buffer allocation (ADR-0008 HP-1). The generic
 /// parameter keeps the relay monomorphised per concrete stream type so the
 /// hot copy loop stays dispatch-free.
 ///
@@ -328,12 +340,28 @@ pub async fn route_inbound_tcp<C>(
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    route_inbound_tcp_with_socket(inner, conn, metadata, prefix, |_| None).await;
+}
+
+/// Inbound handoff with optional kernel TCP access. Plain accepted sockets
+/// pass `|stream| Some(stream)`; wrappers pass an accessor only when bypassing
+/// their I/O is safe. Userspace TUN stacks keep the default copy-only handoff.
+#[doc(hidden)]
+pub async fn route_inbound_tcp_with_socket<C>(
+    inner: &TunnelInner,
+    conn: &mut C,
+    metadata: Metadata,
+    prefix: &[u8],
+    tcp: TcpAccess<C>,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let notes = inner.connection_notes();
-    ConnNotes::scope(
-        notes,
-        route_inbound_tcp_scoped(inner, conn, metadata, prefix),
-    )
-    .await;
+    // Scope the pinned reference: passing the routing future by value makes
+    // the scope's Some/None branches reserve a second copy of its whole frame.
+    let routing = route_inbound_tcp_scoped(inner, conn, metadata, prefix, tcp);
+    tokio::pin!(routing);
+    ConnNotes::scope(notes, routing).await;
 }
 
 async fn route_inbound_tcp_scoped<C>(
@@ -341,6 +369,7 @@ async fn route_inbound_tcp_scoped<C>(
     conn: &mut C,
     mut metadata: Metadata,
     prefix: &[u8],
+    tcp: TcpAccess<C>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -363,7 +392,7 @@ async fn route_inbound_tcp_scoped<C>(
 
     // Match rules with lazy enrichment: DNS pre-resolution and process
     // lookup run only if the scan reaches a rule that demands them.
-    let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
+    let Some(target) = Box::pin(inner.resolve_proxy_lazy(&mut metadata)).await else {
         warn!(
             "{} no matching rule for {}",
             metadata.conn_type,
@@ -401,11 +430,6 @@ async fn route_inbound_tcp_scoped<C>(
         return;
     };
 
-    // Declare relay buffers on the future's stack frame — zero per-relay heap
-    // allocation (ADR-0011 T6). Paid once at task-spawn, not at relay-call time.
-    let mut buf_up = [0u8; RELAY_BUF_SIZE];
-    let mut buf_dn = [0u8; RELAY_BUF_SIZE];
-
     // Dial the remote via proxy, bounded like mihomo's `C.DefaultTCPTimeout`:
     // a server that accepts and then stalls mid-handshake would otherwise pin
     // this task, its inbound socket and its stats entry forever.
@@ -419,7 +443,7 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
-            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            let dial = Box::pin(with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))).await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());
@@ -450,11 +474,11 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as rill_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked(
+                    match copy_bidirectional_tracked(
                         conn,
                         &mut remote,
-                        &mut buf_up,
-                        &mut buf_dn,
+                        tcp,
+                        ProxyConn::as_tcp_stream,
                         |n| {
                             inner
                                 .stats

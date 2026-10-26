@@ -222,7 +222,11 @@ impl tokio::io::AsyncWrite for DirectConn {
 }
 
 impl Unpin for DirectConn {}
-impl ProxyConn for DirectConn {}
+impl ProxyConn for DirectConn {
+    fn as_tcp_stream(&self) -> Option<&TcpStream> {
+        Some(&self.0)
+    }
+}
 
 // UDP wrapper
 struct DirectPacketConn {
@@ -525,6 +529,10 @@ mod tests {
             .dial_tcp(&tcp_metadata("multi.test", port))
             .await
             .expect("second resolved address should connect");
+        assert_eq!(
+            conn.as_tcp_stream().unwrap().peer_addr().unwrap().port(),
+            port
+        );
         let _ = accept.await.unwrap();
         drop(conn);
     }

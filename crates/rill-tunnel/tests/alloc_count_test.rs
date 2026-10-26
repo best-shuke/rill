@@ -484,3 +484,104 @@ fn lazy_match_zero_alloc_with_dead_target_skips() {
         "one dead-target skip must stay inline in the SmallVec, got {allocs} allocs ({per_match:.3}/match)"
     );
 }
+
+/// HP-1: setup, idle polling and 10k chunks per direction must not allocate
+/// relay storage when each write drains immediately. Includes the bulk copy
+/// transition, which now uses worker scratch rather than an owned upgrade.
+#[test]
+fn relay_setup_and_steady_copy_zero_alloc() {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct Stream {
+        remaining: usize,
+    }
+    impl AsyncRead for Stream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.remaining == usize::MAX {
+                return Poll::Pending;
+            }
+            let n = self.remaining.min(1024).min(buf.remaining());
+            buf.put_slice(&[0; 1024][..n]);
+            self.remaining -= n;
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for Stream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    let _guard = serial();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut idle_a = Stream {
+        remaining: usize::MAX,
+    };
+    let mut idle_b = Stream {
+        remaining: usize::MAX,
+    };
+    let mut a = Stream {
+        remaining: 10_000 * 1024,
+    };
+    let mut b = Stream {
+        remaining: 10_000 * 1024,
+    };
+    reset_counts();
+    {
+        let idle = rill_tunnel::copy_bidirectional_tracked(
+            &mut idle_a,
+            &mut idle_b,
+            |_| None,
+            |_| None,
+            |_| {},
+            |_| {},
+        );
+        tokio::pin!(idle);
+        assert!(std::future::Future::poll(idle.as_mut(), &mut cx).is_pending());
+    }
+    let mut bytes = (0, 0);
+    {
+        let relay = rill_tunnel::copy_bidirectional_tracked(
+            &mut a,
+            &mut b,
+            |_| None,
+            |_| None,
+            |n| bytes.0 += n,
+            |n| bytes.1 += n,
+        );
+        tokio::pin!(relay);
+        loop {
+            if let Poll::Ready(result) = std::future::Future::poll(relay.as_mut(), &mut cx) {
+                assert_eq!(result.unwrap(), (10_000 * 1024, 10_000 * 1024));
+                break;
+            }
+        }
+    }
+    let (allocs, _) = snapshot();
+    assert_eq!(bytes, (10_000 * 1024, 10_000 * 1024));
+    println!("HP-1 relay: {allocs} allocations across setup, idle poll and 20,000 chunks");
+    if !under_coverage_instrumentation() {
+        assert_eq!(allocs, 0, "relay setup/idle/steady copy allocated");
+    }
+}

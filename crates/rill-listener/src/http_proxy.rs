@@ -2,7 +2,7 @@ use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use rill_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
 use rill_tunnel::{
-    copy_bidirectional_buf_tracked, route_inbound_tcp, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+    copy_bidirectional_tracked, route_inbound_tcp_with_socket, ResolvedTarget, Tunnel,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -57,9 +57,9 @@ async fn handle_http_inner(
     const CHUNK: usize = 1024;
     const MAX_HEADERS: usize = 8192;
     let mut request_buf = Vec::with_capacity(4096);
-    let mut chunk = [0u8; CHUNK];
-    let mut validated = 0usize;
     let read_headers = async {
+        let mut chunk = [0u8; CHUNK];
+        let mut validated = 0usize;
         loop {
             let n = stream.read(&mut chunk).await?;
             if n == 0 {
@@ -105,16 +105,20 @@ async fn handle_http_inner(
             }
         }
     };
-    let header_end =
-        match tokio::time::timeout(crate::DEFAULT_HANDSHAKE_TIMEOUT, read_headers).await {
-            Err(_) => return Err("HTTP proxy handshake timed out".into()),
-            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
-                write_bad_request(stream).await?;
-                return Err(error.into());
-            }
-            Ok(Err(error)) => return Err(error.into()),
-            Ok(Ok(header_end)) => header_end,
-        };
+    let header_end = match Box::pin(tokio::time::timeout(
+        crate::DEFAULT_HANDSHAKE_TIMEOUT,
+        read_headers,
+    ))
+    .await
+    {
+        Err(_) => return Err("HTTP proxy handshake timed out".into()),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+            write_bad_request(stream).await?;
+            return Err(error.into());
+        }
+        Ok(Err(error)) => return Err(error.into()),
+        Ok(Ok(header_end)) => header_end,
+    };
     let leftover: Vec<u8> = request_buf[header_end..].to_vec();
     request_buf.truncate(header_end);
 
@@ -188,6 +192,11 @@ async fn handle_http_inner(
         };
 
         debug!("HTTP CONNECT to {}:{}", host, port);
+        // The long-lived CONNECT relay needs only metadata and pipelined
+        // application bytes, not the parsed headers or their 4 KiB backing.
+        drop(request);
+        drop(request_buf);
+        drop(in_user);
 
         // Send 200 Connection Established — the client will then send its
         // application data (e.g., TLS ClientHello) which we can peek at.
@@ -197,7 +206,7 @@ async fn handle_http_inner(
 
         // Sniff TLS SNI from the client's TLS ClientHello (if applicable).
         if let Some(rt) = sniffer {
-            rt.sniff(stream, &mut metadata).await;
+            Box::pin(rt.sniff(stream, &mut metadata)).await;
         }
 
         // Hand off to the shared inbound routing+relay path. `leftover`
@@ -205,7 +214,7 @@ async fn handle_http_inner(
         // 200 OK (RFC 7230 forbids this but real clients do it); the shared
         // path re-emits them to the remote before the bidirectional copy.
         let inner = tunnel.inner();
-        route_inbound_tcp(inner, stream, metadata, &leftover).await;
+        route_inbound_tcp_with_socket(inner, stream, metadata, &leftover, |s| Some(s)).await;
     } else {
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
@@ -246,7 +255,7 @@ async fn handle_http_inner(
             return Err("unmapped fake-ip destination".into());
         }
         let admission = inner.tcp_admission();
-        let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
+        let Some(target) = Box::pin(inner.resolve_proxy_lazy(&mut metadata)).await else {
             write_bad_gateway(stream).await?;
             return Err("no matching rule".into());
         };
@@ -279,7 +288,8 @@ async fn handle_http_inner(
 
         _guard
             .run_until_closed(async {
-                let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+                let dial =
+                    Box::pin(with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))).await;
                 drop(route.take());
                 match dial {
                     Ok(mut remote) => {
@@ -295,13 +305,6 @@ async fn handle_http_inner(
                         remote.write_all(&rewritten).await?;
                         let up = Arc::clone(_guard.counters());
                         let dn = Arc::clone(_guard.counters());
-                        // Relay scratch buffers live on this plain-HTTP path's stack —
-                        // zero per-relay heap allocation (ADR-0008). Declared here
-                        // (not at the top of handle_http_inner) so the dominant CONNECT
-                        // path, which relays via the shared `route_inbound_tcp` helper
-                        // and its own stack buffers, does not carry these 8 KiB.
-                        let mut relay_buf_up = [0u8; RELAY_BUF_SIZE];
-                        let mut relay_buf_dn = [0u8; RELAY_BUF_SIZE];
                         // Keep the response-head scratch out of `handle_http_inner`'s
                         // async frame. CONNECT is the dominant path and must not pay
                         // for storage used only by plain HTTP exchanges.
@@ -320,11 +323,11 @@ async fn handle_http_inner(
                         // half-close semantics.
                         let mut remote = ShutdownGate::new(remote, &pass_upstream_shutdown);
 
-                        match copy_bidirectional_buf_tracked(
+                        match copy_bidirectional_tracked(
                             &mut *client,
                             &mut remote,
-                            &mut relay_buf_up,
-                            &mut relay_buf_dn,
+                            |_| None,
+                            |_| None,
                             |n| {
                                 inner
                                     .stats

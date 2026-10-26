@@ -207,3 +207,81 @@ async fn handle_connection(
         .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_future_stays_compact() {
+        let resolver = Arc::new(rill_dns::Resolver::new(
+            vec![],
+            vec![],
+            rill_common::DnsMode::Normal,
+            rill_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let _client = client.unwrap();
+        let (stream, peer) = accepted.unwrap();
+        let raw = stream.into_std().unwrap();
+        let http = http_proxy::handle_http(
+            &tunnel,
+            tokio::net::TcpStream::from_std(raw.try_clone().unwrap()).unwrap(),
+            peer,
+            None,
+            None,
+            "",
+            addr.port(),
+        );
+        let socks = socks5::handle_socks5(
+            &tunnel,
+            tokio::net::TcpStream::from_std(raw.try_clone().unwrap()).unwrap(),
+            peer,
+            None,
+            None,
+            "",
+            addr.port(),
+        );
+        println!(
+            "HTTP future: {} bytes; SOCKS5 future: {} bytes",
+            std::mem::size_of_val(&http),
+            std::mem::size_of_val(&socks)
+        );
+        drop((http, socks));
+        let mut stream = tokio::net::TcpStream::from_std(raw).unwrap();
+        let mut metadata = rill_common::Metadata::default();
+        let sniffer = SnifferRuntime::new(Default::default());
+        let sniff = sniffer.sniff(&stream, &mut metadata);
+        println!(
+            "unboxed sniffer future: {} bytes",
+            std::mem::size_of_val(&sniff)
+        );
+        drop(sniff);
+        let route = rill_tunnel::route_inbound_tcp_with_socket(
+            tunnel.inner(),
+            &mut stream,
+            metadata,
+            &[],
+            |s| Some(s),
+        );
+        println!(
+            "routing/relay future: {} bytes",
+            std::mem::size_of_val(&route)
+        );
+        drop(route);
+        let future =
+            handle_connection(tunnel, stream, peer, None, String::new(), addr.port(), None);
+        let size = std::mem::size_of_val(&future);
+        println!("mixed handle_connection future: {size} bytes");
+        assert!(
+            size <= 4 * 1024,
+            "mixed connection future grew to {size} bytes"
+        );
+    }
+}

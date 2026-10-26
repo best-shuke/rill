@@ -1,64 +1,48 @@
-// M2 relay-buffer-pool (ADR-0011 T6):
-//   `tokio::io::copy_bidirectional_with_sizes` allocates a `Box<[u8]>` per
-//   direction per connection (via `CopyBuffer::new`). At 4 KiB per direction
-//   that is 8 KiB heap per TCP connection setup — confirmed in the dhat
-//   baseline as sites #2 and #3 (66 MB each over 8 105 connections).
-//
-//   This module provides `copy_bidirectional_buf` which accepts caller-supplied
-//   `&mut [u8]` scratch buffers. Callers declare `[0u8; BUF]` arrays inside the
-//   enclosing async fn; those arrays become part of the future's state machine
-//   and are paid for at task-spawn time (one allocation per task, shared with
-//   everything else in the future), not at relay-call time.
-//
-//   Public API: `copy_bidirectional_buf` and `RELAY_BUF_SIZE`.
-//   No new public types exposed — no M2 API break.
-//
-// Direction fairness (#345):
-//   The two directions are driven by ONE future, so they can never run on two
-//   cores at once — but they must not starve each other either. Each direction
-//   advances at most one buffer fill+drain cycle per turn, and turns strictly
-//   alternate a→b, b→a inside the poll loop. A busy direction therefore delays
-//   the other by at most one `RELAY_BUF_SIZE` cycle, instead of monopolizing
-//   the task until its reader runs dry (the pre-#345 behavior, where a→b was
-//   always polled first and drained to `Pending` before b→a ever ran).
-//   `RELAY_CYCLES_PER_POLL` additionally bounds total work per poll so the
-//   relay yields to sibling tasks even on streams that don't participate in
-//   tokio's coop budget.
+//! Bidirectional relay with zero allocations at setup and no per-connection
+//! idle buffers (ADR-0008 HP-1 / ADR-0011 T6). Each worker has 32 KiB of
+//! thread-local scratch, borrowed only during a synchronous read/write poll.
+//! A direction owns storage only after backpressure leaves unwritten bytes;
+//! that spill buffer is retained and reused for the connection's lifetime.
+//!
+//! Plain kernel TCP pairs on Linux lazily switch to splice after 128 KiB per
+//! direction. Pipes keep the kernel's default capacity and close on cancellation.
+//! Other transports keep using the copy path. Both paths alternate directions
+//! and yield after bounded cycles/bytes, count only bytes delivered to the
+//! destination, and drain before propagating EOF with a write shutdown.
 
+use std::cell::RefCell;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
-/// Buffer size used for each relay direction at connection setup.
-/// 4 KiB halves the tokio default (8 KiB) to save 8 KiB/conn at the
-/// cost of more syscalls; acceptable for proxy workloads where connections
-/// are long-lived and latency matters less than memory at 5k+ conns.
-/// Directions that prove bulk are upgraded to the private
-/// `RELAY_BULK_BUF_SIZE` (32 KiB) — see the tiered-buffer note below.
+#[cfg(target_os = "linux")]
+mod splice;
+
+/// Copy chunk size before a direction proves bulk; no buffer is held at setup.
 pub const RELAY_BUF_SIZE: usize = 4 * 1024;
-
-/// Tiered bulk buffer (#386): once a direction has relayed
-/// [`RELAY_BULK_UPGRADE_BYTES`], its scratch buffer is swapped for a
-/// heap-allocated buffer of this size, matching Go mihomo's 32 KiB relay
-/// buffers. At 4 KiB the relay is syscall-bound on fast paths — one
-/// read+write pair per 4 KiB left bulk throughput ~40% behind mihomo
-/// (19 vs 31 Gbps loopback, see the issue) — while at 32 KiB the gap closes
-/// to parity. The upgrade is lazy so the per-connection footprint at 5k+
-/// mostly-idle connections stays at the small stack buffers; only
-/// connections that actually stream pay the 32 KiB, amortized over at least
-/// [`RELAY_BULK_UPGRADE_BYTES`] of traffic. The one-time allocation is far
-/// past HP-1's warmup window and amortizes to ~0.0001 allocations per
-/// iteration over its 10k-iteration budget (ADR-0008 §3 threshold 0.5).
 const RELAY_BULK_BUF_SIZE: usize = 32 * 1024;
-
-/// Bytes a direction must relay before its scratch buffer is upgraded to
-/// [`RELAY_BULK_BUF_SIZE`]. Typical request/response exchanges stay below
-/// this and never allocate; a bulk stream crosses it in single-digit
-/// milliseconds.
+/// Keep short request/response flows free of pipe creation and descriptor costs.
 const RELAY_BULK_UPGRADE_BYTES: u64 = 128 * 1024;
+/// Bytes one socket → pipe splice may move. The kernel caps each call at the
+/// pipe's free space (64 KiB by default), so this only asks for "as much as
+/// fits" — Go's net package passes 1 MiB the same way — instead of halving
+/// every call at the copy path's 32 KiB.
+#[cfg(target_os = "linux")]
+const SPLICE_CHUNK: usize = 1 << 20;
+
+thread_local! {
+    static SCRATCH: RefCell<[u8; RELAY_BULK_BUF_SIZE]> = const {
+        RefCell::new([0; RELAY_BULK_BUF_SIZE])
+    };
+}
+
+/// Accessor for an unbuffered, untransformed kernel TCP endpoint. Returning
+/// `Some` permits bypassing the endpoint's AsyncRead/AsyncWrite implementation.
+pub type TcpAccess<T> = fn(&T) -> Option<&TcpStream>;
 
 /// Idle window granted to the surviving relay direction after the *other*
 /// direction has reached EOF.
@@ -91,90 +75,50 @@ pub const RELAY_HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
 /// deterministic: at 4 KiB per cycle it bounds one poll at 256 KiB relayed.
 const RELAY_CYCLES_PER_POLL: u32 = 64;
 
-/// Byte-based companion to [`RELAY_CYCLES_PER_POLL`]: after bulk upgrade a
-/// single cycle moves up to 32 KiB, so 64 cycles would stretch one poll to
+/// Byte-based companion to [`RELAY_CYCLES_PER_POLL`]: a bulk copy or splice
+/// cycle moves up to 32 KiB, so 64 cycles would stretch one poll to
 /// 2 MiB. Yield once this many bytes have moved in a poll instead, keeping
 /// the pre-upgrade 256 KiB-per-poll bound regardless of buffer size.
 const RELAY_BYTES_PER_POLL: u64 = 256 * 1024;
 
-// ---------------------------------------------------------------------------
-// Internal copy-one-direction state (no heap allocation)
-// ---------------------------------------------------------------------------
-
-/// Outcome of one [`HalfCopy::poll_cycle`] turn.
 enum Cycle {
-    /// EOF reached, buffer fully flushed, writer shutdown complete.
     Done,
-    /// The cycle moved data and the direction may have more work available —
-    /// give the peer direction a turn, then call again.
     Progress,
-    /// Blocked on the reader or the writer; a waker is registered.
     Pending,
 }
 
-/// Per-direction scratch storage: the caller's stack array until the
-/// direction proves bulk, then a one-time owned upgrade (#386).
-enum Scratch<'buf> {
-    Borrowed(&'buf mut [u8]),
-    Owned(Box<[u8]>),
-}
-
-impl Scratch<'_> {
-    fn slice(&mut self) -> &mut [u8] {
-        match self {
-            Scratch::Borrowed(b) => b,
-            Scratch::Owned(b) => b,
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Scratch::Borrowed(b) => b.len(),
-            Scratch::Owned(b) => b.len(),
-        }
-    }
-}
-
-/// Whether a direction that has relayed `amt` bytes through a `buf_len`-byte
-/// scratch buffer should upgrade to the owned [`RELAY_BULK_BUF_SIZE`] buffer.
-/// Callers that already supply a bulk-sized (or larger) buffer never upgrade.
-fn wants_bulk_upgrade(amt: u64, buf_len: usize) -> bool {
-    amt >= RELAY_BULK_UPGRADE_BYTES && buf_len < RELAY_BULK_BUF_SIZE
-}
-
-struct HalfCopy<'buf> {
-    buf: Scratch<'buf>,
+struct HalfCopy {
+    spill: Option<Box<[u8]>>,
     read_done: bool,
     pos: usize,
     cap: usize,
     amt: u64,
     need_flush: bool,
+    #[cfg(target_os = "linux")]
+    pipe: Option<splice::Pipe>,
 }
 
-impl<'buf> HalfCopy<'buf> {
-    fn new(buf: &'buf mut [u8]) -> Self {
+impl HalfCopy {
+    fn new() -> Self {
         Self {
-            buf: Scratch::Borrowed(buf),
+            spill: None,
             read_done: false,
             pos: 0,
             cap: 0,
             amt: 0,
             need_flush: false,
+            #[cfg(target_os = "linux")]
+            pipe: None,
         }
     }
 
-    /// Advance this direction by at most ONE buffer fill+drain cycle.
-    ///
-    /// The pre-#345 `poll_copy` looped read→write until `Pending`, so a busy
-    /// direction monopolized the poll while the peer direction waited. Capping
-    /// each turn at a single cycle lets the caller interleave the two
-    /// directions fairly; the caller loops as long as either side reports
-    /// [`Cycle::Progress`].
     fn poll_cycle<R, W, F>(
         &mut self,
         cx: &mut Context<'_>,
         mut reader: Pin<&mut R>,
         mut writer: Pin<&mut W>,
+        _tcp: (TcpAccess<R>, TcpAccess<W>),
+        _allow_splice: &mut bool,
         on_progress: &mut F,
     ) -> io::Result<Cycle>
     where
@@ -182,51 +126,183 @@ impl<'buf> HalfCopy<'buf> {
         W: AsyncWrite + ?Sized,
         F: FnMut(u64),
     {
-        // Refill the buffer when empty — at most one read per cycle.
-        if self.pos == self.cap && !self.read_done {
-            // Tiered upgrade (#386): the buffer is empty, so swapping it is
-            // safe — no buffered bytes to carry over. One allocation per bulk
-            // direction for the connection's remaining lifetime.
-            if wants_bulk_upgrade(self.amt, self.buf.len()) {
-                self.buf = Scratch::Owned(vec![0u8; RELAY_BULK_BUF_SIZE].into_boxed_slice());
-            }
-            let mut rb = ReadBuf::new(self.buf.slice());
-            match reader.as_mut().poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {
-                    let filled = rb.filled().len();
-                    if filled == 0 {
-                        self.read_done = true;
-                    } else {
-                        self.pos = 0;
-                        self.cap = filled;
+        #[cfg(target_os = "linux")]
+        if self.pos == self.cap && *_allow_splice && self.amt >= RELAY_BULK_UPGRADE_BYTES {
+            if let (Some(src), Some(dst)) = (
+                _tcp.0(reader.as_ref().get_ref()),
+                _tcp.1(writer.as_ref().get_ref()),
+            ) {
+                // Defer pipe creation while a bulk direction is waiting for
+                // input. Readiness may be spurious; poll_fill clears it.
+                if self.pipe.is_none() && !self.read_done {
+                    match src.poll_read_ready(cx) {
+                        Poll::Pending => return Ok(Cycle::Pending),
+                        Poll::Ready(Err(e)) => return Err(e),
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    match splice::Pipe::new() {
+                        Ok(pipe) => self.pipe = Some(pipe),
+                        // Descriptor/memory pressure must not break a relay
+                        // that can still make progress through userspace.
+                        Err(_) => *_allow_splice = false,
                     }
                 }
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => {
-                    // Nothing buffered and the reader is idle: push written
-                    // bytes to the peer before parking this direction.
-                    if self.need_flush {
-                        match writer.as_mut().poll_flush(cx) {
-                            Poll::Ready(Ok(())) => self.need_flush = false,
-                            Poll::Ready(Err(e)) => return Err(e),
-                            Poll::Pending => return Ok(Cycle::Pending),
-                        }
+                if *_allow_splice {
+                    match self.poll_splice(cx, src, dst, on_progress) {
+                        Ok(Cycle::Done) => return shutdown(cx, writer),
+                        Ok(cycle) => return Ok(cycle),
+                        Err(e) if splice::unsupported(&e) => *_allow_splice = false,
+                        Err(e) => return Err(e),
                     }
-                    return Ok(Cycle::Pending);
                 }
             }
         }
 
-        // Drain buffered data to the writer.
-        while self.pos < self.cap {
-            let data = &self.buf.slice()[self.pos..self.cap];
-            match writer.as_mut().poll_write(cx, data) {
-                Poll::Ready(Ok(0)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero bytes to writer",
-                    ));
+        // Owned storage is only needed if a previous poll could not drain its
+        // read. Taking it temporarily avoids aliasing self while polling I/O.
+        if let Some(mut spill) = self.spill.take() {
+            let result = self.poll_copy(cx, reader, writer, &mut spill, on_progress);
+            self.spill = Some(spill);
+            return result;
+        }
+        SCRATCH.with(|scratch| {
+            // A custom stream can recursively poll another relay. In that rare
+            // case use temporary stack scratch instead of panicking on RefCell.
+            match scratch.try_borrow_mut() {
+                Ok(mut buf) => {
+                    self.poll_scratch(cx, reader.as_mut(), writer.as_mut(), &mut *buf, on_progress)
                 }
+                Err(_) => self.poll_reentrant(cx, reader, writer, on_progress),
+            }
+        })
+    }
+
+    #[inline(never)]
+    fn poll_reentrant<R: AsyncRead + ?Sized, W: AsyncWrite + ?Sized, F: FnMut(u64)>(
+        &mut self,
+        cx: &mut Context<'_>,
+        reader: Pin<&mut R>,
+        writer: Pin<&mut W>,
+        on_progress: &mut F,
+    ) -> io::Result<Cycle> {
+        self.poll_scratch(
+            cx,
+            reader,
+            writer,
+            &mut [0; RELAY_BULK_BUF_SIZE],
+            on_progress,
+        )
+    }
+
+    fn poll_scratch<R: AsyncRead + ?Sized, W: AsyncWrite + ?Sized, F: FnMut(u64)>(
+        &mut self,
+        cx: &mut Context<'_>,
+        reader: Pin<&mut R>,
+        writer: Pin<&mut W>,
+        buf: &mut [u8],
+        on_progress: &mut F,
+    ) -> io::Result<Cycle> {
+        let result = self.poll_copy(cx, reader, writer, buf, on_progress);
+        if result.is_ok() && self.pos < self.cap {
+            let remaining = self.cap - self.pos;
+            let mut spill = vec![0; RELAY_BULK_BUF_SIZE].into_boxed_slice();
+            spill[..remaining].copy_from_slice(&buf[self.pos..self.cap]);
+            self.spill = Some(spill);
+            self.pos = 0;
+            self.cap = remaining;
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_splice<F: FnMut(u64)>(
+        &mut self,
+        cx: &mut Context<'_>,
+        src: &TcpStream,
+        dst: &TcpStream,
+        on_progress: &mut F,
+    ) -> io::Result<Cycle> {
+        let Some(pipe) = &mut self.pipe else {
+            // EOF was already observed before reaching the bulk threshold.
+            return Ok(Cycle::Done);
+        };
+        if pipe.buffered == 0 && !self.read_done {
+            match pipe.poll_fill(cx, src, SPLICE_CHUNK) {
+                Poll::Pending => return Ok(Cycle::Pending),
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(0)) => self.read_done = true,
+                Poll::Ready(Ok(_)) => {}
+            }
+        }
+        while pipe.buffered != 0 {
+            match pipe.poll_drain(cx, dst) {
+                Poll::Pending => return Ok(Cycle::Pending),
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(0)) => return Err(write_zero()),
+                Poll::Ready(Ok(n)) => {
+                    self.amt += n as u64;
+                    on_progress(n as u64);
+                }
+            }
+        }
+        Ok(if self.read_done {
+            Cycle::Done
+        } else {
+            Cycle::Progress
+        })
+    }
+
+    fn poll_copy<R: AsyncRead + ?Sized, W: AsyncWrite + ?Sized, F: FnMut(u64)>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+        buf: &mut [u8],
+        on_progress: &mut F,
+    ) -> io::Result<Cycle> {
+        if self.pos == self.cap && !self.read_done {
+            self.pos = 0;
+            self.cap = 0;
+            // Keep the original small-flow and bulk fairness granularity.
+            let limit = if self.amt < RELAY_BULK_UPGRADE_BYTES {
+                RELAY_BUF_SIZE
+            } else {
+                RELAY_BULK_BUF_SIZE
+            };
+            let mut rb = ReadBuf::new(&mut buf[..limit]);
+            #[cfg(target_os = "linux")]
+            if let Some(pipe) = &mut self.pipe {
+                if pipe.buffered != 0 {
+                    let n = pipe.read(rb.initialize_unfilled())?;
+                    rb.advance(n);
+                }
+                if pipe.buffered == 0 {
+                    self.pipe = None;
+                }
+            }
+            // A failed pipe→socket splice can leave already-read bytes in the
+            // pipe. Forward those first, without rereading/reordering the socket.
+            if rb.filled().is_empty() {
+                match reader.as_mut().poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => self.read_done = rb.filled().is_empty(),
+                    Poll::Ready(Err(e)) => return Err(e),
+                    Poll::Pending => {
+                        if self.need_flush {
+                            match writer.as_mut().poll_flush(cx) {
+                                Poll::Ready(Ok(())) => self.need_flush = false,
+                                Poll::Ready(Err(e)) => return Err(e),
+                                Poll::Pending => return Ok(Cycle::Pending),
+                            }
+                        }
+                        return Ok(Cycle::Pending);
+                    }
+                }
+            }
+            self.cap = rb.filled().len();
+        }
+        while self.pos < self.cap {
+            match writer.as_mut().poll_write(cx, &buf[self.pos..self.cap]) {
+                Poll::Ready(Ok(0)) => return Err(write_zero()),
                 Poll::Ready(Ok(n)) => {
                     self.pos += n;
                     self.amt += n as u64;
@@ -234,39 +310,33 @@ impl<'buf> HalfCopy<'buf> {
                     self.need_flush = true;
                 }
                 Poll::Ready(Err(e)) => return Err(e),
-                // Blocked on the writer — retrying this direction cannot help
-                // until its waker fires, even though bytes may have moved.
                 Poll::Pending => return Ok(Cycle::Pending),
             }
         }
-
         if self.read_done {
-            return match writer.as_mut().poll_shutdown(cx) {
-                Poll::Ready(Ok(())) => Ok(Cycle::Done),
-                Poll::Ready(Err(e)) => Err(e),
-                Poll::Pending => Ok(Cycle::Pending),
-            };
+            return shutdown(cx, writer);
         }
-
-        // Buffer drained and the reader has not hit EOF: more work may be
-        // immediately available next turn.
         Ok(Cycle::Progress)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+fn write_zero() -> io::Error {
+    io::Error::new(io::ErrorKind::WriteZero, "write zero bytes to writer")
+}
 
-/// Bidirectional relay using caller-supplied scratch buffers.
-///
-/// `buf_a_to_b` and `buf_b_to_a` are borrowed for the duration of the copy;
-/// they must be at least 1 byte (typically `RELAY_BUF_SIZE`).
-/// Callers declare these as `[0u8; RELAY_BUF_SIZE]` arrays in the enclosing
-/// async fn so they live in the future's state machine — zero per-relay heap
-/// allocation (ADR-0011 T6 / ADR-0008 HP-1 goal).
-///
-/// Returns `(bytes_a_to_b, bytes_b_to_a)`.
+fn shutdown<W: AsyncWrite + ?Sized>(
+    cx: &mut Context<'_>,
+    writer: Pin<&mut W>,
+) -> io::Result<Cycle> {
+    match writer.poll_shutdown(cx) {
+        Poll::Ready(Ok(())) => Ok(Cycle::Done),
+        Poll::Ready(Err(e)) => Err(e),
+        Poll::Pending => Ok(Cycle::Pending),
+    }
+}
+
+/// Compatibility entry point for callers with existing scratch arrays. Storage
+/// is now shared per worker; supplied buffers are not retained or used.
 pub async fn copy_bidirectional_buf<A, B>(
     a: &mut A,
     b: &mut B,
@@ -280,14 +350,34 @@ where
     copy_bidirectional_buf_tracked(a, b, buf_a_to_b, buf_b_to_a, |_| {}, |_| {}).await
 }
 
-/// Tracked variant of [`copy_bidirectional_buf`]. The callbacks run after
-/// bytes are successfully written in each direction, allowing live traffic
-/// and connection statistics without waiting for relay completion.
+/// Compatibility tracked entry point; prefer [`copy_bidirectional_tracked`]
+/// for relays without caller-owned buffers and with optional kernel TCP access.
 pub async fn copy_bidirectional_buf_tracked<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
-    buf_a_to_b: &mut [u8],
-    buf_b_to_a: &mut [u8],
+    _buf_a_to_b: &mut [u8],
+    _buf_b_to_a: &mut [u8],
+    on_a_to_b: FA,
+    on_b_to_a: FB,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    FA: FnMut(u64),
+    FB: FnMut(u64),
+{
+    copy_bidirectional_tracked(a, b, |_| None, |_| None, on_a_to_b, on_b_to_a).await
+}
+
+/// Relay without allocating buffers at setup. TCP accessors opt into Linux
+/// splice only when both endpoints safely expose an untransformed TcpStream.
+/// Callbacks count bytes after successful destination writes, including splice.
+/// Dropping this future releases all spill buffers and any lazily-created pipes.
+pub async fn copy_bidirectional_tracked<A, B, FA, FB>(
+    a: &mut A,
+    b: &mut B,
+    a_tcp: TcpAccess<A>,
+    b_tcp: TcpAccess<B>,
     mut on_a_to_b: FA,
     mut on_b_to_a: FB,
 ) -> io::Result<(u64, u64)>
@@ -297,8 +387,9 @@ where
     FA: FnMut(u64),
     FB: FnMut(u64),
 {
-    let mut a_to_b = HalfCopy::new(buf_a_to_b);
-    let mut b_to_a = HalfCopy::new(buf_b_to_a);
+    let mut a_to_b = HalfCopy::new();
+    let mut b_to_a = HalfCopy::new();
+    let mut allow_splice = true;
     let mut a_done = false;
     let mut b_done = false;
 
@@ -338,7 +429,14 @@ where
             if !a_done && !a_parked {
                 let a_pin = Pin::new(&mut *a);
                 let b_pin = Pin::new(&mut *b);
-                match a_to_b.poll_cycle(cx, a_pin, b_pin, &mut on_a_to_b) {
+                match a_to_b.poll_cycle(
+                    cx,
+                    a_pin,
+                    b_pin,
+                    (a_tcp, b_tcp),
+                    &mut allow_splice,
+                    &mut on_a_to_b,
+                ) {
                     Ok(Cycle::Done) => a_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -352,7 +450,14 @@ where
             if !b_done && !b_parked {
                 let a_pin = Pin::new(&mut *a);
                 let b_pin = Pin::new(&mut *b);
-                match b_to_a.poll_cycle(cx, b_pin, a_pin, &mut on_b_to_a) {
+                match b_to_a.poll_cycle(
+                    cx,
+                    b_pin,
+                    a_pin,
+                    (b_tcp, a_tcp),
+                    &mut allow_splice,
+                    &mut on_b_to_a,
+                ) {
                     Ok(Cycle::Done) => b_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -436,25 +541,10 @@ mod tests {
         assert_eq!(down, 5, "b→a direction");
     }
 
-    // Tiered upgrade decision (#386): small callers upgrade only after the
-    // bulk threshold; callers that already supply bulk-sized buffers never do.
-    #[test]
-    fn bulk_upgrade_decision() {
-        assert!(!wants_bulk_upgrade(0, RELAY_BUF_SIZE));
-        assert!(!wants_bulk_upgrade(
-            RELAY_BULK_UPGRADE_BYTES - 1,
-            RELAY_BUF_SIZE
-        ));
-        assert!(wants_bulk_upgrade(RELAY_BULK_UPGRADE_BYTES, RELAY_BUF_SIZE));
-        assert!(!wants_bulk_upgrade(u64::MAX, RELAY_BULK_BUF_SIZE));
-        assert!(!wants_bulk_upgrade(u64::MAX, RELAY_BULK_BUF_SIZE * 2));
-    }
-
-    // Data integrity across the in-flight buffer swap (#386): stream several
-    // multiples of the upgrade threshold through standard small caller
-    // buffers in both directions and verify every byte arrives, in order.
+    // Data integrity across the bulk chunk-size transition and backpressure:
+    // stream several multiples of the threshold through both directions.
     #[tokio::test]
-    async fn bulk_stream_survives_buffer_upgrade() {
+    async fn bulk_copy_survives_backpressure_and_chunk_size_transition() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const TOTAL: usize = (RELAY_BULK_UPGRADE_BYTES as usize) * 4;
@@ -682,5 +772,172 @@ mod tests {
             .unwrap();
         assert_eq!(up, 0);
         assert_eq!(down, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn idle_and_immediate_writes_need_no_owned_buffer() {
+        let (mut client, mut src) = tokio::io::duplex(64);
+        let (mut dst, mut upstream) = tokio::io::duplex(64);
+        let mut half = HalfCopy::new();
+        let mut allow = true;
+        poll_fn(|cx| {
+            assert!(matches!(
+                half.poll_cycle(
+                    cx,
+                    Pin::new(&mut src),
+                    Pin::new(&mut dst),
+                    (|_| None, |_| None),
+                    &mut allow,
+                    &mut |_| {}
+                )
+                .unwrap(),
+                Cycle::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(half.spill.is_none());
+        client.write_all(b"hello").await.unwrap();
+        poll_fn(|cx| {
+            assert!(matches!(
+                half.poll_cycle(
+                    cx,
+                    Pin::new(&mut src),
+                    Pin::new(&mut dst),
+                    (|_| None, |_| None),
+                    &mut allow,
+                    &mut |_| {}
+                )
+                .unwrap(),
+                Cycle::Progress
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        let mut bytes = [0; 5];
+        upstream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"hello");
+        assert!(half.spill.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_write_spills_only_the_unwritten_bytes() {
+        let (mut client, mut src) = tokio::io::duplex(64);
+        let (mut dst, mut upstream) = tokio::io::duplex(1);
+        client.write_all(b"hello").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut half = HalfCopy::new();
+        let mut allow = true;
+        let mut delivered = 0;
+        poll_fn(|cx| {
+            assert!(matches!(
+                half.poll_cycle(
+                    cx,
+                    Pin::new(&mut src),
+                    Pin::new(&mut dst),
+                    (|_| None, |_| None),
+                    &mut allow,
+                    &mut |n| delivered += n
+                )
+                .unwrap(),
+                Cycle::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(delivered, 1);
+        assert_eq!(half.cap, 4);
+        assert_eq!(&half.spill.as_ref().unwrap()[..4], b"ello");
+        let storage = half.spill.as_ref().unwrap().as_ptr();
+        // A different connection on this worker can overwrite all scratch
+        // before the blocked writer wakes, without corrupting retained bytes.
+        SCRATCH.with(|scratch| scratch.borrow_mut().fill(99));
+        let copy = poll_fn(|cx| loop {
+            match half
+                .poll_cycle(
+                    cx,
+                    Pin::new(&mut src),
+                    Pin::new(&mut dst),
+                    (|_| None, |_| None),
+                    &mut allow,
+                    &mut |n| delivered += n,
+                )
+                .unwrap()
+            {
+                Cycle::Done => return Poll::Ready(()),
+                Cycle::Pending => return Poll::Pending,
+                Cycle::Progress => {}
+            }
+        });
+        let read = async {
+            let mut bytes = Vec::new();
+            upstream.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        };
+        let ((), bytes) = tokio::join!(copy, read);
+        assert_eq!(bytes, b"hello");
+        assert_eq!(delivered, 5);
+        assert_eq!(half.spill.as_ref().unwrap().as_ptr(), storage);
+    }
+
+    #[tokio::test]
+    async fn always_ready_streams_yield_within_cycle_and_byte_budgets() {
+        struct Endless;
+        impl AsyncRead for Endless {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let n = buf.remaining();
+                buf.initialize_unfilled().fill(0);
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for Endless {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut a = Endless;
+        let mut b = Endless;
+        let up = std::cell::Cell::new(0);
+        let down = std::cell::Cell::new(0);
+        let relay = copy_bidirectional_tracked(
+            &mut a,
+            &mut b,
+            |_| None,
+            |_| None,
+            |n| up.set(up.get() + n),
+            |n| down.set(down.get() + n),
+        );
+        tokio::pin!(relay);
+        for _ in 0..3 {
+            let before = up.get() + down.get();
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(relay.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(up.get(), down.get(), "directions must alternate fairly");
+            assert!(up.get() + down.get() - before <= RELAY_BYTES_PER_POLL);
+        }
     }
 }

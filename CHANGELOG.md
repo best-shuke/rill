@@ -10,6 +10,11 @@
   CPU per byte and per connection and lower latency, for a 19 MB instead of
   a 13 MB binary. Size-capped router builds use the new `release-small`
   profile (`opt-level = "z"`), which the OpenWrt packaging now builds.
+- On Linux, a relay between plain kernel TCP sockets — an inbound
+  connection dialed DIRECT — moves bulk data with `splice` past its first
+  128 KiB, as Go's net package does (4-flow loopback echo 27.8 → 54.6 Gbps;
+  mihomo 53.3). Idle connections hold no relay buffers and a far smaller
+  task: 10 000 idle connections take 65 MB instead of 194 MB.
 
 ## 0.1.2 — 2026-10-25
 

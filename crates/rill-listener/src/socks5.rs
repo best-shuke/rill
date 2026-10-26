@@ -1,6 +1,6 @@
 use crate::sniffer::SnifferRuntime;
 use rill_common::{AuthConfig, ConnType, Metadata, Network};
-use rill_tunnel::{route_inbound_tcp, Tunnel};
+use rill_tunnel::{route_inbound_tcp_with_socket, Tunnel};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -26,18 +26,35 @@ pub async fn handle_socks5(
     in_name: &str,
     in_port: u16,
 ) {
-    match handle_socks5_inner(
-        tunnel,
-        &mut stream,
-        src_addr,
-        sniffer,
-        auth,
-        in_name,
-        in_port,
-    )
-    .await
-    {
-        Ok(PostHandshake::Done) => {}
+    match Box::pin(handle_socks5_inner(&mut stream, src_addr, auth)).await {
+        Ok(PostHandshake::Connect {
+            host,
+            dst_ip,
+            dst_port,
+            in_user,
+        }) => {
+            let mut metadata = Metadata {
+                network: Network::Tcp,
+                conn_type: ConnType::Socks5,
+                src_ip: Some(src_addr.ip()),
+                src_port: src_addr.port(),
+                dst_ip,
+                dst_port,
+                host: Metadata::lower_host(&host),
+                in_name: in_name.into(),
+                in_port,
+                in_user: in_user.as_deref().map(Into::into),
+                ..Default::default()
+            };
+            drop(host);
+            drop(in_user);
+            if let Some(rt) = sniffer {
+                Box::pin(rt.sniff(&stream, &mut metadata)).await;
+            }
+            debug!("SOCKS5 CONNECT to {}", metadata.remote_address());
+            route_inbound_tcp_with_socket(tunnel.inner(), &mut stream, metadata, &[], |s| Some(s))
+                .await;
+        }
         Ok(PostHandshake::UdpAssociate {
             requested_ip,
             requested_port,
@@ -67,11 +84,16 @@ pub async fn handle_socks5(
     }
 }
 
-/// Outcome of the SOCKS5 handshake: a CONNECT was fully relayed, or the client
+/// Outcome of the SOCKS5 handshake: CONNECT can enter the relay, or the client
 /// requested UDP ASSOCIATE and the (owned) control connection must be handed to
 /// the UDP relay.
 enum PostHandshake {
-    Done,
+    Connect {
+        host: String,
+        dst_ip: Option<IpAddr>,
+        dst_port: u16,
+        in_user: Option<String>,
+    },
     UdpAssociate {
         requested_ip: Option<IpAddr>,
         requested_port: u16,
@@ -80,13 +102,9 @@ enum PostHandshake {
 }
 
 async fn handle_socks5_inner(
-    tunnel: &Tunnel,
     stream: &mut TcpStream,
     src_addr: SocketAddr,
-    sniffer: Option<&SnifferRuntime>,
     auth: Option<&AuthConfig>,
-    in_name: &str,
-    in_port: u16,
 ) -> Result<PostHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let deadline = tokio::time::Instant::now() + crate::DEFAULT_HANDSHAKE_TIMEOUT;
     // 1. Version/method negotiation
@@ -199,36 +217,12 @@ async fn handle_socks5_inner(
     ];
     stream.write_all(&reply).await?;
 
-    // 4. Build metadata and hand off to tunnel
-    let mut metadata = Metadata {
-        network: Network::Tcp,
-        conn_type: ConnType::Socks5,
-        src_ip: Some(src_addr.ip()),
-        src_port: src_addr.port(),
+    Ok(PostHandshake::Connect {
+        host,
         dst_ip,
         dst_port,
-        host: Metadata::lower_host(&host),
-        in_name: in_name.into(),
-        in_port,
-        in_user: in_user.as_deref().map(Into::into),
-        ..Default::default()
-    };
-
-    // Sniff TLS SNI or HTTP Host header from the initial payload bytes.
-    if let Some(rt) = sniffer {
-        rt.sniff(stream, &mut metadata).await;
-    }
-
-    debug!("SOCKS5 CONNECT to {}", metadata.remote_address());
-
-    // Hand off to the shared inbound routing+relay path: fake-IP rewrite,
-    // lazy rule match, connection tracking, dial, and bidirectional copy.
-    // `prefix` is empty — the SOCKS5 CONNECT handshake consumes exactly the
-    // request header, leaving a clean stream.
-    let inner = tunnel.inner();
-    route_inbound_tcp(inner, stream, metadata, &[]).await;
-
-    Ok(PostHandshake::Done)
+        in_user,
+    })
 }
 
 async fn parse_socks5_address(

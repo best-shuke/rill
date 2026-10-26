@@ -281,7 +281,7 @@ Any PR touching these types **must** include before/after byte counts (from `-Zp
 - `UdpSession` (`crates/rill-tunnel/src/udp.rs`) — M2 exit 40 B
 - DNS `CacheEntry` / `ReverseEntry` (`crates/rill-dns/src/cache.rs`) — M2 exit 72 B per `CacheEntry` (the LRU `.val`; full `LruEntry` slot incl. key + links is ~104 B on macOS)
 
-Any PR touching relay code (`crates/rill-tunnel/src/relay.rs`, `tcp.rs`, or call sites in `rill-listener`) must preserve the zero-per-relay-setup-allocation invariant: relay buffers are stack-allocated in the caller's async frame, not heap-allocated per call.
+Any PR touching relay code (`crates/rill-tunnel/src/relay.rs`, `tcp.rs`, or call sites in `rill-listener`) must preserve the zero-per-relay-setup-allocation invariant: idle relays retain no data buffers — per-worker thread-local scratch is borrowed only within a synchronous poll, a direction allocates its spill buffer once only when backpressure leaves unwritten bytes, and Linux kernel-TCP pairs lazily open default-sized splice pipes past the bulk threshold. The mixed and tproxy per-connection futures stay under 4 KiB (`connection_future_stays_compact`).
 
 ### Rule-engine footprint (docs/benchmarks/rule-engine-footprint-2026-09.md)
 
