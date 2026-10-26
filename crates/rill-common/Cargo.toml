@@ -18,6 +18,8 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 bytes = { workspace = true }
+# `happy_eyeballs::race_connect` drives its attempts in a `FuturesUnordered`.
+futures-util = { workspace = true }
 tracing = { workspace = true }
 httparse = { version = "1", default-features = false }
 ipnet = { workspace = true }

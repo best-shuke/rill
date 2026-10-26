@@ -3,7 +3,7 @@ use crate::statistics::Statistics;
 use crate::tunnel::{ResolvedTarget, TunnelInner};
 use rill_common::conn_note;
 use rill_common::conn_notes::{self, ConnNotes};
-use rill_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
+use rill_common::{dial_with_retry, Metadata, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -452,7 +452,7 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
-            let dial = Box::pin(with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))).await;
+            let dial = Box::pin(dial_with_retry(proxy.name(), || proxy.dial_tcp(&metadata))).await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());

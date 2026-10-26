@@ -4,7 +4,7 @@ mod udp;
 
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
-use rill_common::{with_dial_timeout, ConnType, Metadata, Network};
+use rill_common::{dial_with_retry, ConnType, Metadata, Network};
 use rill_tunnel::{copy_bidirectional_tracked, ResolvedTarget, Tunnel};
 use std::collections::HashSet;
 use std::future::Future;
@@ -620,7 +620,7 @@ async fn handle_tproxy_flow(
 
     _guard
         .run_until_closed(async {
-            let dial = Box::pin(with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))).await;
+            let dial = Box::pin(dial_with_retry(proxy.name(), || proxy.dial_tcp(&metadata))).await;
             drop(route.take());
             match dial {
                 Ok(mut remote) => {

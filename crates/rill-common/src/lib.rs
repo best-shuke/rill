@@ -26,6 +26,7 @@ pub mod dial;
 pub mod dns_mode;
 pub mod error;
 pub mod fs_util;
+pub mod happy_eyeballs;
 pub mod home_dir;
 pub mod logbook;
 pub mod metadata;
@@ -51,7 +52,7 @@ pub use chain_health::{
     CLOSED_BEFORE_REPLY,
 };
 pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
-pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
+pub use dial::{dial_with_retry, with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;
 pub use error::{Result, RillError};
 pub use fs_util::{sweep_scratch_siblings, SCRATCH_STALE_AGE};

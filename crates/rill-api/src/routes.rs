@@ -1354,6 +1354,7 @@ async fn apply_raw_to_tunnel(
         "caller must hold the CONFIG_MUTATION lane"
     );
     let connection_notes = raw.connection_notes.unwrap_or(false);
+    let tcp_concurrent = raw.tcp_concurrent.unwrap_or(false);
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1451,6 +1452,7 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    rill_common::happy_eyeballs::set_tcp_concurrent(tcp_concurrent);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3663,6 +3665,7 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    rill_common::happy_eyeballs::set_tcp_concurrent(raw_config.tcp_concurrent.unwrap_or(false));
     if dropped > 0 {
         tracing::info!(
             connections_dropped = dropped,

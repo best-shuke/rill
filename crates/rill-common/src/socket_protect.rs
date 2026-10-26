@@ -437,36 +437,43 @@ async fn resolve_via_hook(
 
 /// Dial an outbound TCP stream to `host:port`. The hostname is resolved
 /// through `resolve_addrs` (installed `HostResolver` → cache → system
-/// resolver), then each candidate is dialed via [`connect_tcp`] so the
-/// `SocketProtector` (Android) still applies. If every candidate fails to
-/// connect, any cached system-resolver entry is evicted so the next dial
-/// re-resolves instead of reusing a dead address.
+/// resolver), then the candidates are raced per RFC 8305
+/// ([`crate::happy_eyeballs::race_connect`]), each dialed via
+/// [`connect_tcp`] so the `SocketProtector` (Android) still applies. If
+/// every candidate fails to connect, any cached system-resolver entry is
+/// evicted so the next dial re-resolves instead of reusing a dead address.
 ///
 /// IP literals short-circuit inside `resolve_addrs` — no resolver hook is
 /// consulted, but the protector still applies to the literal dial.
 pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     let addrs = resolve_addrs(host, port).await?;
-    let mut last_err: Option<io::Error> = None;
-    for addr in &addrs {
-        match connect_tcp(*addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                // An errno-backed failure (e.g. EMFILE on socket()) must
-                // not be masked by a later errno-less error — it carries
-                // the local-vs-member classification (issue #668).
-                last_err = crate::RillError::prefer_errno_io(last_err, e);
-            }
+    // An errno-backed failure (e.g. EMFILE on socket()) must not be masked
+    // by a later errno-less error — it carries the local-vs-member
+    // classification (issue #668).
+    match crate::happy_eyeballs::race_connect(
+        &addrs,
+        connect_tcp,
+        crate::RillError::prefer_errno_io,
+    )
+    .await
+    {
+        Ok(stream) => {
+            crate::happy_eyeballs::set_keepalive(&stream);
+            Ok(stream)
+        }
+        Err(last_err) => {
+            // Every candidate failed — drop any cached system entry so the
+            // next dial re-resolves. No-op for the literal / resolver-hook
+            // paths (not cached).
+            sys_cache_evict(host);
+            Err(last_err.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "connect_tcp_host: no addresses resolved",
+                )
+            }))
         }
     }
-    // Every candidate failed — drop any cached system entry so the next dial
-    // re-resolves. No-op for the literal / resolver-hook paths (not cached).
-    sys_cache_evict(host);
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "connect_tcp_host: no addresses resolved",
-        )
-    }))
 }
 
 /// Resolve `host` to a single [`SocketAddr`] (the first candidate from

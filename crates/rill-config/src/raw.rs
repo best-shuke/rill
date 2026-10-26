@@ -236,6 +236,10 @@ pub struct RawConfig {
     /// Explicit `type: direct` proxy blocks are NOT covered by this
     /// global; they accept their own per-proxy `connect-timeout` field.
     pub tcp_connect_timeout: Option<u64>,
+    /// mihomo's `tcp-concurrent`: dial every resolved address at once
+    /// instead of racing them 250 ms apart (RFC 8305). See
+    /// `rill_common::happy_eyeballs`.
+    pub tcp_concurrent: Option<bool>,
     /// `connection-notes: true` records a timestamped account of how each
     /// TCP connection was handled (fake-IP reversal, DNS lookups, matched
     /// rule, dial, close), served by `GET /connections/{id}`. A rill

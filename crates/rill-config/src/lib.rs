@@ -118,6 +118,8 @@ pub struct GeneralConfig {
     pub bind_address: String,
     /// `connection-notes` — see `Tunnel::set_connection_notes`.
     pub connection_notes: bool,
+    /// `tcp-concurrent` — see `rill_common::happy_eyeballs::set_tcp_concurrent`.
+    pub tcp_concurrent: bool,
     /// `logbook.enable` — see `rill_common::logbook::apply`.
     pub logbook: bool,
 }
@@ -4399,6 +4401,7 @@ pub async fn build_config(
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
         connection_notes: raw.connection_notes.unwrap_or(false),
+        tcp_concurrent: raw.tcp_concurrent.unwrap_or(false),
         logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
     };
 

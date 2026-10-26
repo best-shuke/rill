@@ -75,10 +75,150 @@ where
         .await
 }
 
+/// Most attempts [`dial_with_retry`] makes for one connection.
+pub const DIAL_ATTEMPTS: u32 = 3;
+
+/// Pause before the first retry; doubled before each further one.
+const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Whether a failed dial is worth repeating within the same deadline: the
+/// connection to the server was cut while it was being set up — reset,
+/// aborted, closed before the handshake finished — which is what a
+/// restarting server, a flaky middlebox or a lost NAT mapping produce and
+/// what usually succeeds a moment later. A refusal, a DNS failure, a
+/// timeout or a protocol error is final; so is local resource exhaustion,
+/// which retrying only worsens.
+pub fn is_transient_dial_error(err: &RillError) -> bool {
+    match err {
+        RillError::Io(e) => {
+            matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+            ) && !err.is_local_resource_error()
+        }
+        RillError::RelayHopFailed { source, .. } => is_transient_dial_error(source),
+        _ => false,
+    }
+}
+
+/// [`with_dial_timeout`] that repeats a dial cut by a transient failure
+/// ([`is_transient_dial_error`]) — up to [`DIAL_ATTEMPTS`] attempts, 50 ms
+/// then 100 ms apart, all under the one deadline. mihomo's `tunnel.retry`
+/// does the same with up to ten attempts but retries every error, which
+/// holds a refused connection for seconds before the client hears of it;
+/// here a final error returns at once.
+///
+/// Each attempt goes back through `dial`, so a proxy group picks its member
+/// afresh (and has recorded the failure) — a retry can land on a healthy one.
+pub async fn dial_with_retry<F, Fut, T>(via: &str, mut dial: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    with_dial_timeout(via, async {
+        let mut backoff = RETRY_BACKOFF;
+        let mut attempt = 1;
+        loop {
+            match dial().await {
+                Err(err) if attempt < DIAL_ATTEMPTS && is_transient_dial_error(&err) => {
+                    // Not worth starting an attempt the deadline would cut.
+                    if dial_deadline().is_some_and(|deadline| Instant::now() + backoff >= deadline)
+                    {
+                        return Err(err);
+                    }
+                    tracing::debug!("dial via {via} failed ({err}); retrying");
+                    crate::conn_note!(Dial, "Failed ({err}); retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::pending;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn reset() -> RillError {
+        RillError::Io(io::Error::from(io::ErrorKind::ConnectionReset))
+    }
+
+    /// A dial that fails with `errors` in turn, then succeeds.
+    async fn flaky(errors: Vec<RillError>) -> (Result<u32>, u32) {
+        let calls = AtomicU32::new(0);
+        let errors = std::sync::Mutex::new(errors.into_iter());
+        let result = dial_with_retry("mock", || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let next = errors.lock().unwrap().next();
+            async move {
+                match next {
+                    Some(err) => Err(err),
+                    None => Ok(n),
+                }
+            }
+        })
+        .await;
+        (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_dial_is_retried() {
+        let start = Instant::now();
+        let (result, calls) = flaky(vec![reset(), reset()]).await;
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(calls, 3);
+        assert_eq!(start.elapsed(), Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_stop_after_the_attempt_limit() {
+        let (result, calls) = flaky(vec![reset(), reset(), reset(), reset()]).await;
+        assert!(is_transient_dial_error(&result.unwrap_err()));
+        assert_eq!(calls, DIAL_ATTEMPTS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_final_error_is_not_retried() {
+        for err in [
+            RillError::Io(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            RillError::Io(io::Error::from(io::ErrorKind::TimedOut)),
+            RillError::Dns("no address".into()),
+            RillError::Proxy("auth failed".into()),
+            RillError::Io(io::Error::from_raw_os_error(libc_emfile())),
+        ] {
+            let (result, calls) = flaky(vec![err]).await;
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn a_relay_hop_reset_is_transient() {
+        let hop = RillError::RelayHopFailed {
+            hop: 1,
+            source: Box::new(reset()),
+        };
+        assert!(is_transient_dial_error(&hop));
+    }
+
+    #[cfg(unix)]
+    fn libc_emfile() -> i32 {
+        24
+    }
+
+    #[cfg(not(unix))]
+    fn libc_emfile() -> i32 {
+        10024
+    }
 
     #[tokio::test]
     async fn a_completed_dial_passes_through_untouched() {

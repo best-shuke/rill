@@ -355,27 +355,33 @@ impl ProxyAdapter for DirectAdapter {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let dests = self.resolve_targets(metadata).await?;
-        let mut last_err = None;
-
-        for dest in dests {
-            match apply_connect_timeout(
-                connect_with_mark(dest, self.routing_mark),
-                self.connect_timeout,
-                dest,
-            )
-            .await
-            {
-                Ok(stream) => return Ok(Box::new(DirectConn(stream))),
-                // An errno-backed connect failure (e.g. EMFILE on
-                // socket()) outranks a later context-only error — the
-                // errno is what dead-mark classification reads (issue
-                // #668); this error also escapes through relay hop-0 /
-                // dialer-proxy front boundaries.
-                Err(err) => last_err = RillError::prefer_errno(last_err, err),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| RillError::Proxy("direct: no reachable address".into())))
+        // Race the addresses per RFC 8305 rather than one after another: a
+        // blackholed first address would otherwise burn the whole dial
+        // deadline before the next one was tried.
+        //
+        // An errno-backed connect failure (e.g. EMFILE on socket()) outranks
+        // a later context-only error — the errno is what dead-mark
+        // classification reads (issue #668); this error also escapes
+        // through relay hop-0 / dialer-proxy front boundaries.
+        let routing_mark = self.routing_mark;
+        let connect_timeout = self.connect_timeout;
+        let stream = rill_common::happy_eyeballs::race_connect(
+            &dests,
+            |dest| {
+                apply_connect_timeout(connect_with_mark(dest, routing_mark), connect_timeout, dest)
+            },
+            RillError::prefer_errno,
+        )
+        .await
+        .map_err(|last_err| {
+            last_err.unwrap_or_else(|| RillError::Proxy("direct: no reachable address".into()))
+        })?;
+        // Nagle off, as Go (and so mihomo) does on every connection: a
+        // client's small pipelined writes must not wait for the server's
+        // delayed ACK. The inbound side is already `TCP_NODELAY`.
+        let _ = stream.set_nodelay(true);
+        rill_common::happy_eyeballs::set_keepalive(&stream);
+        Ok(Box::new(DirectConn(stream)))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
