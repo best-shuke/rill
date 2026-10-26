@@ -1038,10 +1038,15 @@ impl Resolver {
         }
     }
 
-    pub async fn resolve_ips_direct(&self, host: &str) -> io::Result<Option<Vec<IpAddr>>> {
+    /// The DIRECT adapter's lookup: `direct-nameserver` when configured,
+    /// else this resolver, both through [`Self::resolve_ips_optimistic`].
+    pub async fn resolve_ips_direct(
+        self: &Arc<Self>,
+        host: &str,
+    ) -> io::Result<Option<Vec<IpAddr>>> {
         match &self.direct_resolver {
-            Some(resolver) => resolver.resolve_ips(host).await,
-            None => self.resolve_ips(host).await,
+            Some(resolver) => resolver.resolve_ips_optimistic(host).await,
+            None => self.resolve_ips_optimistic(host).await,
         }
     }
 
@@ -1315,6 +1320,74 @@ impl Resolver {
         None
     }
 
+    /// [`Self::resolve_ips`] for a connection about to be dialed: when the
+    /// cache only holds an answer that expired less than an hour ago
+    /// (`cache::STALE_WINDOW`), return it at once and refresh the
+    /// name in the background (RFC 8767 serve-stale, as mihomo does), instead
+    /// of holding the connection for a full upstream round-trip. The refresh
+    /// joins the single-flight lookup, so a burst of stale hits costs one
+    /// upstream query. Anything else behaves exactly like `resolve_ips`.
+    pub async fn resolve_ips_optimistic(
+        self: &Arc<Self>,
+        host: &str,
+    ) -> io::Result<Option<Vec<IpAddr>>> {
+        if let Some(stale) = self.stale_answer(host) {
+            conn_note!(
+                Dns,
+                "Cached (expired, refreshing): {host} → {}",
+                IpList(&stale)
+            );
+            let resolver = Arc::clone(self);
+            let host = host.to_owned();
+            tokio::spawn(async move {
+                if let Err(e) = resolver.resolve_ips(&host).await {
+                    debug!("background refresh of {host} failed: {e}");
+                }
+            });
+            return Ok(Some(stale));
+        }
+        self.resolve_ips(host).await
+    }
+
+    /// The expired-but-servable answer [`Self::resolve_ips_optimistic`]
+    /// returns, or `None` when `resolve_ips` should run as usual: a hosts
+    /// entry, a cache that can already answer every needed family, or nothing
+    /// within the stale window.
+    fn stale_answer(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let lookup_host = if self.use_hosts {
+            match self.lookup_hosts_entry(host) {
+                Some(HostsLookup::Addresses(_)) => return None,
+                Some(HostsLookup::Alias(alias)) => alias,
+                None => host,
+            }
+        } else {
+            host
+        };
+        let required = if self.ipv6 {
+            QueryFamilies::BOTH
+        } else {
+            QueryFamilies::IPV4
+        };
+        if let Some(cached) = self.cache.get_lookup(lookup_host) {
+            let v4_ok = !required.contains(QueryFamilies::IPV4) || cached.v4.is_fresh();
+            let v6_ok = !required.contains(QueryFamilies::IPV6) || cached.v6.is_fresh();
+            if v4_ok && v6_ok {
+                return None;
+            }
+        }
+        let stale = self.cache.get_stale(lookup_host, required)?;
+        self.filter_enabled_ips(&stale)
+    }
+
+    /// First usable address of `family` from an expired-but-servable cache
+    /// entry (see [`DnsServer::try_answer_stale`](crate::DnsServer::try_answer_stale)).
+    pub(crate) fn stale_family_ip(&self, host: &str, family: QueryFamilies) -> Option<IpAddr> {
+        self.cache
+            .get_stale(host, family)?
+            .into_iter()
+            .find(|ip| !self.in_fake_ip_range(*ip))
+    }
+
     /// [`Self::resolve_ips`] first address. Same `Ok`/`Err` contract —
     /// `Err` keeps the upstream failure's `io::Error` (errno intact, #682).
     pub async fn resolve_ip(&self, host: &str) -> io::Result<Option<IpAddr>> {
@@ -1329,9 +1402,12 @@ impl Resolver {
     /// failure re-surfaces on the real dial's own `resolve_ips`, so the
     /// `Err` arm decays to `None` here (logged at debug so a persistent
     /// local-resource failure is still visible in traces).
-    pub async fn resolve_ip_real(&self, host: &str) -> Option<IpAddr> {
-        match self.resolve_ip(host).await {
-            Ok(ip) => ip,
+    ///
+    /// Serves an expired cache entry while refreshing it, like
+    /// [`Self::resolve_ips_optimistic`].
+    pub async fn resolve_ip_real(self: &Arc<Self>, host: &str) -> Option<IpAddr> {
+        match self.resolve_ips_optimistic(host).await {
+            Ok(ips) => ips.and_then(|ips| ips.into_iter().next()),
             Err(e) => {
                 debug!("pre-resolve hint for {host} dropped upstream error: {e}");
                 None
@@ -2417,12 +2493,107 @@ mod tests {
         let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
         let real = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         hosts.insert("example.test", vec![real].into());
-        let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        let resolver = Arc::new(Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        ));
         assert_eq!(
             resolver.resolve_ip("example.test").await.unwrap(),
             Some(real)
         );
         assert_eq!(resolver.resolve_ip_real("example.test").await, Some(real));
+    }
+
+    /// Serve-stale: an expired answer is returned at once and refreshed in
+    /// the background; the next dial sees the refreshed address.
+    #[tokio::test]
+    async fn optimistic_lookup_serves_stale_and_refreshes() {
+        let fresh_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let stale_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let (upstream, queries) = counting_a_upstream(fresh_ip).await;
+        let resolver = Arc::new(Resolver::new(
+            vec![upstream],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            false,
+        ));
+        resolver.cache.merge_family(
+            "stale.test",
+            QueryFamilies::IPV4,
+            &[stale_ip],
+            Duration::from_millis(1),
+            None,
+            FamilyNeg::None,
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert_eq!(
+            resolver.resolve_ips_optimistic("stale.test").await.unwrap(),
+            Some(vec![stale_ip]),
+            "the expired answer is served without waiting for upstream"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while resolver.cache.get("stale.test").is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "refresh never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolver.resolve_ip_real("stale.test").await,
+            Some(IpAddr::V4(fresh_ip))
+        );
+        // The DNS server serves an expired answer the same way, with TTL 1.
+        resolver.cache.merge_family(
+            "served.test",
+            QueryFamilies::IPV4,
+            &[stale_ip],
+            Duration::from_millis(1),
+            None,
+            FamilyNeg::None,
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        query.add_query(hickory_proto::op::Query::query(
+            "served.test.".parse().unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_bytes().unwrap();
+        assert!(matches!(
+            crate::DnsServer::try_answer_local(&query, &resolver),
+            crate::LocalAnswer::Upstream
+        ));
+        let reply = crate::DnsServer::try_answer_stale(&query, &resolver).unwrap();
+        let reply = Message::from_bytes(&reply).unwrap();
+        assert_eq!(reply.metadata.id, 0x4242);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].ttl, 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while resolver.cache.get("served.test").is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "refresh never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            crate::DnsServer::try_answer_stale(&query, &resolver).is_none(),
+            "a fresh name is answered by try_answer_local, not as stale"
+        );
+
+        // A name with nothing cached still waits for the upstream.
+        assert_eq!(
+            resolver.resolve_ips_optimistic("cold.test").await.unwrap(),
+            Some(vec![IpAddr::V4(fresh_ip)])
+        );
     }
 
     #[tokio::test]

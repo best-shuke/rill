@@ -286,6 +286,63 @@ impl DnsServer {
     ///
     /// `pub` for the TUN dns-hijack path (`rill-listener`), which answers
     /// locally-decidable queries inline instead of spending a task spawn.
+    /// Answer an A/AAAA query that [`Self::try_answer_local`] sent upstream
+    /// from a cache entry that expired less than an hour ago, with TTL 1,
+    /// and refresh the name in the background — RFC 8767 serve-stale, as
+    /// mihomo's resolver does. The client gets its answer without waiting a
+    /// full upstream round-trip and re-asks a second later, by when the
+    /// refreshed answer is cached. `None` when there is nothing stale to
+    /// serve; the caller then goes upstream through [`Self::handle_query`].
+    ///
+    /// Only meaningful for a query `try_answer_local` classified as
+    /// [`LocalAnswer::Upstream`]: the hosts, IPv6-disable and fake-IP
+    /// decisions are re-checked but every header/question validation is
+    /// assumed done.
+    pub fn try_answer_stale(data: &[u8], resolver: &Arc<Resolver>) -> Option<Vec<u8>> {
+        if data.len() < 12 || u16::from_be_bytes([data[4], data[5]]) != 1 {
+            return None;
+        }
+        let id = u16::from_be_bytes([data[0], data[1]]);
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        let (domain, qtype, question_len) = Self::parse_question(&data[12..]).ok()?;
+        if qtype != 1 && qtype != 28 || resolver.lookup_hosts_all(&domain).is_some() {
+            return None;
+        }
+        let local = if qtype == 1 {
+            resolver.lookup_ipv4_local(&domain)
+        } else {
+            resolver.lookup_ipv6_local(&domain)
+        };
+        let crate::resolver::LocalLookup::Upstream(target) = local else {
+            return None;
+        };
+        let family = if qtype == 1 {
+            crate::cache::QueryFamilies::IPV4
+        } else {
+            crate::cache::QueryFamilies::IPV6
+        };
+        let addr = resolver.stale_family_ip(target, family)?;
+        debug!("DNS query: id={id:#06x} domain={domain} qtype={qtype} answered stale; refreshing");
+        let refresh = Arc::clone(resolver);
+        let name = domain.to_string();
+        tokio::spawn(async move {
+            if qtype == 1 {
+                refresh.lookup_ipv4_result(&name).await;
+            } else {
+                refresh.lookup_ipv6_result(&name).await;
+            }
+        });
+        Some(Self::build_response(
+            id,
+            data,
+            flags,
+            question_len,
+            qtype,
+            addr,
+            1,
+        ))
+    }
+
     pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
         if data.len() < 12 {
             return LocalAnswer::Drop; // handle_query errs — silently dropped
@@ -1041,6 +1098,20 @@ impl BoundDnsServer {
                 // handle_query error path does, minus the task.
                 LocalAnswer::Drop => continue,
                 LocalAnswer::Upstream => {}
+            }
+            let stale = {
+                let resolver_guard = resolver.read();
+                DnsServer::try_answer_stale(&buf[..len], &resolver_guard)
+            };
+            if let Some(response) = stale {
+                match socket.try_send_to(&response, src) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => debug!("DNS send error: {e}"),
+                    Ok(_) => {}
+                }
+                continue;
             }
 
             // Acquire the permit BEFORE copying the payload: under

@@ -264,6 +264,15 @@ const REVERSE_CAP_MULTIPLIER: usize = 4;
 /// stale CDN-shared IPs indefinitely (LRU + this floor still bound growth).
 const REVERSE_TTL_FLOOR: Duration = Duration::from_secs(600);
 
+/// How long past its TTL a positive answer may still be served to a dial
+/// while a background lookup refreshes it ([`DnsCache::get_stale`], RFC 8767
+/// "serve-stale"). mihomo keeps expired entries for the LRU's lifetime and
+/// answers them with TTL 1 while it refetches; an hour bounds how stale an
+/// address can get while still covering the common case — a short-TTL CDN
+/// name revisited minutes after its TTL ran out, which otherwise stalls the
+/// connection on a full upstream round-trip (a DoH one through a proxy).
+pub(crate) const STALE_WINDOW: Duration = Duration::from_secs(3600);
+
 /// Number of LRU shards. Power-of-two so the modulo lowers to a mask. Each
 /// shard owns 1/SHARDS of the total capacity. 16 is enough to flatten the
 /// lock-contention curve under W4 load on a typical 8–16 core host.
@@ -432,13 +441,48 @@ impl DnsCache {
                     v6,
                 });
             }
-            // No family is still fresh — evict on the way out.
-            expired = true;
+            // No family is still fresh. Keep the entry while `get_stale`
+            // may still serve it; evict once it is past that window too.
+            expired = !entry_servable_stale(entry, now);
         }
         if expired {
             cache.pop(domain.as_ref());
         }
         None
+    }
+
+    /// Positive addresses of an entry that is no longer (entirely) fresh but
+    /// expired less than [`STALE_WINDOW`] ago, for the dial path to use
+    /// while it refreshes the name in the background. Every family in
+    /// `families` must have been queried and be within the window, so a
+    /// dual-stack dial never loses a family it would otherwise wait for;
+    /// `None` when that does not hold or no address is left.
+    pub(crate) fn get_stale(&self, domain: &str, families: QueryFamilies) -> Option<IpList> {
+        let domain = normalize_domain(domain);
+        let cache = self.cache[shard_str(&domain)].lock();
+        // `peek`: serving stale must not refresh the entry's LRU position.
+        let entry = cache.peek(domain.as_ref())?;
+        let now = Instant::now();
+        let within = |family: QueryFamilies| {
+            let expire = if family == QueryFamilies::IPV4 {
+                entry.expire_v4
+            } else {
+                entry.expire_v6
+            };
+            entry.queried.contains(family) && expire + STALE_WINDOW > now
+        };
+        for family in [QueryFamilies::IPV4, QueryFamilies::IPV6] {
+            if families.contains(family) && !within(family) {
+                return None;
+            }
+        }
+        let ips: IpList = entry
+            .ips
+            .iter()
+            .copied()
+            .filter(|ip| families.contains_ip(*ip))
+            .collect();
+        (!ips.is_empty()).then_some(ips)
     }
 
     /// Insert a resolved-domain record. Takes the IP list by reference to
@@ -750,47 +794,55 @@ impl DnsCache {
         for shard in &self.cache {
             let mut cache = shard.lock();
             // An entry is live while at least one queried family is still
-            // fresh; once both expire the whole entry is evicted.
+            // fresh; once both expire it is only kept for `get_stale`, and
+            // evicted past that window.
             let expired: Vec<Arc<str>> = cache
                 .iter()
-                .filter(|(_, entry)| {
-                    let v4 = entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
-                    let v6 = entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
-                    !v4 && !v6
-                })
+                .filter(|(_, entry)| !entry_servable_stale(entry, now))
                 .map(|(name, _)| Arc::clone(name))
                 .collect();
             for name in expired {
                 cache.pop(name.as_ref());
             }
-            entries.extend(cache.iter().map(|(name, entry)| {
-                // Display the entry's overall remaining lifetime: the latest
-                // fresh family's expiry, so the panel reflects how long the
-                // entry as a whole stays cache-resolvable.
-                let v4_fresh = entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
-                let v6_fresh = entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
-                let mut latest = now;
-                if v4_fresh && entry.expire_v4 > latest {
-                    latest = entry.expire_v4;
-                }
-                if v6_fresh && entry.expire_v6 > latest {
-                    latest = entry.expire_v6;
-                }
-                // Only show IPs belonging to families that are still fresh —
-                // an expired family's stale IPs must not appear in the panel.
-                let visible_ips: Vec<IpAddr> = entry
-                    .ips
+            let fresh = |entry: &CacheEntry| {
+                (entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now)
+                    || (entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now)
+            };
+            entries.extend(
+                cache
                     .iter()
-                    .copied()
-                    .filter(|ip| if ip.is_ipv4() { v4_fresh } else { v6_fresh })
-                    .collect();
-                DnsCacheSnapshotEntry {
-                    name: name.to_string(),
-                    ips: visible_ips,
-                    ttl: latest.saturating_duration_since(now),
-                    source: entry.source.as_ref().map(std::string::ToString::to_string),
-                }
-            }));
+                    .filter(|(_, entry)| fresh(entry))
+                    .map(|(name, entry)| {
+                        // Display the entry's overall remaining lifetime: the latest
+                        // fresh family's expiry, so the panel reflects how long the
+                        // entry as a whole stays cache-resolvable.
+                        let v4_fresh =
+                            entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 > now;
+                        let v6_fresh =
+                            entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 > now;
+                        let mut latest = now;
+                        if v4_fresh && entry.expire_v4 > latest {
+                            latest = entry.expire_v4;
+                        }
+                        if v6_fresh && entry.expire_v6 > latest {
+                            latest = entry.expire_v6;
+                        }
+                        // Only show IPs belonging to families that are still fresh —
+                        // an expired family's stale IPs must not appear in the panel.
+                        let visible_ips: Vec<IpAddr> = entry
+                            .ips
+                            .iter()
+                            .copied()
+                            .filter(|ip| if ip.is_ipv4() { v4_fresh } else { v6_fresh })
+                            .collect();
+                        DnsCacheSnapshotEntry {
+                            name: name.to_string(),
+                            ips: visible_ips,
+                            ttl: latest.saturating_duration_since(now),
+                            source: entry.source.as_ref().map(std::string::ToString::to_string),
+                        }
+                    }),
+            );
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         entries
@@ -869,6 +921,13 @@ impl DnsCache {
     }
 }
 
+/// Whether some queried family of `entry` expired less than [`STALE_WINDOW`]
+/// ago (or is still fresh), i.e. the entry is still worth keeping.
+fn entry_servable_stale(entry: &CacheEntry, now: Instant) -> bool {
+    (entry.queried.contains(QueryFamilies::IPV4) && entry.expire_v4 + STALE_WINDOW > now)
+        || (entry.queried.contains(QueryFamilies::IPV6) && entry.expire_v6 + STALE_WINDOW > now)
+}
+
 fn normalize_domain(domain: &str) -> Cow<'_, str> {
     if domain.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(domain.to_ascii_lowercase())
@@ -924,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn get_on_expired_entry_returns_none_and_evicts() {
+    fn get_on_expired_entry_returns_none_and_keeps_it_for_stale_serving() {
         let c = DnsCache::new(64);
         c.put("x.example", &[ipv4(1, 1, 1, 1)], Duration::from_millis(1));
         std::thread::sleep(Duration::from_millis(10));
@@ -932,8 +991,50 @@ mod tests {
             c.get("x.example").is_none(),
             "expired entry must not be returned"
         );
-        // Eviction happened as a side-effect of the failed read.
-        assert_eq!(c.forward_len(), 0);
+        // Still inside the stale window: kept for `get_stale`, not evicted.
+        assert_eq!(c.forward_len(), 1);
+        assert_eq!(
+            c.get_stale("x.example", QueryFamilies::IPV4).as_deref(),
+            Some(&[ipv4(1, 1, 1, 1)][..])
+        );
+        // The DNS results panel shows fresh entries only.
+        assert!(c.snapshot().is_empty());
+    }
+
+    #[test]
+    fn get_stale_requires_every_wanted_family() {
+        let c = DnsCache::new(64);
+        c.merge_family(
+            "dual.example",
+            QueryFamilies::IPV4,
+            &[ipv4(192, 0, 2, 1)],
+            Duration::from_millis(1),
+            None,
+            FamilyNeg::None,
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        // A was queried; AAAA never was, so a dual-stack dial must wait for
+        // the real lookup rather than lose its IPv6 candidates.
+        assert!(c.get_stale("dual.example", QueryFamilies::BOTH).is_none());
+        assert!(c.get_stale("dual.example", QueryFamilies::IPV4).is_some());
+        assert!(c
+            .get_stale("missing.example", QueryFamilies::IPV4)
+            .is_none());
+    }
+
+    #[test]
+    fn get_stale_ignores_negative_answers() {
+        let c = DnsCache::new(64);
+        c.merge_family(
+            "nx.example",
+            QueryFamilies::IPV4,
+            &[],
+            Duration::from_millis(1),
+            None,
+            FamilyNeg::NxDomain,
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(c.get_stale("nx.example", QueryFamilies::IPV4).is_none());
     }
 
     #[test]

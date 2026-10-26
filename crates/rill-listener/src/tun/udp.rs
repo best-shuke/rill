@@ -139,6 +139,14 @@ pub(super) async fn run_udp(
                 LocalAnswer::Drop => continue,
                 LocalAnswer::Upstream => {}
             }
+            // An answer that just expired is served at once (TTL 1) while
+            // it refreshes in the background.
+            if let Some(response) = DnsServer::try_answer_stale(&data, &resolver) {
+                if reply_tx.try_send((response, dst, src)).is_err() {
+                    note_hijack_drop(&hijack_dropped);
+                }
+                continue;
+            }
             match Arc::clone(&hijack_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let reply_tx = reply_tx.clone();

@@ -80,12 +80,15 @@ where
         let response = match DnsServer::try_answer_local(&query, &resolver) {
             LocalAnswer::Answer(response) => response,
             LocalAnswer::Drop => return,
-            LocalAnswer::Upstream => match DnsServer::handle_query(&query, &resolver).await {
-                Ok(response) => response,
-                Err(e) => {
-                    debug!("DNS TCP: unanswerable query from {src}: {e}");
-                    return;
-                }
+            LocalAnswer::Upstream => match DnsServer::try_answer_stale(&query, &resolver) {
+                Some(response) => response,
+                None => match DnsServer::handle_query(&query, &resolver).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        debug!("DNS TCP: unanswerable query from {src}: {e}");
+                        return;
+                    }
+                },
             },
         };
         let Ok(response_len) = u16::try_from(response.len()) else {
