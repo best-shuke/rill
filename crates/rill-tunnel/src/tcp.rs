@@ -152,8 +152,17 @@ impl<'a> ConnectionGuard<'a> {
         }
     }
 
+    /// Mark the flow established: its dial succeeded and relaying starts.
+    /// A config reload cancels only flows not yet marked
+    /// ([`crate::Tunnel::reload_routing`]); call this right after a
+    /// successful dial.
+    pub fn mark_established(&self) {
+        self.counters.mark_established();
+    }
+
     /// Run the complete dial/write/relay lifetime until a close request,
-    /// including an API deletion or a cold routing reload.
+    /// including an API deletion or a routing reload that finds the flow
+    /// still dialing.
     /// Dropping the future releases its remote stream; callers then return to
     /// the listener so the owned inbound stream is dropped as well.
     pub async fn run_until_closed<F: std::future::Future>(&self, future: F) -> Option<F::Output> {
@@ -189,7 +198,7 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
-/// A TCP setup's cold-reload generation, captured before reading routing state.
+/// A TCP setup's reload generation, captured before reading routing state.
 /// This is a value, not a held lock, so DNS enrichment may safely await.
 #[must_use]
 pub struct TcpAdmission<'a> {
@@ -199,7 +208,7 @@ pub struct TcpAdmission<'a> {
 
 impl TunnelInner {
     /// Start TCP routing setup. Call before resolving the proxy, then register
-    /// through the returned token so cold reload cannot miss the connection.
+    /// through the returned token so a reload cannot miss the connection.
     pub fn tcp_admission(&self) -> TcpAdmission<'_> {
         TcpAdmission {
             inner: self,
@@ -213,7 +222,7 @@ impl<'a> TcpAdmission<'a> {
     /// API-only metadata or the group chain when the application has no
     /// external controller.
     /// The read lock covers generation validation and registry insertion,
-    /// so a cold reload cannot drain between them and miss this connection.
+    /// so a reload cannot drain between them and miss this connection.
     pub fn track_named(
         self,
         metadata: &Metadata,
@@ -223,7 +232,7 @@ impl<'a> TcpAdmission<'a> {
     ) -> Option<ConnectionGuard<'a>> {
         let generation = self.inner.tcp_generation.read();
         if *generation != self.generation {
-            debug!("TCP routing setup invalidated by cold reload");
+            debug!("TCP routing setup invalidated by a reload");
             return None;
         }
         let guard =
@@ -232,7 +241,7 @@ impl<'a> TcpAdmission<'a> {
         Some(guard)
     }
 
-    /// Register only if no cold reload has crossed this routing decision.
+    /// Register only if no reload has crossed this routing decision.
     /// The read lock covers both validation and insertion: a reload cannot
     /// close the table between these operations and leave an old flow alive.
     /// Headless tracking discards the metadata, rule and chain arguments.
@@ -245,7 +254,7 @@ impl<'a> TcpAdmission<'a> {
     ) -> Option<ConnectionGuard<'a>> {
         let generation = self.inner.tcp_generation.read();
         if *generation != self.generation {
-            debug!("TCP routing setup invalidated by cold reload");
+            debug!("TCP routing setup invalidated by a reload");
             return None;
         }
         let guard = ConnectionGuard::track(&self.inner.stats, metadata, rule, rule_payload, chains);
@@ -449,6 +458,7 @@ async fn route_inbound_tcp_scoped<C>(
             drop(route.take());
             match dial {
                 Ok(mut remote) => {
+                    guard.mark_established();
                     conn_note!(Dial, "Connected in {} ms", started.elapsed().as_millis());
                     let up = Arc::clone(guard.counters());
                     let dn = Arc::clone(guard.counters());
@@ -593,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_reload_rejects_late_registration_and_cancels_earlier_registration() {
+    async fn reload_rejects_late_registration_and_cancels_earlier_registration() {
         let tunnel = test_tunnel();
         let inner = tunnel.inner();
         let late = inner.tcp_admission();
@@ -628,8 +638,53 @@ mod tests {
         assert_eq!(inner.stats.active_connection_count(), 1);
     }
 
+    /// Upstream's `PUT /configs` keeps live connections: a reload cancels
+    /// setups still dialing but leaves established flows relaying, API-
+    /// tracked and headless alike.
     #[tokio::test]
-    async fn headless_connections_skip_api_details_but_cold_reload_cancels_them() {
+    async fn reload_keeps_established_flows_and_cancels_pending_ones() {
+        for headless in [false, true] {
+            let tunnel = test_tunnel();
+            if headless {
+                tunnel.statistics().set_headless();
+            }
+            let inner = tunnel.inner();
+            let track = || {
+                inner
+                    .tcp_admission()
+                    .track(metadata(), "MATCH".into(), "".into(), smallvec![])
+                    .unwrap()
+            };
+            let established = track();
+            established.mark_established();
+            let dialing = track();
+
+            assert_eq!(
+                tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+                1,
+                "headless={headless}"
+            );
+            assert!(dialing.run_until_closed(async { "dial" }).await.is_none());
+            assert_eq!(
+                established.run_until_closed(async { "relay" }).await,
+                Some("relay"),
+                "headless={headless}"
+            );
+            assert_eq!(
+                inner.stats.active_connection_count(),
+                usize::from(!headless)
+            );
+            // An explicit close still reaches the established flow.
+            assert_eq!(inner.stats.close_all_connections_counted(), 1);
+            assert!(established
+                .run_until_closed(async { "relay" })
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_connections_skip_api_details_but_reload_cancels_pending_ones() {
         let tunnel = test_tunnel();
         tunnel.statistics().set_headless();
         let inner = tunnel.inner();
@@ -709,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_registration_cannot_escape_cold_reload() {
+    async fn concurrent_registration_cannot_escape_reload() {
         for headless in [false, true] {
             let tunnel = test_tunnel();
             if headless {

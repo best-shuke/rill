@@ -83,10 +83,10 @@ impl RouteTable {
 /// TCP flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackedTcp {
-    /// Cancel them — the warm reload path ([`Tunnel::update_routing`])
-    /// preserves tracked TCP.
+    /// Cancel them — both reload paths ([`Tunnel::update_routing`],
+    /// [`Tunnel::reload_routing`]) leave established TCP flows running.
     Cancel,
-    /// The caller already did ([`Tunnel::reload_routing`]).
+    /// The caller already cancelled every tracked TCP flow.
     AlreadyCancelled,
 }
 
@@ -126,9 +126,10 @@ pub struct TunnelInner {
     reject: Arc<rill_proxy::RejectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
-    /// Cold-reload admission boundary. TCP setup captures this generation
-    /// before routing, then checks it under a read lock through registration.
-    /// Reload holds the write lock through cancellation and route publication.
+    /// Reload admission boundary. TCP setup captures this generation before
+    /// routing, then checks it under a read lock through registration.
+    /// Reload holds the write lock through cancelling pending setups and
+    /// route publication.
     /// Neither side holds this lock across an await or during relay.
     pub(crate) tcp_generation: RwLock<u64>,
     /// Cached: true if any rule needs the dst_ip resolved (GeoIP / IP-CIDR).
@@ -1027,14 +1028,20 @@ impl Tunnel {
         info!("Routing configuration updated");
     }
 
-    /// Immediately cancel tracked TCP flows and publish new routing state.
+    /// Publish new routing state; no TCP flow dials under the old policy
+    /// once this returns, and established flows keep running.
     ///
-    /// Compilation finishes before admission is locked. Registration either
-    /// precedes cancellation, or detects the changed generation and refuses
-    /// the old routing decision (including a decision delayed by DNS). New
-    /// setup can capture the new generation only after publication completes.
-    /// Returns closure requests for tracked TCP flows, not completed teardowns;
-    /// unregistered setups are rejected later and UDP sessions are unaffected.
+    /// Like upstream's `PUT /configs`, connections already relaying keep the
+    /// adapters they dialed with — a reload no longer drops every flow
+    /// (formerly a cold reload: 10 reloads under 64-way conn churn cost 640
+    /// live connections). Setups still routing or dialing are cancelled
+    /// instead, so the #510 guarantee holds: compilation finishes before
+    /// admission is locked; registration either precedes the cancellation
+    /// of not-yet-established flows, or detects the changed generation and
+    /// refuses the old routing decision (including a decision delayed by
+    /// DNS). New setup can capture the new generation only after publication
+    /// completes. Returns closure requests for those pending flows, not
+    /// completed teardowns; UDP sessions are unaffected.
     ///
     /// `dialer_registry` is the registry generation the build published
     /// `proxies` into; the new route table owns it so the map's `dialer-proxy`
@@ -1049,7 +1056,7 @@ impl Tunnel {
         let route = Arc::new(RouteTable::new(proxies, rules, dialer_registry));
         let mut generation = self.inner.tcp_generation.write();
         *generation = generation.checked_add(1).expect("TCP generation exhausted");
-        let closed = self.inner.stats.close_all_connections_counted();
+        let closed = self.inner.stats.close_pending_connections_counted();
         let old = self.install_routing(route);
         if let Some(mode) = mode {
             self.set_mode(mode);

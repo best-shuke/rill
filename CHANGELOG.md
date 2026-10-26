@@ -15,6 +15,8 @@
   128 KiB, as Go's net package does (4-flow loopback echo 27.8 → 54.6 Gbps;
   mihomo 53.3). Idle connections hold no relay buffers and a far smaller
   task: 10 000 idle connections take 65 MB instead of 194 MB.
+- `PUT /configs` keeps established connections, as mihomo does; only
+  connections still dialing under the old configuration are cancelled.
 
 ## 0.1.2 — 2026-10-25
 

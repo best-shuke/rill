@@ -624,6 +624,7 @@ async fn handle_tproxy_flow(
             drop(route.take());
             match dial {
                 Ok(mut remote) => {
+                    _guard.mark_established();
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());
                     match copy_bidirectional_tracked(

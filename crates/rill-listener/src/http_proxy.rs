@@ -293,6 +293,7 @@ async fn handle_http_inner(
                 drop(route.take());
                 match dial {
                     Ok(mut remote) => {
+                        _guard.mark_established();
                         // Rewrite the request line: remove the absolute URI scheme+host,
                         // keep the path. Rebuild headers without Proxy-* headers while
                         // preserving all other field bytes exactly.

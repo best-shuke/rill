@@ -2,7 +2,7 @@
 /// connection-rate load runs through the proxy, with a datapath-rate
 /// probe before and after, plus a committed-config verification.
 /// Exercises the rebuild/publish chain end-to-end — YAML parse, semantic
-/// proxy/rule rebuild, `reload_routing` route swap + tracked-conn kill —
+/// proxy/rule rebuild, `reload_routing` route swap + pending-setup cancel —
 /// under the mutation lane, against a live mixed listener.  (The A/B
 /// configs differ only in the probe rule, so DNS and health-check
 /// reconcile are no-ops here — those paths are covered by the config-
@@ -19,11 +19,12 @@
 /// and an A commit must echo.  Anything else means a reload was accepted
 /// but never applied.
 ///
-/// Note: `PUT /configs` is a *cold* reload — `reload_routing` closes
-/// every tracked connection by design.  `load_conns_failed` therefore
-/// has a systematic floor of roughly `reloads × concurrency` (each
-/// commit drops the in-flight set); the pre/post probe rates and the
-/// verification PUTs, not that counter, are the parity signal.
+/// Note: `PUT /configs` keeps established flows and cancels only setups
+/// still dialing under the old policy, so `load_conns_failed` counts
+/// the few setups each commit catches mid-dial (the former cold reload
+/// put a floor of roughly `reloads × concurrency` under it); the
+/// pre/post probe rates and the verification PUTs remain the parity
+/// signal.
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,7 +47,7 @@ pub struct ReloadResult {
     /// Echo connections completed while reloads were running.
     pub load_conns_ok: u64,
     /// Echo connections that failed during the reload window — includes
-    /// the intentional cold-reload kills each commit performs.
+    /// setups a commit cancels mid-dial (established flows survive it).
     pub load_conns_failed: u64,
     /// Conns/sec over a short probe BEFORE the first reload — the
     /// baseline the post-reload probe is compared against.
@@ -159,8 +160,8 @@ fn spawn_load(
                     }
                     Ok(Ok(mut stream)) => {
                         // Echo until the conn ages out or drops.  A PUT
-                        // commit kills every live conn by design (cold
-                        // reload), so mid-conn drops land in `failed`.
+                        // commit keeps established conns; any mid-conn
+                        // drop lands in `failed`.
                         let conn_end = (Instant::now() + CONN_LIFETIME).min(until);
                         let echoed = tokio::time::timeout(Duration::from_secs(10), async {
                             let mut rounds = 0u64;

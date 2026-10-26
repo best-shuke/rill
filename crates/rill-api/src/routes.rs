@@ -1481,7 +1481,7 @@ async fn apply_raw_to_tunnel(
 /// rewrite proxies / groups / rules / subscriptions, so for them it merely
 /// re-asserts the running listener's binding for the rebuild and is handed
 /// back on return — but any `tun:` or fake-IP change reaching the reconcile
-/// is covered the same way as on the cold path.
+/// is covered the same way as on the `PUT /configs` path.
 ///
 /// `change` is recorded in the logbook once the candidate is committed.
 async fn commit_raw_candidate(
@@ -3004,9 +3004,10 @@ async fn spawn_tun_from_raw(
 /// after it. Without a spawn it is dropped on return, handing the binding
 /// back to the running listener (or clearing it when none runs).
 ///
-/// `tracked_tcp` says whether the caller's routing publish already
-/// cancelled every tracked TCP flow after the binding was installed
-/// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
+/// `tracked_tcp` says whether the caller already cancelled every tracked
+/// TCP flow after the binding was installed, for
+/// [`outbound_binding_adopted`]'s flush. Neither reload path does any more:
+/// `reload_routing` keeps established flows.
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
     candidate: RawConfig,
@@ -3360,7 +3361,7 @@ async fn put_configs(
     // re-targets, `tun.auto-route: global` must have every socket it
     // creates bound, and the registry may only be touched in the lane. The
     // cost is that a slow ECH lookup now also queues sibling mutations;
-    // this cold path already holds the lane across the rebuild's provider
+    // this full-reload path already holds the lane across the rebuild's provider
     // fetches, which dominate it. (The warm-path writers — subscription
     // add/refresh — keep resolving before the lane: they never change
     // `tun:`, so the running listener's binding already covers them.)
@@ -3639,7 +3640,8 @@ async fn put_configs(
     };
 
     // Prepare routing before the synchronous admission/cancellation boundary.
-    // No old-policy setup can register after this cold reload completes.
+    // No old-policy setup can register after this reload completes; flows
+    // already relaying keep running, as upstream's do.
     let mode = raw_config
         .mode
         .as_deref()
@@ -3662,9 +3664,9 @@ async fn put_configs(
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
     if dropped > 0 {
-        tracing::warn!(
+        tracing::info!(
             connections_dropped = dropped,
-            "connection closure requested for cold reload"
+            "reload cancelled TCP setups still dialing under the old policy"
         );
     }
     // Commit point: install the candidate's provider sets — the rules and
@@ -3684,17 +3686,18 @@ async fn put_configs(
     dropped_providers.record();
 
     let reloaded = reload_succeeded(&raw_config, &forced, dropped);
-    // `reload_routing` above ran after the pre-install and cancelled every
-    // tracked TCP flow; any admitted since dialled under the binding. A TUN
-    // that fails to come up is rolled back and recorded there; the
-    // document is committed, so the PUT succeeds.
+    // `reload_routing` above ran after the pre-install but kept established
+    // flows, which may ride sockets dialled before a binding change — the
+    // flush cancels them if the binding moved. A TUN that fails to come up
+    // is rolled back and recorded there; the document is committed, so the
+    // PUT succeeds.
     let _ = swap_config_and_reconcile_tun(
         &state,
         raw_config,
         dns,
         prior_resolver,
         preinstalled,
-        TrackedTcp::AlreadyCancelled,
+        TrackedTcp::Cancel,
     )
     .await;
     reloaded.record();

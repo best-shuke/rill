@@ -53,7 +53,7 @@ async fn close_stalled_plain_http_response_terminates_sockets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_reload_rejects_plain_http_setup_before_registration() {
+async fn reload_rejects_plain_http_setup_before_registration() {
     use rill_common::{Metadata, Rule, RuleMatchHelper, RuleType, TunnelMode};
     use std::sync::Mutex;
     use tokio::sync::oneshot;

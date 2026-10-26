@@ -9,6 +9,15 @@ See also: roadmap M3 "hot config reload without dropping connections" — this
 M1 spec is the cold-reload endpoint; M3 upgrades it to hot-reload.
 Upstream reference: `hub/server.go::patchConfig`, `component/profile/profile.go`.
 
+Amendment (2026-10, connection-preserving reload): `PUT /configs` no longer
+cancels established TCP flows. Flows already relaying keep the adapters they
+dialed with, as upstream's do; only setups still routing or dialing under the
+old policy are cancelled, so the #510 guarantee below (no dial under the old
+policy once the PUT returns) holds unchanged. Measured with
+`rill-bench --only reload` (10 reloads under 64-way conn churn): 640 load
+connections failed before — every in-flight flow, each reload — against
+mihomo's 180. Listener lifecycle reconciliation remains separate work.
+
 Scope amendment (2026-09-05, [#510](https://github.com/meow-rs/meow-rs/issues/510)):
 retain immediate cold-reload cancellation from #509 and fix the TCP admission
 boundary and routing snapshot publication. The original five-second drain
@@ -19,13 +28,16 @@ The current boundary is the start of TCP routing, after inbound handshake and
 sniffing. Setup captures a generation before reading mode/rules/proxies. It
 registers under a read lock only if that generation is still current. Reload
 builds and compiles the candidate first, then holds the matching write lock to
-advance the generation, cancel tracked TCP flows, and publish rules/proxies
+advance the generation, cancel tracked TCP flows that have not finished
+dialing (since the 2026-10 amendment; established flows keep running), and
+publish rules/proxies
 as one `Arc<RouteTable>` plus the requested mode. No lock spans DNS awaits or
 relay. A DNS-delayed setup is rejected when it returns; cancellation of DNS
 itself and inbound handshakes is not promised. A handshake that reaches routing
 after the boundary uses the new configuration.
 
-`connections_dropped` counts closure requests for registered TCP flows, not
+`connections_dropped` counts closure requests for registered TCP flows still
+dialing, not
 completed socket teardowns or rejected unregistered setups. UDP sessions are
 outside this boundary. Ordinary listener bindings/authentication are not
 rebuilt by PUT. The DNS runtime is republished when its inputs change
@@ -42,9 +54,10 @@ standard part of the Clash/mihomo API surface that dashboard tools (Yacd,
 MetaCubeXD) call after a user edits configuration. Without it, dashboard
 config editors are broken.
 
-The implemented **cold reload** cancels tracked TCP flows and replaces routing
-configuration. Connection-preserving hot reload is M3. Full listener teardown
-from the original M1 design was never implemented.
+The implemented reload replaces routing configuration and keeps established
+TCP flows (see the 2026-10 amendment; the M1 cold reload cancelled every
+tracked flow). Full listener teardown from the original M1 design was never
+implemented.
 
 ## Scope
 
@@ -165,7 +178,7 @@ Authorization: Bearer <secret>
 | 1 | Upstream `payload` field contains raw YAML string (not base64) in some dashboard versions — inconsistent | B | We require base64 in M1 for clean JSON embedding. Clients that send raw YAML get 400 with a helpful message. |
 | 2 | `?force=true` — upstream silently applies broken config; M1 logs errors prominently | B | We log each parse error as `error!` before proceeding under force. Same end result. |
 | 3 | GET /configs — upstream returns full Go struct including runtime state | B | M1 returns `RawConfig` fields only (static config, no runtime state). Runtime state is available via /proxies, /rules, /connections. |
-| 4 | In-flight connections dropped on reload — upstream attempts graceful handover | A | Cold reload is intentional M1 simplification. Documented prominently in response headers and logs. NOT a silent drop. |
+| 4 | In-flight connections dropped on reload — upstream attempts graceful handover | — | Closed by the 2026-10 amendment: established flows survive; only setups still dialing under the old policy are cancelled (logged). |
 
 ## Internal design
 

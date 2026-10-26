@@ -5087,8 +5087,12 @@ async fn delete_all_connections_terminates_both_stream_directions() {
     assert_eq!(state.tunnel.statistics().active_connection_count(), 0);
 }
 
+/// `PUT /configs` keeps established flows, as upstream does (formerly a
+/// cold reload that cut every live connection), while connections opened
+/// afterwards see the reloaded policy.
 #[tokio::test]
-async fn cold_reload_terminates_live_stream_without_drain_delay() {
+async fn reload_keeps_live_stream_and_applies_new_policy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
         ..Default::default()
@@ -5111,12 +5115,20 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
         ),
     )
     .await
-    .expect("cold reload must not wait for live connections to finish")
+    .expect("reload must not wait for live connections to finish")
     .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_socket_closed(&mut client).await;
-    assert_socket_closed(&mut remote).await;
-    task.await.unwrap();
+    assert_eq!(state.tunnel.statistics().active_connection_count(), 1);
+    client.write_all(b"after reload").await.unwrap();
+    let mut buf = [0; 12];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        remote.read_exact(&mut buf),
+    )
+    .await
+    .expect("the established flow must keep relaying after the reload")
+    .unwrap();
+    assert_eq!(&buf, b"after reload");
     let metadata = rill_common::Metadata {
         dst_ip: Some("127.0.0.1".parse().unwrap()),
         dst_port: 12345,
@@ -5132,13 +5144,17 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
         "REJECT",
         "new connections must see the reloaded policy"
     );
+    state.tunnel.statistics().close_all_connections();
+    assert_socket_closed(&mut client).await;
+    assert_socket_closed(&mut remote).await;
+    task.await.unwrap();
 }
 
 /// Force the real routing/DNS await to straddle two completed PUT requests.
 /// Before #510, this flow registers only after close_all and dials DIRECT
 /// using the old IP-CIDR rule, even though the active policy is now REJECT.
 #[tokio::test]
-async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
+async fn reload_rejects_tcp_setup_waiting_for_dns() {
     use base64::Engine as _;
     use hickory_proto::{
         op::Message,
@@ -5272,7 +5288,7 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
         fresh_task.await.unwrap();
     })
     .await
-    .expect("DNS-delayed setup escaped cold reload or admission did not recover");
+    .expect("DNS-delayed setup escaped the reload or admission did not recover");
 }
 
 /// Issue #514: `PUT /configs` must swap the running DNS resolver, not just

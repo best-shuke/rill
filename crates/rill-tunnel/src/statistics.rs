@@ -73,6 +73,10 @@ pub struct ConnCounters {
     pub download: AtomicI,
     // Stored in the existing Arc so cancellation adds no setup allocation.
     closed: AtomicBool,
+    /// Set once the dial succeeded and the flow started relaying. A config
+    /// reload leaves established flows running (as upstream does) and
+    /// cancels only setups still routing or dialing under the old policy.
+    established: AtomicBool,
     close_notify: tokio::sync::Notify,
     /// The connection's notes when the tunnel records them (see
     /// `Tunnel::set_connection_notes`). Kept here, not on `ConnectionInfo`,
@@ -87,6 +91,15 @@ impl ConnCounters {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.close_notify.notify_waiters();
+    }
+
+    /// See [`Self::established`]'s field docs.
+    pub(crate) fn mark_established(&self) {
+        self.established.store(true, Ordering::Release);
+    }
+
+    fn is_established(&self) -> bool {
+        self.established.load(Ordering::Acquire)
     }
 
     pub(crate) async fn closed(&self) {
@@ -541,11 +554,26 @@ impl Statistics {
     /// Request closure of all tracked TCP connections and remove their entries.
     /// Returns the number of closure requests, not completed socket teardowns.
     pub fn close_all_connections_counted(&self) -> usize {
+        self.close_connections_where(|_| true)
+    }
+
+    /// Request closure of the tracked TCP connections that have not started
+    /// relaying yet — setups still dialing — and remove their entries.
+    /// Established flows keep running. Returns the number of closure
+    /// requests.
+    pub fn close_pending_connections_counted(&self) -> usize {
+        self.close_connections_where(|counters| !counters.is_established())
+    }
+
+    fn close_connections_where(&self, doomed: impl Fn(&ConnCounters) -> bool) -> usize {
         let mut closed = 0;
         // Signal and remove under the same shard lock. A separate iteration
         // followed by clear could erase newly inserted, unsignalled entries.
         let mut noted = Vec::new();
         self.connections.retain(|_, info| {
+            if !doomed(&info.counters) {
+                return true;
+            }
             info.counters.close();
             closed += 1;
             if info.counters.notes.is_some() {
@@ -558,6 +586,9 @@ impl Statistics {
         }
         if let Some(connections) = self.headless_connections.get() {
             connections.retain(|_, counters| {
+                if !doomed(counters) {
+                    return true;
+                }
                 counters.close();
                 closed += 1;
                 false
