@@ -131,6 +131,10 @@ struct Args {
     #[arg(long, default_value = "1500")]
     tun_mtu: u16,
 
+    /// rill TUN stacks to run (comma-separated)
+    #[arg(long, default_value = "lwip", value_delimiter = ',', value_parser = ["lwip", "system", "mixed", "gvisor"])]
+    tun_rill_stacks: Vec<String>,
+
     /// mihomo TUN stacks the `tun` workload runs against --go-binary
     /// (comma-separated)
     #[arg(long, default_value = "system,gvisor", value_delimiter = ',')]

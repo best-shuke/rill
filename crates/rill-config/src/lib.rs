@@ -281,6 +281,7 @@ pub struct NamedListener {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
     pub enable: bool,
+    pub stack: TunStack,
     /// Device name; `None` = platform default.
     pub device: Option<String>,
     pub mtu: u16,
@@ -322,6 +323,34 @@ pub struct TunConfig {
     pub max_connections: usize,
 }
 
+/// TUN TCP backend. `system` and `mixed` both retain lwIP for non-TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunStack {
+    #[default]
+    Lwip,
+    System,
+}
+
+impl TunStack {
+    /// Read mihomo's `tun.stack`: `system` / `mixed` select kernel TCP,
+    /// `lwip` / `gvisor` or no value the userspace stack. Anything else
+    /// warns and falls back to lwIP. The raw value stays untouched in
+    /// [`raw::RawTun`], so a saved config keeps the user's spelling.
+    fn from_raw(value: Option<&serde_yaml::Value>) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
+        match value.as_str() {
+            Some("system" | "mixed") => Self::System,
+            Some("lwip" | "gvisor") => Self::Lwip,
+            _ => {
+                warn!("tun.stack: unknown value {value:?}; using lwip");
+                Self::Lwip
+            }
+        }
+    }
+}
+
 /// Scope of the routes `tun.auto-route` installs (#375).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunRouteMode {
@@ -340,6 +369,7 @@ impl Default for TunConfig {
     fn default() -> Self {
         Self {
             enable: false,
+            stack: TunStack::default(),
             device: None,
             // mihomo's defaults. The device subnet sits inside the default
             // fake-IP range, whose pool never allocates its first four
@@ -537,6 +567,7 @@ pub fn parse_tun_config(
 
     Ok(TunConfig {
         enable: r.enable,
+        stack: TunStack::from_raw(r.stack.as_ref()),
         device: r.device.clone().filter(|s| !s.is_empty()),
         mtu,
         inet4_address,

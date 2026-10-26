@@ -52,6 +52,7 @@ pub fn tun_config_to_listener_config(
     rill_listener::TunListenerConfig {
         device: tun.device.clone(),
         mtu: tun.mtu,
+        system_stack: tun.stack == rill_config::TunStack::System,
         inet4_address: tun.inet4_address,
         inet6_address: tun.inet6_address,
         auto_route: tun.auto_route,

@@ -78,7 +78,7 @@ const PARALLEL_SIZE: usize = 16 * 1024 * 1024;
 
 /// One proxy configuration under test.
 enum Flavor {
-    Rill,
+    Rill { stack: String },
     Mihomo { stack: String },
 }
 
@@ -129,11 +129,17 @@ pub async fn run_tun_test(args: &Args) -> anyhow::Result<()> {
     ensure_private_netns()?;
     run_ip(&["link", "set", "lo", "up"])?;
 
-    let mut targets = vec![TunTarget {
-        name: "rill (lwip)".to_string(),
-        binary: args.rust_binary.clone(),
-        flavor: Flavor::Rill,
-    }];
+    let mut targets: Vec<_> = args
+        .tun_rill_stacks
+        .iter()
+        .map(|stack| TunTarget {
+            name: format!("rill ({stack})"),
+            binary: args.rust_binary.clone(),
+            flavor: Flavor::Rill {
+                stack: stack.clone(),
+            },
+        })
+        .collect();
     if let Some(go) = &args.go_binary {
         for stack in &args.tun_mihomo_stacks {
             targets.push(TunTarget {
@@ -307,12 +313,12 @@ async fn bench_tun_target(
 }
 
 /// The YAML both binaries share except for the `tun:` block: rill takes
-/// `inet4-address` as a string and ignores `stack`; mihomo wants a list
+/// `inet4-address` as a string; mihomo wants a list
 /// and needs interface auto-detection off (no physical interface here).
 fn config_yaml(flavor: &Flavor, mtu: u16, upstream: SocketAddr) -> String {
     let tun = match flavor {
-        Flavor::Rill => format!(
-            "tun:\n  enable: true\n  device: {DEVICE}\n  mtu: {mtu}\n  \
+        Flavor::Rill { stack } => format!(
+            "tun:\n  enable: true\n  stack: {stack}\n  device: {DEVICE}\n  mtu: {mtu}\n  \
              inet4-address: {TUN_ADDR}\n  auto-route: false\n"
         ),
         Flavor::Mihomo { stack } => format!(
@@ -668,6 +674,9 @@ fn render_markdown(report: &TunReport) -> Result<String, std::fmt::Error> {
     row(&mut md, targets, "Proxy CPU per connection", &|t| {
         format!("{:.0} µs", t.connrate_cpu_us_per_conn)
     })?;
+    row(&mut md, targets, "TUN tx_dropped", &|t| {
+        t.tun_tx_dropped.to_string()
+    })?;
     Ok(md)
 }
 
@@ -703,7 +712,13 @@ mod tests {
     #[test]
     fn configs_differ_only_where_the_binaries_do() {
         let upstream: SocketAddr = "127.0.0.1:5300".parse().unwrap();
-        let rill = config_yaml(&Flavor::Rill, 9000, upstream);
+        let rill = config_yaml(
+            &Flavor::Rill {
+                stack: "lwip".to_string(),
+            },
+            9000,
+            upstream,
+        );
         let mihomo = config_yaml(
             &Flavor::Mihomo {
                 stack: "system".to_string(),
@@ -715,6 +730,15 @@ mod tests {
         assert!(rill.contains(&format!("inet4-address: {TUN_ADDR}\n")));
         assert!(mihomo.contains(&format!("inet4-address:\n    - {TUN_ADDR}\n")));
         assert!(mihomo.contains("stack: system\n"));
+        assert!(rill.contains("stack: lwip\n"));
+        let system = config_yaml(
+            &Flavor::Rill {
+                stack: "system".to_string(),
+            },
+            9000,
+            upstream,
+        );
+        assert!(system.contains("stack: system\n"));
         for cfg in [&rill, &mihomo] {
             assert!(cfg.contains("mtu: 9000\n"));
             assert!(cfg.contains("auto-route: false\n"));

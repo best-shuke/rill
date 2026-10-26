@@ -10,7 +10,7 @@
 #   GO_BINARY=/path/to/mihomo bash bench-tun.sh [extra rill-bench args]
 #
 # Extra args go to rill-bench, e.g. `--tun-mtu 9000` or
-# `--tun-mihomo-stacks system`.
+# `--tun-mihomo-stacks system` or `--tun-rill-stacks lwip,system`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +26,11 @@ DURATION="${DURATION:-10}"
 
 echo "=== Building rill (release) ==="
 cargo build --release -p rill-app -p rill-bench
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+TUN_BIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rill-bench-tun.XXXXXX")
+trap 'rm -rf "$TUN_BIN_DIR"' EXIT
+# A shared target directory can be overwritten by another build mid-run.
+cp "$BUILD_TARGET_DIR/release/rill" "$BUILD_TARGET_DIR/release/rill-bench" "$TUN_BIN_DIR/"
 
 GO_ARGS=()
 MIHOMO_VERSION="${MIHOMO_VERSION:-}"
@@ -46,9 +51,9 @@ OUTPUT=target/bench/tun-results.json
 echo ""
 echo "=== Running TUN benchmark (sudo, private network namespace) ==="
 sudo MIHOMO_VERSION="$MIHOMO_VERSION" unshare --net -- \
-    ./target/release/rill-bench \
+    "$TUN_BIN_DIR/rill-bench" \
     --only tun \
-    --rust-binary ./target/release/rill \
+    --rust-binary "$TUN_BIN_DIR/rill" \
     "${GO_ARGS[@]}" \
     --duration "$DURATION" \
     --output "$OUTPUT" \

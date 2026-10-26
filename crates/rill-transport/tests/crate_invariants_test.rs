@@ -549,6 +549,19 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         1,
         "routing-mark dial; applies rill_common::apply_outbound_interface itself",
     ),
+    // TUN `stack: system`: listeners on the device address, not outbound.
+    (
+        "crates/rill-listener/src/tun/system/mod.rs",
+        "TcpSocket::new_v4(",
+        1,
+        "kernel-TCP TUN listener bound to the device (SO_BINDTODEVICE); inbound",
+    ),
+    (
+        "crates/rill-listener/src/tun/system/mod.rs",
+        "TcpSocket::new_v6(",
+        1,
+        "kernel-TCP TUN listener bound to the device (SO_BINDTODEVICE); inbound",
+    ),
     // Vendored anytls: its own protect helper and its server side.
     (
         "crates/rill-anytls/src/util/socket_protect.rs",

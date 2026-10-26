@@ -624,6 +624,7 @@ tun:
         .expect("config must load")
         .tun;
     assert!(tun.enable && tun.auto_route);
+    assert_eq!(tun.stack, rill_config::TunStack::System);
     assert_eq!(tun.route_mode, rill_config::TunRouteMode::Global);
     assert_eq!(tun.device.as_deref(), Some("utun"));
     assert!(tun.dns_hijack && tun.dns_hijack_tcp);
@@ -638,4 +639,51 @@ tun:
     );
     assert_eq!(tun.mtu, 9000);
     assert_eq!(tun.outbound_interface, None, "auto-detected and followed");
+}
+
+#[tokio::test]
+async fn stack_aliases_defaults_and_unknown_values() {
+    use rill_config::TunStack;
+
+    for (value, expected) in [
+        ("system", TunStack::System),
+        ("mixed", TunStack::System),
+        ("gvisor", TunStack::Lwip),
+        ("lwip", TunStack::Lwip),
+        ("future-stack", TunStack::Lwip),
+        ("42", TunStack::Lwip),
+        ("[system]", TunStack::Lwip),
+        ("null", TunStack::Lwip),
+    ] {
+        let yaml = format!("tun:\n  enable: true\n  stack: {value}\n");
+        let cfg = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(cfg.tun.stack, expected, "{value}");
+    }
+    let default = load_config_from_str("tun:\n  enable: true\n")
+        .await
+        .unwrap()
+        .tun;
+    assert_eq!(default.stack, TunStack::Lwip);
+    let system = load_config_from_str("tun:\n  enable: true\n  stack: system\n")
+        .await
+        .unwrap()
+        .tun;
+    let mixed = load_config_from_str("tun:\n  enable: true\n  stack: mixed\n")
+        .await
+        .unwrap()
+        .tun;
+    assert_eq!(system, mixed);
+    assert_ne!(default, system, "stack changes must restart the listener");
+}
+
+/// A saved config keeps the user's spelling: `mixed` / `gvisor` are not
+/// rewritten to the backend rill picked for them.
+#[test]
+fn stack_round_trips_as_written() {
+    for value in ["mixed", "gvisor", "future-stack"] {
+        let yaml = format!("tun:\n  enable: true\n  stack: {value}\n");
+        let raw: rill_config::raw::RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        let saved = serde_yaml::to_string(&raw).unwrap();
+        assert!(saved.contains(&format!("stack: {value}")), "{saved}");
+    }
 }

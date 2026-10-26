@@ -1,15 +1,14 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-10-19. Tracks the `listener-tun` feature (issue
+Last updated: 2026-10-26. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
 inbound works on Linux and macOS.
 
 The TUN inbound creates an L3 network device (`wintun` on Windows, `tun` on
-Linux, `utun` on macOS), terminates the raw IP packets in a userspace TCP/IP
-stack ([lwIP](https://github.com/madeye/lwip), via the in-tree tun2socks
-bindings), and dispatches the
+Linux, `utun` on macOS), terminates raw IP packets using lwIP by default
+or Linux kernel TCP with `stack: system` / `mixed`, and dispatches the
 resulting TCP/UDP flows through rill's normal routing engine — rules, proxy
 groups, statistics, and the REST API all behave exactly as they do for the
 other inbounds.
@@ -464,9 +463,52 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping rill: 
 | `strict-route` | `false` | Global routing without IPv6: make global IPv6 unreachable (Linux), so it cannot bypass the device. |
 | `route-address` | all | Global routing: route only these prefixes into the device. CIDR or list; also `inet4-route-address` / `inet6-route-address`. |
 | `route-exclude-address` | none | Global routing: keep these prefixes on the physical default route. CIDR or list; also `inet4-route-exclude-address` / `inet6-route-exclude-address`. |
-| `stack` | — | Accepted for mihomo compatibility; rill has one userspace stack (lwIP). |
+| `stack` | `lwip` | `lwip` / `gvisor` use lwIP. On Linux, `system` / `mixed` use kernel TCP and lwIP for UDP/ICMP. Other platforms warn and fall back to lwIP; unknown values warn and select lwIP. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
+
+With `stack: system` or `mixed` on Linux, a listener bound to the device's
+address terminates TCP in the host kernel. Packet NAT uses a second usable
+address in each device prefix (normally address + 1), so each prefix needs
+two usable hosts; `/32` IPv4 and `/128` IPv6 cannot start this backend.
+Keep the peer address reserved and its connected route through the TUN,
+including when setting route exclusions. Listener sockets bind to the TUN
+interface; outbound dials retain the usual physical-interface binding.
+The device's strict IPv4 reverse-path filter is loosened while this backend
+runs, then restored. TCP MSS negotiation follows the device MTU.
+
+Both names currently mean mihomo's **mixed** behavior: only TCP bypasses
+lwIP, while UDP, UDP DNS hijacking and ICMP retain the existing path. TCP
+DNS hijacking, fake-IP rewriting, the 200 ms sniff window and connection
+limits share the lwIP accept path. IPv4 TCP fragments, IPv6 TCP with fragment, routing or AH headers,
+and IPv6 jumbo packets are dropped safely by the kernel backend;
+IPv6 hop-by-hop and destination options are supported. Plain IPv4/IPv6
+UDP and ICMP packets continue through lwIP.
+
+The NAT table has 64,512 ports shared across IPv4/IPv6, including incomplete
+handshakes (30 s timeout) and closed flows. A closed flow keeps its port for
+60 s when the listener side closed first (its socket sits in TIME_WAIT), and
+for 5 s when the client's FIN or a RST came first (the common case, which
+leaves no TIME_WAIT behind). Accepted flows keep their entries until their
+handler ends. At exhaustion a new SYN takes over the passively closed port
+due to expire first; with none left it is dropped until ports expire. An
+active connection, or a port guarding a TIME_WAIT socket, is never evicted.
+`max-connections` still bounds routing tasks after sniffing, and the port
+limit bounds flows waiting in the sniff window or for a permit.
+
+On Linux the device is created with virtio-net offload (TSO/GSO, logged as
+`TUN offload enabled`) and a 4096-packet `txqueuelen`; a kernel without
+`IFF_VNET_HDR` support falls back to one read/write per packet. The kernel
+then hands rill whole TCP bursts of up to 64 KiB per read. lwIP gets them
+split into MTU-sized packets, and its own output is coalesced back before
+each write. The system backend NATs the burst as it is — headers only,
+with the pseudo-header checksum the kernel completes — and writes it
+straight back: one read and one write per burst, no split, copy or
+checksum pass (13 Gbps single-flow loopback against lwIP's 3.3 Gbps on a
+4-core Neoverse-N1, `bench-tun.sh`).
+
+The functional/benchmark harness can select several rill backends with
+`bash bench-tun.sh --tun-rill-stacks lwip,system`; the default stays `lwip`.
 
 mihomo fields rill does not implement (`mtu-v6`,
 `endpoint-independent-nat`, `auto-redirect`, UID filters, …) are accepted

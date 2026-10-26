@@ -22,6 +22,11 @@
   allocates per packet or scans a first-fit heap: lwIP TUN throughput is up
   about 1.5× at 30% less CPU per GB. On glibc, rill caps malloc arenas at
   one (`MALLOC_ARENA_MAX` overrides), keeping TUN peak RSS 11 MB lower.
+- `tun.stack: system` / `mixed` now terminate TUN TCP in the host kernel on
+  Linux instead of lwIP (UDP and ICMP stay on lwIP), NATing whole GSO
+  bursts in place: 14 Gbps single-flow and 3 s CPU per GB, against lwIP's
+  3.6 Gbps / 6.2 s and mihomo-system's 2.0 Gbps / 6.8 s. `stack` used to be
+  ignored; `lwip`, `gvisor` or no value keep lwIP. See [TUN](docs/tun.md).
 
 ## 0.1.2 — 2026-10-25
 

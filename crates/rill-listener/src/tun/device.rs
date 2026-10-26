@@ -19,6 +19,7 @@ use lwip::PACKET_HEADROOM;
 use lwip::{IngressBuffers, NetStack};
 use tokio::task::JoinHandle;
 
+use super::system::{Dispatch, System, TcpChecksum};
 use super::TunDevice;
 
 /// One IP packet. UDP/TCP over IPv4/v6 tops out below 64 KiB regardless of
@@ -71,6 +72,7 @@ struct PumpEnd<D, H> {
 pub(super) fn spawn_pumps(
     device: Arc<TunDevice>,
     stack: NetStack,
+    system: Option<Arc<System>>,
 ) -> (JoinHandle<io::Result<()>>, JoinHandle<io::Result<()>>) {
     let buffers = stack.ingress_buffers();
     let (stack_sink, stack_stream) = stack.split();
@@ -80,6 +82,7 @@ pub(super) fn spawn_pumps(
             half: stack_sink,
         },
         buffers,
+        system,
     ));
     let outbound = tokio::spawn(stack_to_device(PumpEnd {
         device,
@@ -95,24 +98,43 @@ pub(super) fn spawn_pumps(
 /// `end` is only ever borrowed: moving its fields out into locals would
 /// give them the locals' drop order (reverse of declaration) and undo
 /// [`PumpEnd`]'s ordering.
+///
+/// With the kernel-TCP `system` stack, TCP packets are NATed and written
+/// straight back into the device ([`System::dispatch`]); only the rest
+/// reaches lwIP.
 async fn device_to_stack(
     mut end: PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
     buffers: IngressBuffers,
+    system: Option<Arc<System>>,
 ) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if end.device.device.tcp_gso() {
-        return device_to_stack_batched(&mut end, &buffers).await;
+        return match system {
+            Some(system) => device_to_stack_system_offload(&mut end, &buffers, &system).await,
+            None => device_to_stack_batched(&mut end, &buffers).await,
+        };
     }
     let mut buf = vec![0u8; PACKET_BUF];
     loop {
         let n = end.device.device.recv(&mut buf).await?;
-        packet_from_device(&mut end, &buffers, &buf[..n]).await?;
+        let packet = &mut buf[..n];
+        if let Some(system) = &system {
+            match system.dispatch(packet, TcpChecksum::Full) {
+                Dispatch::ToStack => {}
+                Dispatch::ToDevice => {
+                    packet_to_device(&end.device, packet).await?;
+                    continue;
+                }
+                Dispatch::Drop => continue,
+            }
+        }
+        packet_from_device(&mut end, &buffers, packet).await?;
     }
 }
 
-/// The single lwIP ingress point, shared by plain and GSO reads. The copy
-/// lands in a recycled buffer the core hands back once the frame is in a
-/// pbuf.
+/// The single lwIP ingress point, shared by plain and GSO reads (the
+/// system TCP stack dispatches before it). The copy lands in a recycled
+/// buffer the core hands back once the frame is in a pbuf.
 async fn packet_from_device(
     end: &mut PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
     buffers: &IngressBuffers,
@@ -150,6 +172,123 @@ async fn device_to_stack_batched(
             packet_from_device(end, buffers, &packet[..size]).await?;
         }
     }
+}
+
+/// Offload device under the `system` stack: NAT each frame as read — a
+/// whole GSO super-packet at once — and write it back under its own
+/// virtio-net header. A 64 KiB TCP burst then costs one read and one write,
+/// with no split, copy or checksum pass (the kernel segments or delivers
+/// the frame itself), where `recv_multiple` + `send_multiple` would split
+/// it into ~45 checksummed packets only to coalesce them again. Frames for
+/// lwIP are split the way `recv_multiple` would.
+#[cfg(target_os = "linux")]
+async fn device_to_stack_system_offload(
+    end: &mut PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
+    buffers: &IngressBuffers,
+    system: &System,
+) -> io::Result<()> {
+    use tun_rs::{VirtioNetHdr, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+
+    let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN + PACKET_BUF];
+    let mtu = end.device.device.mtu()? as usize;
+    let mut packets = vec![vec![0; mtu]; IDEAL_BATCH_SIZE];
+    let mut sizes = vec![0; IDEAL_BATCH_SIZE];
+    loop {
+        let len = end.device.device.recv(&mut frame).await?;
+        if len <= VIRTIO_NET_HDR_LEN {
+            continue;
+        }
+        let hdr = VirtioNetHdr::decode(&frame[..VIRTIO_NET_HDR_LEN])?;
+        let csum = if hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
+            TcpChecksum::Partial
+        } else {
+            TcpChecksum::Full
+        };
+        match system.dispatch(&mut frame[VIRTIO_NET_HDR_LEN..len], csum) {
+            Dispatch::ToStack => {}
+            Dispatch::ToDevice => {
+                packet_to_device(&end.device, &frame[..len]).await?;
+                continue;
+            }
+            Dispatch::Drop => continue,
+        }
+        let packet = &mut frame[VIRTIO_NET_HDR_LEN..len];
+        if hdr.gso_type == VIRTIO_NET_HDR_GSO_NONE {
+            if csum == TcpChecksum::Partial {
+                complete_partial_checksum(packet, hdr)?;
+            }
+            packet_from_device(end, buffers, packet).await?;
+            continue;
+        }
+        let n = split_gso_frame(hdr, packet, &mut packets, &mut sizes)?;
+        for (packet, &size) in packets[..n].iter().zip(&sizes[..n]) {
+            packet_from_device(end, buffers, &packet[..size]).await?;
+        }
+    }
+}
+
+/// virtio-net header values tun-rs does not re-export.
+#[cfg(target_os = "linux")]
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+#[cfg(target_os = "linux")]
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+
+/// Finish a CHECKSUM_PARTIAL frame for lwIP: the field at `csum_start +
+/// csum_offset` holds the pseudo-header sum; add the transport bytes.
+#[cfg(target_os = "linux")]
+fn complete_partial_checksum(packet: &mut [u8], hdr: tun_rs::VirtioNetHdr) -> io::Result<()> {
+    let start = usize::from(hdr.csum_start);
+    let at = start + usize::from(hdr.csum_offset);
+    if at + 2 > packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checksum field exceeds packet length",
+        ));
+    }
+    let initial = u16::from_be_bytes([packet[at], packet[at + 1]]);
+    packet[at..at + 2].fill(0);
+    let sum = tun_rs::checksum(&packet[start..], u64::from(initial));
+    packet[at..at + 2].copy_from_slice(&(!sum).to_be_bytes());
+    Ok(())
+}
+
+/// Split a GSO super-packet into MTU-sized packets, as tun-rs's own
+/// `recv_multiple` does — including not trusting `hdr_len` from the kernel.
+#[cfg(target_os = "linux")]
+fn split_gso_frame(
+    mut hdr: tun_rs::VirtioNetHdr,
+    packet: &mut [u8],
+    packets: &mut [Vec<u8>],
+    sizes: &mut [usize],
+) -> io::Result<usize> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+    let is_v6 = match packet.first().map(|b| b >> 4) {
+        Some(4) => false,
+        Some(6) => true,
+        _ => return Err(invalid("GSO frame is not IPv4/IPv6")),
+    };
+    let start = usize::from(hdr.csum_start);
+    let transport_len = if hdr.gso_type == tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4 {
+        8
+    } else {
+        let at = start + 12;
+        let tcp_len = usize::from(
+            *packet
+                .get(at)
+                .ok_or_else(|| invalid("GSO frame too short"))?
+                >> 4,
+        ) * 4;
+        if !(20..=60).contains(&tcp_len) {
+            return Err(invalid("GSO frame has an invalid TCP header length"));
+        }
+        tcp_len
+    };
+    hdr.hdr_len = u16::try_from(start + transport_len)
+        .map_err(|_| invalid("GSO frame header length overflow"))?;
+    if packet.len() < usize::from(hdr.hdr_len) {
+        return Err(invalid("GSO frame shorter than its headers"));
+    }
+    tun_rs::gso_split(packet, hdr, packets, sizes, 0, is_v6)
 }
 
 /// stack → device. Borrows `end` for the same reason as [`device_to_stack`].

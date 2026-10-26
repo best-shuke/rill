@@ -161,6 +161,7 @@ mod tests {
             super::super::TunListenerConfig {
                 device: None,
                 mtu: 1500,
+                system_stack: false,
                 inet4_address: "172.19.0.1/30".parse().unwrap(),
                 inet6_address: None,
                 auto_route: true,

@@ -7,6 +7,8 @@
 //! terminates them and hands us ordinary `AsyncRead + AsyncWrite` streams
 //! (TCP) and a packet-level UDP socket, which are dispatched into the
 //! tunnel exactly like every other inbound.
+//! Linux also supports kernel TCP termination (`stack: system` / `mixed`)
+//! through the `system` module; non-TCP packets continue through lwIP.
 //!
 //! lwIP's accept hook runs only after the TCP handshake, so a SYN-only
 //! packet never becomes a `TcpStream`. PCB / window / heap caps live in
@@ -65,6 +67,7 @@ mod dns;
 mod local_dns;
 mod outbound_binding;
 mod route;
+mod system;
 mod udp;
 #[cfg(target_os = "windows")]
 mod windows_device;
@@ -79,7 +82,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rill_common::{ConnType, Metadata, Network, ProxyConn};
 use rill_tunnel::Tunnel;
@@ -210,6 +212,8 @@ pub struct TunListenerConfig {
     pub device: Option<String>,
     /// Device MTU. The config layer enforces ≥ 1280 (RFC 8200 §5).
     pub mtu: u16,
+    /// Use Linux kernel TCP termination (`system` / `mixed`).
+    pub system_stack: bool,
     /// Address + prefix assigned to the device.
     pub inet4_address: Ipv4Net,
     /// IPv6 address + prefix assigned to the device; `None` = IPv4-only.
@@ -360,6 +364,10 @@ struct TunDevice {
     /// along with the binding.
     #[allow(dead_code)]
     rp_guard: parking_lot::Mutex<Option<route::RpFilterGuard>>,
+    // Restore the system stack's device filter before destroying the
+    // adapter and before core_done permits reuse of the interface name.
+    #[cfg(target_os = "linux")]
+    _system_rp_guard: Option<route::RpFilterGuard>,
     pub(super) device: tun_rs::AsyncDevice,
 }
 
@@ -753,6 +761,12 @@ impl TunListener {
             strict_guard,
             iface_guard: parking_lot::Mutex::new(iface_guard),
             rp_guard: parking_lot::Mutex::new(rp_guard),
+            #[cfg(target_os = "linux")]
+            _system_rp_guard: if cfg.system_stack {
+                route::RpFilterGuard::loosen(&dev_name)
+            } else {
+                None
+            },
             device,
         });
 
@@ -877,6 +891,16 @@ impl TunListener {
             v4: cfg.inet4_address,
             v6: cfg.inet6_address,
         };
+        // Kernel TCP stack: use the addresses actually assigned after retries.
+        let system = system::System::new(
+            cfg.system_stack,
+            Ipv4Net::new_assert(used_addr, prefix),
+            used_addr6
+                .zip(cfg.inet6_address)
+                .map(|(addr, net)| Ipv6Net::new_assert(addr, net.prefix_len())),
+            &dev_name,
+        )
+        .await?;
         // Nothing past here fails: the listener is up, and its binding is
         // the running one.
         if let Some(binding) = device.iface_guard.lock().as_ref() {
@@ -892,7 +916,7 @@ impl TunListener {
                 cfg.route_exclude_address.clone(),
             ));
         }
-        let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
+        let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack, system.clone());
         tasks.push(&pump_in);
         tasks.push(&pump_out);
         // Live UDP flow-table occupancy, readable via `TunReady::Ready` →
@@ -912,7 +936,7 @@ impl TunListener {
         let max_conn = cfg.max_connections;
         info!(
             "TUN listener '{}' started on device '{dev_name}' ({}/{}{}, mtu {}, auto-route: {}, \
-             dns-hijack: {}, max-connections: {}, stack: lwip, total startup {total_ms:.0}ms)",
+             dns-hijack: {}, max-connections: {}, stack: {}, total startup {total_ms:.0}ms)",
             self.name,
             used_addr,
             prefix,
@@ -928,6 +952,7 @@ impl TunListener {
             } else {
                 max_conn.to_string()
             },
+            if system.is_some() { "system" } else { "lwip" },
         );
 
         // Signal readiness: device, stack, and child tasks are all up.
@@ -950,13 +975,18 @@ impl TunListener {
 
         let result = loop {
             tokio::select! {
-                accepted = tcp_listener.next() => match accepted {
-                    Some((stream, src, dst)) => {
+                accepted = system::accept_tcp(&mut tcp_listener, system.as_deref()) => match accepted {
+                    Ok((stream, src, dst)) => {
                         // `dns-hijack: tcp://…:53`, ahead of the loop guard
                         // as on the UDP path: DNS aimed at the device's own
                         // address is answered too.
                         if dns_hijack_tcp && dst.port() == 53 {
-                            tasks.spawn(rill_dns::tcp::serve(stream, self.tunnel.resolver(), src));
+                            let (stream, lease) = stream.into_connection(Vec::new());
+                            let resolver = self.tunnel.resolver();
+                            tasks.spawn(async move {
+                                let _lease = lease;
+                                rill_dns::tcp::serve(stream, resolver, src).await;
+                            });
                             continue;
                         }
                         // Same loop guard as the UDP path: a dial to the
@@ -971,21 +1001,15 @@ impl TunListener {
                         let sem = conn_limit.clone();
                         let warned = Arc::clone(&warned_saturated);
                         tasks.spawn(async move {
-                            // lwIP only delivers this stream after the
-                            // handshake. Sniff the client's first bytes for
+                            // Both stacks accept after the handshake.
+                            // Sniff the client's first bytes for
                             // up to TUN_SNIFF_WINDOW; a close/reset inside
                             // the window drops the flow, silence dials it
                             // with an empty prefix (server-first, #695).
                             let mut stream = stream;
-                            let prefix = match sniff_first_payload(&mut stream).await {
+                            let prefix = match stream.sniff().await {
                                 Ok(p) => {
-                                    if p.is_empty() {
-                                        debug!(
-                                            "tun TCP: {src} -> {dst} silent for {}ms, \
-                                             dialing without prefix",
-                                            TUN_SNIFF_WINDOW.as_millis()
-                                        );
-                                    }
+                                    debug!("tun TCP: {src} -> {dst} ready after sniff window");
                                     p
                                 }
                                 Err(e) => {
@@ -1002,7 +1026,8 @@ impl TunListener {
                             // including an idle server-first one — holds its
                             // slot for its lifetime, exactly as on the other
                             // inbounds. Flows queued here at saturation are
-                            // bounded by lwIP's MEMP_NUM_TCP_PCB.
+                            // bounded by lwIP's PCB cap or the system NAT
+                            // port table.
                             let permit = if let Some(sem) = sem {
                                 if sem.available_permits() == 0
                                     && !warned.swap(true, Ordering::Relaxed)
@@ -1025,10 +1050,12 @@ impl TunListener {
                                 None
                             };
                             let _permit = permit;
-                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
+                            let (stream, lease) = stream.into_connection(prefix);
+                            let _lease = lease;
+                            handle_tcp_flow(tunnel, stream, src, dst, &name).await;
                         });
                     }
-                    None => break Err("netstack TCP listener closed".into()),
+                    Err(e) => break Err(e.into()),
                 },
                 joined = &mut pump_in => {
                     break Err(pump_error("device→stack", joined).into());
@@ -1307,8 +1334,7 @@ where
 
 async fn handle_tcp_flow(
     tunnel: Tunnel,
-    tcp: lwip::TcpStream,
-    prefix: Vec<u8>,
+    tcp: Box<dyn ProxyConn>,
     src: SocketAddr, // client behind the tun
     dst: SocketAddr, // original destination
     in_name: &str,
@@ -1324,24 +1350,9 @@ async fn handle_tcp_flow(
         ..Default::default()
     };
 
-    // handle_tcp does the rest: name sniff for an unmapped fake IP,
-    // fake-IP rewrite, lazy rule match, stats guard, dial, zero-alloc
-    // relay. `prefix` is the first payload read during the sniff window; it
-    // reaches the upstream as the relay's first client read (counted as
-    // upload there). It is empty for a flow that stayed silent
-    // (server-first): `TunTcpConn` then reads straight from the stream and
-    // nothing is written upstream until a side speaks — no zero-length
-    // write, no synthetic EOF.
-    rill_tunnel::tcp::handle_tcp(
-        tunnel.inner(),
-        Box::new(TunTcpConn {
-            prefix,
-            pos: 0,
-            inner: std::sync::Mutex::new(tcp),
-        }),
-        metadata,
-    )
-    .await;
+    // Both stacks share metadata, fake-IP rewrite, DNS hijack and routing.
+    // Kernel connections stay plain TcpStreams; lwIP replays its prefix.
+    rill_tunnel::tcp::handle_tcp(tunnel.inner(), tcp, metadata).await;
 }
 
 /// Netstack TCP stream plus the bytes already consumed during the sniff

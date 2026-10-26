@@ -300,7 +300,7 @@ impl HostsValue {
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///
 /// Only the fields rill implements are typed; upstream-only fields
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) are accepted and
+/// (`auto-redirect`, `endpoint-independent-nat`, …) are accepted and
 /// produce a `warn!` (Class B per ADR-0002, forward-compat), never a parse
 /// error — the same policy as [`RawGeoDataConfig`] and #328.
 ///
@@ -365,8 +365,9 @@ pub struct RawTun {
     pub route_exclude_address: Option<serde_yaml::Value>,
     pub inet4_route_exclude_address: Option<serde_yaml::Value>,
     pub inet6_route_exclude_address: Option<serde_yaml::Value>,
-    /// mihomo's stack selector. rill has one userspace stack, so any value
-    /// is accepted.
+    /// mihomo's stack selector, kept as written so a saved config
+    /// round-trips; [`crate::TunStack`] reads it (system/mixed → kernel TCP
+    /// on Linux, lwip/gvisor → lwIP, unknown → warn + lwIP).
     pub stack: Option<serde_yaml::Value>,
     // mihomo-only fields accepted for forward-compat; warn and ignore.
     pub auto_redirect: Option<serde_yaml::Value>,
