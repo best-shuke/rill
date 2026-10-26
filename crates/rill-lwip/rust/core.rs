@@ -41,6 +41,7 @@ use tokio::sync::{
     watch,
 };
 
+use super::buffer::{Buffer, BufferPool, IngressBuffers, Packet, PACKET_HEADROOM};
 use super::lwip::*;
 use super::tcp_stream::TcpStream;
 use super::util;
@@ -50,9 +51,11 @@ pub(crate) type StreamId = u64;
 /// Max bytes handed to `tcp_write` per chunk travelling the per-stream write
 /// channel. Together with [`WRITE_CHAN_CAP`] this bounds per-stream buffering
 /// ahead of lwIP's own `TCP_SND_BUF`.
-pub(crate) const WRITE_CHUNK: usize = 4096;
+pub(crate) const WRITE_CHUNK: usize = 16 * 1024;
 /// Per-stream write channel capacity, in chunks.
-pub(crate) const WRITE_CHAN_CAP: usize = 8;
+// One queued chunk plus one parked chunk: 32 KiB, versus the old 8×4 KiB
+// queue plus a parked 4 KiB chunk.
+pub(crate) const WRITE_CHAN_CAP: usize = 1;
 
 /// Ordered per-stream commands. Travelling a dedicated bounded channel gives
 /// the write path real backpressure (a full channel parks the writer via
@@ -61,7 +64,7 @@ pub(crate) const WRITE_CHAN_CAP: usize = 8;
 /// "handle gone — close the pcb" signal, so teardown cannot be lost to a full
 /// queue.
 pub(crate) enum StreamCmd {
-    Write(Vec<u8>),
+    Write(Buffer),
     /// Half-close TX (`tcp_shutdown(rx=0, tx=1)`), ordered after all writes.
     Shutdown,
 }
@@ -115,9 +118,10 @@ pub(crate) struct CbCtx {
     id: StreamId,
     /// `None` after EOF-follow-up or error — mirrors the old design where
     /// dropping the sender closes the handle's read channel.
-    read_tx: Option<UnboundedSender<Vec<u8>>>,
+    read_tx: Option<UnboundedSender<Buffer>>,
     cmd_tx: UnboundedSender<Cmd>,
     local_addr: SocketAddr,
+    read_pool: BufferPool,
     /// Set SYNCHRONOUSLY by `tcp_err_cb` (and by `tcp_recv_cb` when it hands
     /// a fully closed pcb back to lwIP), shared with the core's
     /// `StreamState`. When the err callback fires, lwIP has ALREADY freed the
@@ -133,6 +137,8 @@ pub(crate) struct CbCtx {
 /// stream — id allocation, channel plumbing, and the accept queue.
 pub(crate) struct ListenerCtx {
     next_id: StreamId,
+    read_pool: BufferPool,
+    write_pool: BufferPool,
     cmd_tx: UnboundedSender<Cmd>,
     accept_tx: UnboundedSender<(TcpStream, SocketAddr, SocketAddr)>,
 }
@@ -141,8 +147,19 @@ pub(crate) struct ListenerCtx {
 /// paired the try_send with a hand-rolled waker; the channel's own receiver
 /// waker makes that redundant.
 pub(crate) struct OutputCtx {
-    egress_tx: Sender<Vec<u8>>,
+    egress_tx: Sender<Packet>,
+    pool: BufferPool,
 }
+
+/// Idle buffers each recycling pool may keep, as (slots, bytes). Pools only
+/// spare steady-state malloc/free churn — a miss allocates — so their caches
+/// stay a fraction of `MEM_SIZE` (2 MiB desktop / 512 KiB iOS): together at
+/// most `MEM_SIZE`, against ~20 MiB (and +35 MB peak RSS on the parallel TUN
+/// leg) at the first cut's `MEM_SIZE * 8` egress cache.
+const EGRESS_POOL: (usize, usize) = (256, MEM_SIZE as usize / 2);
+const READ_POOL: (usize, usize) = (256, MEM_SIZE as usize / 4);
+const WRITE_POOL: (usize, usize) = (32, MEM_SIZE as usize / 4);
+const INGRESS_POOL: (usize, usize) = (256, MEM_SIZE as usize / 4);
 
 /// `OUTPUT_CB_PTR`-style hook target. Only touched from the constructor
 /// thread (before the core task exists) and the core task (teardown), under
@@ -155,13 +172,14 @@ fn output(p: *mut pbuf) -> err_t {
             return err_enum_t_ERR_ABRT as err_t;
         }
         let pbuflen = std::ptr::read_unaligned(p).tot_len;
-        let mut buf = Vec::with_capacity(pbuflen as usize);
-        pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, pbuflen, 0);
-        buf.set_len(pbuflen as usize);
         let ctx = &*(OUTPUT_PTR as *const OutputCtx);
+        let mut buf = ctx.pool.take(pbuflen as usize + PACKET_HEADROOM);
+        buf.resize(PACKET_HEADROOM, 0);
+        pbuf_copy_partial(p, buf.as_mut_ptr().add(PACKET_HEADROOM).cast(), pbuflen, 0);
+        buf.set_len(pbuflen as usize + PACKET_HEADROOM);
         // Egress saturation drops the frame (IP is allowed to; TCP
         // retransmits) — blocking here would wedge the whole core.
-        let _ = ctx.egress_tx.try_send(buf);
+        let _ = ctx.egress_tx.try_send(Packet(buf));
         err_enum_t_ERR_OK as err_t
     }
 }
@@ -195,10 +213,10 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        // Empty Vec is the EOF marker, queued behind any undrained data so a
+        // An empty buffer is the EOF marker, queued behind any undrained data so a
         // handle mid-read sees that data first.
         if let Some(tx) = ctx.read_tx.as_ref() {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send(ctx.read_pool.take(0));
         }
         // If our FIN already went out (`Cmd::Shutdown`), this peer FIN put
         // the pcb in TIME_WAIT, or in CLOSING on its way there (lwIP moves
@@ -233,7 +251,7 @@ pub unsafe extern "C" fn tcp_recv_cb(
     }
 
     let pbuflen = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(pbuflen as usize);
+    let mut buf = ctx.read_pool.take(pbuflen as usize);
     pbuf_copy_partial(p, buf.as_mut_ptr() as _, pbuflen, 0);
     buf.set_len(pbuflen as usize);
 
@@ -318,6 +336,7 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         read_tx: Some(read_tx),
         cmd_tx: listener.cmd_tx.clone(),
         local_addr: src_addr,
+        read_pool: listener.read_pool.clone(),
         dead: dead.clone(),
     }));
 
@@ -347,6 +366,7 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         read_rx,
         write_tx,
         listener.cmd_tx.clone(),
+        listener.write_pool.clone(),
     );
     let _ = listener.accept_tx.send((stream, src_addr, dest_addr));
 
@@ -400,7 +420,7 @@ struct StreamState {
     /// Chunk lwIP refused (`snd_buf` full / `ERR_MEM`) plus the offset
     /// already accepted; retried on `Sent`/`PollTick`. Replaces the old
     /// cross-thread `write_waker`.
-    parked: Option<(Vec<u8>, usize)>,
+    parked: Option<(Buffer, usize)>,
     /// `Shutdown` processed — `tcp_shutdown(tx)` done. Governs whether close
     /// is graceful (`tcp_close`, enabling the FIN_WAIT_2 reap) or an abort.
     tx_shut: bool,
@@ -447,6 +467,8 @@ pub(crate) struct LwipCore {
     /// Core keeps one sender so `cmd_rx` never reports closed while alive.
     _cmd_tx: UnboundedSender<Cmd>,
     ingress_rx: Receiver<Vec<u8>>,
+    /// Where consumed ingress frames go back to (see [`IngressBuffers`]).
+    ingress_buffers: IngressBuffers,
     done_tx: watch::Sender<bool>,
 }
 
@@ -454,12 +476,13 @@ pub(crate) struct LwipCore {
 pub(crate) struct CoreParts {
     pub core: LwipCore,
     pub accept_rx: UnboundedReceiver<(TcpStream, SocketAddr, SocketAddr)>,
-    pub egress_rx: Receiver<Vec<u8>>,
+    pub egress_rx: Receiver<Packet>,
     pub udp_in_rx: Receiver<super::udp::UdpPkt>,
     pub udp_out_tx: Sender<UdpOut>,
     pub udp_local_addr: SocketAddr,
     pub cmd_tx: UnboundedSender<Cmd>,
     pub ingress_tx: Sender<Vec<u8>>,
+    pub ingress_buffers: IngressBuffers,
     pub done_rx: watch::Receiver<bool>,
 }
 
@@ -479,13 +502,21 @@ impl LwipCore {
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
+        let ingress_buffers = IngressBuffers(BufferPool::new(
+            INGRESS_POOL.0,
+            INGRESS_POOL.1,
+            mtu as usize,
+        ));
         let (egress_tx, egress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
         let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
         let (udp_in_tx, udp_in_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (udp_out_tx, udp_out_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (done_tx, done_rx) = watch::channel(false);
 
-        let output_ctx = Box::into_raw(Box::new(OutputCtx { egress_tx })) as usize;
+        let output_ctx = Box::into_raw(Box::new(OutputCtx {
+            egress_tx,
+            pool: BufferPool::new(EGRESS_POOL.0, EGRESS_POOL.1, mtu as usize + PACKET_HEADROOM),
+        })) as usize;
         unsafe {
             (*netif_list).output = Some(output_ip4);
             (*netif_list).output_ip6 = Some(output_ip6);
@@ -516,6 +547,8 @@ impl LwipCore {
             }
             let ctx = Box::into_raw(Box::new(ListenerCtx {
                 next_id: 0,
+                read_pool: BufferPool::new(READ_POOL.0, READ_POOL.1, mtu as usize),
+                write_pool: BufferPool::new(WRITE_POOL.0, WRITE_POOL.1, WRITE_CHUNK),
                 cmd_tx: cmd_tx.clone(),
                 accept_tx,
             }));
@@ -550,6 +583,7 @@ impl LwipCore {
             cmd_rx,
             _cmd_tx: cmd_tx.clone(),
             ingress_rx,
+            ingress_buffers: ingress_buffers.clone(),
             done_tx,
         };
 
@@ -562,6 +596,7 @@ impl LwipCore {
             udp_local_addr,
             cmd_tx,
             ingress_tx,
+            ingress_buffers,
             done_rx,
         })
     }
@@ -572,6 +607,7 @@ impl LwipCore {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            let frees = crate::heap::frees();
             tokio::select! {
                 frame = self.ingress_rx.recv() => match frame {
                     Some(f) => self.input(f),
@@ -591,11 +627,23 @@ impl LwipCore {
                     self.wake_mem_waiters();
                 },
             }
+            self.retry_after_frees(frees);
         }
         self.teardown();
     }
 
+    fn retry_after_frees(&mut self, before: usize) {
+        if crate::heap::frees() != before {
+            self.wake_mem_waiters();
+        }
+    }
+
     fn input(&mut self, frame: Vec<u8>) {
+        self.feed(&frame);
+        self.ingress_buffers.give(frame);
+    }
+
+    fn feed(&mut self, frame: &[u8]) {
         if frame.is_empty() {
             return;
         }

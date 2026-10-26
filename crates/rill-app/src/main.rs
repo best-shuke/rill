@@ -187,11 +187,30 @@ struct Logging {
 
 type ReadyCallback = Box<dyn FnOnce() -> Result<()> + Send>;
 
+/// glibc gives each thread that allocates under contention its own arena,
+/// up to 8 per core, and each keeps the peak it ever held. The TUN pumps and
+/// the lwIP core migrate across tokio workers allocating per packet, so the
+/// 32-flow TUN leg peaked at 41-45 MB RSS against 30 MB with one arena —
+/// with no measurable cost to throughput, latency or CPU on either the SOCKS
+/// or the TUN legs (per-thread tcache still serves small allocations
+/// lock-free). An explicit `MALLOC_ARENA_MAX` in the environment wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: mallopt only tunes the allocator; called while the
+        // process is still single-threaded.
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+    }
+}
+
 fn main() -> Result<()> {
     // dhat profiler guard — must be the first local, lives for the duration of main().
     // Writes dh_out.json on drop. Active only when compiled with --features dhat-heap.
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
+    // Before the runtime spawns any thread.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    limit_malloc_arenas();
 
     // nyanpasu uses -v to query version (mihomo format)
     if std::env::args().any(|a| a == "-v") {

@@ -17,6 +17,11 @@
   task: 10 000 idle connections take 65 MB instead of 194 MB.
 - `PUT /configs` keeps established connections, as mihomo does; only
   connections still dialing under the old configuration are cancelled.
+- TUN on Linux uses virtio-net offload (GSO/GRO), falling back to one
+  read/write per packet on kernels without it, and the lwIP glue no longer
+  allocates per packet or scans a first-fit heap: lwIP TUN throughput is up
+  about 1.5× at 30% less CPU per GB. On glibc, rill caps malloc arenas at
+  one (`MALLOC_ARENA_MAX` overrides), keeping TUN peak RSS 11 MB lower.
 
 ## 0.1.2 — 2026-10-25
 

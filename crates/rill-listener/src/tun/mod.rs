@@ -506,6 +506,7 @@ impl TunListener {
             );
 
             match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
+                let device = device::build_device(|_offload| {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
                 // On Windows the listener assigns the addresses itself
                 // once the adapter exists: the ones the builder sets
@@ -522,13 +523,13 @@ impl TunListener {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    builder = builder.tx_queue_len(TUN_TX_QUEUE_LEN);
+                    builder = builder.tx_queue_len(TUN_TX_QUEUE_LEN).offload(_offload);
                 }
                 // Pin the Wintun DLL we resolved above so tun-rs does not
                 // walk the process DLL search path.
                 #[cfg(target_os = "windows")]
                 {
-                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                    builder = builder.wintun_file(wintun_file.clone()).wintun_log(true);
                 }
                 // tun-rs opens a same-named, non-orphaned adapter instead
                 // of creating one (an orphaned one it replaces), and
@@ -547,7 +548,8 @@ impl TunListener {
                         }
                     }
                 }
-                let device = builder.build_async()?;
+                builder.build_async()
+                })?;
                 // One read of the index serves both the address setup
                 // and the caller.
                 let if_index = device.if_index()?;

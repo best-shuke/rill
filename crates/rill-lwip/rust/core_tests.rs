@@ -378,3 +378,96 @@ async fn ipv6_tcp_and_udp_flows_keep_their_addresses() {
         .expect("core teardown timed out")
         .expect("core dropped its done signal");
 }
+
+/// The host allocator still refuses allocations at MEM_SIZE, and a stream
+/// parked on ERR_MEM resumes when an unrelated allocation is released.
+#[tokio::test]
+async fn bounded_heap_parks_and_resumes_writes_after_free() {
+    use crate::core::{Cmd, LwipCore, WRITE_CHUNK};
+    use crate::lwip::*;
+
+    let _serial = STACK_LOCK.lock().await;
+    let mut parts = LwipCore::build(64, 8, 1500).unwrap();
+    parts.core.input(tcp_frame(41000, CLIENT_ISN, 0, SYN, &[]));
+    let syn_ack = parse(&parts.egress_rx.try_recv().unwrap()).unwrap();
+    parts
+        .core
+        .input(tcp_frame(41000, CLIENT_ISN + 1, syn_ack.seq + 1, ACK, &[]));
+    let cmd = parts.core.cmd_rx.try_recv().unwrap();
+    parts.core.handle_cmd(cmd);
+    let (mut stream, _, _) = parts.accept_rx.try_recv().unwrap();
+
+    // All allocator entry points share the budget, calloc checks overflow,
+    // and the returned payload respects lwIP's alignment.
+    unsafe {
+        assert!(mem_malloc(MEM_SIZE as _).is_null());
+        assert!(crate::heap::rill_lwip_calloc(usize::MAX, 2).is_null());
+        let zeroed = mem_calloc(7, 11);
+        assert!(!zeroed.is_null());
+        assert_eq!(zeroed as usize % MEM_ALIGNMENT as usize, 0);
+        assert!(std::slice::from_raw_parts(zeroed.cast::<u8>(), 77)
+            .iter()
+            .all(|&b| b == 0));
+        mem_free(zeroed);
+    }
+    // Exhaust the heap with fixed blocks, without relying on header size or
+    // any allocator implementation details. Keep enough space unavailable
+    // that tcp_write must fail, including its small-segment retry path.
+    let mut held = Vec::new();
+    for size in [4096, 64, 1] {
+        loop {
+            let ptr = unsafe { mem_malloc(size) };
+            if ptr.is_null() {
+                break;
+            }
+            held.push(ptr);
+        }
+    }
+    let payload = vec![0x5a; WRITE_CHUNK];
+    stream.write_all(&payload).await.unwrap();
+    let cmd = parts.core.cmd_rx.try_recv().unwrap();
+    assert!(matches!(cmd, Cmd::Kick(_)));
+    parts.core.handle_cmd(cmd);
+    assert_eq!(parts.core.mem_waiters.len(), 1);
+    assert!(parts.core.streams.values().next().unwrap().parked.is_some());
+
+    let frees = crate::heap::frees();
+    for ptr in held {
+        unsafe { mem_free(ptr) };
+    }
+    assert_ne!(crate::heap::frees(), frees);
+    // This is the same retry the run loop performs after observing a free.
+    parts.core.retry_after_frees(frees);
+    assert!(parts.core.mem_waiters.is_empty());
+    let st = parts.core.streams.values().next().unwrap();
+    assert!(st.parked.is_none());
+    assert!(!st.mem_waiting);
+    assert!(
+        parts.egress_rx.try_recv().is_ok(),
+        "resumed write emitted data"
+    );
+    drop(stream);
+    parts.core.teardown();
+}
+
+/// Frames fed from [`crate::IngressBuffers`] come back to the pool once the
+/// core has copied them into a pbuf, so steady-state ingress reuses storage.
+#[tokio::test]
+async fn ingress_frames_return_to_the_pool() {
+    use crate::core::LwipCore;
+
+    let _serial = STACK_LOCK.lock().await;
+    let mut parts = LwipCore::build(64, 8, 1500).unwrap();
+    // An IPv4 frame of an unassigned protocol: lwIP drops it without
+    // creating state that could leak into the next stack generation.
+    let mut packet = tcp_frame(42000, CLIENT_ISN, 0, SYN, &[]);
+    packet[9] = 253;
+    let mut frame = parts.ingress_buffers.take(packet.len());
+    frame.extend_from_slice(&packet);
+    let storage = frame.as_ptr();
+    parts.core.input(frame);
+    let reused = parts.ingress_buffers.take(packet.len());
+    assert_eq!(reused.as_ptr(), storage);
+    assert!(reused.is_empty());
+    parts.core.teardown();
+}

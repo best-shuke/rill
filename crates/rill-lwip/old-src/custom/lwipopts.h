@@ -151,7 +151,16 @@
 // #define TCP_MSS 1460
 // #define TCP_WND (16 * TCP_MSS)
 // #define TCP_SND_BUF (8 * TCP_MSS)
-// #define MEM_LIBC_MALLOC 1
+// Use the host allocator without losing the bounded ERR_MEM contract.
+// Rust hooks charge an aligned size header plus payload against MEM_SIZE.
+#include <stddef.h>
+void *rill_lwip_malloc(size_t size);
+void *rill_lwip_calloc(size_t count, size_t size);
+void rill_lwip_free(void *ptr);
+#define MEM_LIBC_MALLOC 1
+#define mem_clib_malloc rill_lwip_malloc
+#define mem_clib_calloc rill_lwip_calloc
+#define mem_clib_free rill_lwip_free
 // #define MEMP_MEM_MALLOC 1
 
 #define SYS_LIGHTWEIGHT_PROT 0

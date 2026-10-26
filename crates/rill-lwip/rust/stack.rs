@@ -9,7 +9,7 @@ use tokio_util::sync::PollSender;
 use super::core::LwipCore;
 use super::tcp_listener::TcpListener;
 use super::udp::UdpSocket;
-use crate::Error;
+use crate::{Error, IngressBuffers, Packet};
 
 /// Netif MTU for the constructors that don't take one — the value lwIP was
 /// hard-wired to before [`NetStack::with_mtu`].
@@ -24,7 +24,8 @@ const FRAME_QUEUE_DEPTH: usize = 4096;
 
 /// Ingress/egress handle for the netstack. `Sink` feeds raw IP frames to the
 /// core task (bounded channel — backpressure parks the caller); `Stream`
-/// yields egress frames produced by the netif output hook.
+/// yields pooled egress packets produced by the netif output hook. Dropping
+/// each packet returns its storage for reuse by the core.
 ///
 /// Dropping the `NetStack` is the teardown trigger: the core task observes
 /// the ingress channel closing, tears down every pcb deterministically on its
@@ -35,7 +36,8 @@ const FRAME_QUEUE_DEPTH: usize = 4096;
 /// had, now enforced in exactly one place).
 pub struct NetStack {
     ingress: PollSender<Vec<u8>>,
-    egress_rx: Receiver<Vec<u8>>,
+    ingress_buffers: IngressBuffers,
+    egress_rx: Receiver<Packet>,
     done_rx: watch::Receiver<bool>,
 }
 
@@ -69,6 +71,7 @@ impl NetStack {
 
         let stack = NetStack {
             ingress: PollSender::new(parts.ingress_tx),
+            ingress_buffers: parts.ingress_buffers,
             egress_rx: parts.egress_rx,
             done_rx: parts.done_rx,
         };
@@ -92,10 +95,18 @@ impl NetStack {
     pub fn core_done(&self) -> watch::Receiver<bool> {
         self.done_rx.clone()
     }
+
+    /// Recycled storage for frames sent into this stack: fill a buffer from
+    /// [`IngressBuffers::take`] and send it; the core returns it once the
+    /// frame is consumed. Plain `Vec`s work too, they are just not reused
+    /// by the sender.
+    pub fn ingress_buffers(&self) -> IngressBuffers {
+        self.ingress_buffers.clone()
+    }
 }
 
 impl Stream for NetStack {
-    type Item = io::Result<Vec<u8>>;
+    type Item = io::Result<Packet>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.egress_rx.poll_recv(cx) {
