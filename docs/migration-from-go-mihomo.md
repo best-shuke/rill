@@ -475,6 +475,18 @@ nameserver:
   - udp://223.5.5.5:53                               # Plain UDP (unchanged)
 ```
 
+A DoH upstream is queried over one kept HTTP/2 connection, as in mihomo:
+pinged after 30 s of silence, closed after 5 min unused, retired at once on
+a network change. A server that does not negotiate `h2` over ALPN is served
+over HTTP/1.1, one connection per query. DoT opens a connection per query,
+as mihomo does. `#h3=true` / `prefer-h3` are ignored (HTTP/2 is used).
+The `minimal` build bundle leaves the kept connection out (rill-dns's
+`doh-h2` feature) and opens an HTTP/1.1 connection per DoH query.
+
+An answer that has expired less than an hour ago is served at once — with
+TTL 1 to DNS clients — while a background query refreshes it, as mihomo's
+cache does.
+
 **DoQ (`quic://`) is a hard error** with a message pointing at roadmap M1.E-6.
 Replace with `tls://` or `https://` equivalents.
 
