@@ -19,6 +19,7 @@ pub enum AdapterType {
     Trojan,
     Hysteria2,
     TrustTunnel,
+    Xpro,
     Anytls,
     Snell,
     /// Built-in nop adapter (`PASS`) — a matched rule is skipped silently
@@ -51,6 +52,7 @@ impl fmt::Display for AdapterType {
             AdapterType::Vless => write!(f, "Vless"),
             AdapterType::Trojan => write!(f, "Trojan"),
             AdapterType::Hysteria2 => write!(f, "Hysteria2"),
+            AdapterType::Xpro => write!(f, "XPro"),
             AdapterType::TrustTunnel => write!(f, "TrustTunnel"),
             AdapterType::Anytls => write!(f, "AnyTLS"),
             AdapterType::Snell => write!(f, "Snell"),

@@ -161,6 +161,13 @@ cargo test -p rill-listener --features listener-shadowsocks --test ss_listener_i
 # tests never compile under default features.
 cargo test -p rill-proxy --features anytls --lib
 
+# XPro is opt-in; verify the native wire peer and both parser feature states.
+cargo test -p rill-proxy --no-default-features --features xpro --test xpro_integration
+cargo test -p rill-proxy --no-default-features --features xpro --lib xpro
+cargo test -p rill-config --no-default-features --features xpro --test xpro_config_test
+cargo test -p rill-config --no-default-features --test xpro_config_test
+cargo test -p rill-tunnel --lib xpro_udp_route
+
 # TrustTunnel is opt-in; its wire tests and parser/adapter integration need
 # explicit feature runs, including the disabled-feature parser contract.
 cargo test -p rill-proxy --no-default-features --features trusttunnel --lib trusttunnel

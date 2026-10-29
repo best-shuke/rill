@@ -115,10 +115,17 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
-/// A TT node that fails to parse must stay *bound* even in lenient mode —
+/// A sensitive tunnel node that fails to parse must stay *bound* even in lenient mode —
 /// to a dead placeholder, never dropped. Dropping the requested transport
 /// can make a group select DIRECT, i.e. send the flow out in plaintext.
 /// This check deliberately remains available when the feature is disabled.
+pub(crate) fn node_is_xpro(config: &HashMap<String, serde_yaml::Value>) -> bool {
+    config
+        .get("type")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("xpro"))
+}
+
 pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -> bool {
     config
         .get("type")
@@ -197,6 +204,10 @@ pub fn parse_proxy_with_dialer(
         .ok_or("missing proxy type")?;
 
     match proxy_type {
+        #[cfg(feature = "xpro")]
+        "xpro" => parse_xpro(name, config, dialer),
+        #[cfg(not(feature = "xpro"))]
+        "xpro" => Err("proxy type 'xpro' is not compiled into this build; rebuild with --features xpro (excluded from full)".into()),
         #[cfg(feature = "trusttunnel")]
         "trusttunnel" => parse_trusttunnel(name, config, dialer),
         #[cfg(feature = "ss")]
@@ -3342,6 +3353,25 @@ fn parse_relay_group(
         ));
     }
 
+    fn contains_xpro(
+        proxy: &Arc<dyn Proxy>,
+        seen: &mut std::collections::HashSet<*const ()>,
+    ) -> bool {
+        if !seen.insert(Arc::as_ptr(proxy).cast::<()>()) {
+            return false;
+        }
+        proxy.adapter_type() == AdapterType::Xpro
+            || proxy
+                .member_proxies()
+                .is_some_and(|members| members.iter().any(|p| contains_xpro(p, seen)))
+    }
+    if proxies
+        .iter()
+        .any(|p| contains_xpro(p, &mut std::collections::HashSet::new()))
+    {
+        return Err("xpro: relay chaining is unsupported".into());
+    }
+
     // Warn-once on inert fields (Class B — relay has no probe loop and
     // consumes no provider slots).
     warn_inert_health_fields("relay", name, config);
@@ -3358,6 +3388,134 @@ fn group_display(config: &crate::raw::RawProxyGroup) -> GroupDisplay {
         hidden: config.hidden.unwrap_or(false),
         icon: config.icon.as_deref().unwrap_or_default().into(),
     }
+}
+
+/// Shared by static nodes, provider refreshes, and config reloads.
+#[cfg(feature = "xpro")]
+fn parse_xpro(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn rill_proxy::dialer::TcpDialer>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    use rill_proxy::xpro::{Config, DeviceKey, InnerTls, Profile, XproAdapter};
+    for field in config.keys() {
+        if ![
+            "name",
+            "type",
+            "server",
+            "port",
+            "transport",
+            "servername",
+            "path",
+            "device-id",
+            "key-file",
+            "udp",
+            "inner-tls",
+            "ca-file",
+            "ws-ping-interval",
+            "ws-pong-timeout",
+        ]
+        .contains(&field.as_str())
+        {
+            return Err(format!("xpro: unsupported field {field}"));
+        }
+    }
+    if dialer.is_proxy() {
+        return Err("xpro: dialer-proxy is unsupported".into());
+    }
+    if let Some(v) = config.get("udp") {
+        if v.as_bool() != Some(false) {
+            return Err("xpro: udp must be false".into());
+        }
+    }
+    let required = |field: &str| {
+        config
+            .get(field)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("xpro: missing or invalid {field}"))
+    };
+    let server = required("server")?;
+    let string = |field: &str, default: &str| -> std::result::Result<String, String> {
+        match config.get(field) {
+            None => Ok(default.to_owned()),
+            Some(v) => v
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("xpro: invalid {field}")),
+        }
+    };
+    let profile = match string("transport", "h2")?.as_str() {
+        "h2" => Profile::H2,
+        "wss" => Profile::Wss,
+        _ => return Err("xpro: transport must be h2 or wss".into()),
+    };
+    let id = required("device-id")?;
+    if id.len() != 32 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("xpro: device-id must be 32 hex digits".into());
+    }
+    let mut device_id = [0; 16];
+    for (i, b) in device_id.iter_mut().enumerate() {
+        *b =
+            u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).map_err(|_| "xpro: invalid device-id")?;
+    }
+    let key = DeviceKey::from_file(required("key-file")?)
+        .map_err(|_| "xpro: cannot read a 32-byte device key file")?;
+    let inner_tls = if let Some(raw) = config.get("inner-tls") {
+        let map = raw.as_mapping().ok_or("xpro: inner-tls must be a map")?;
+        if map
+            .keys()
+            .any(|k| !matches!(k.as_str(), Some("servername" | "ca-file")))
+        {
+            return Err("xpro: unknown inner-tls field".into());
+        }
+        let inner = |field: &str| {
+            map.get(serde_yaml::Value::String(field.into()))
+                .and_then(serde_yaml::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("xpro: missing inner-tls {field}"))
+        };
+        Some(InnerTls {
+            servername: inner("servername")?.into(),
+            ca_file: inner("ca-file")?.into(),
+        })
+    } else {
+        None
+    };
+    let ca_file = if config.contains_key("ca-file") {
+        Some(required("ca-file")?.into())
+    } else {
+        None
+    };
+    let seconds = |field: &str, default: u64| -> std::result::Result<std::time::Duration, String> {
+        let n = match config.get(field) {
+            None => default,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= 3600)
+                .ok_or_else(|| format!("xpro: invalid {field}"))?,
+        };
+        Ok(std::time::Duration::from_secs(n))
+    };
+    let heartbeat = rill_proxy::xpro::Heartbeat {
+        idle: seconds("ws-ping-interval", 30)?,
+        timeout: seconds("ws-pong-timeout", 15)?,
+    };
+    let options = Config {
+        heartbeat,
+        server: server.into(),
+        port: required_port(config, "xpro")?,
+        servername: string("servername", server)?,
+        path: string("path", "/api/stream")?,
+        profile,
+        device_id,
+        key,
+        ca_file,
+        inner_tls,
+    };
+    let adapter = XproAdapter::new(name, options, Arc::clone(dialer)).map_err(|e| e.to_string())?;
+    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
 }
 
 #[cfg(test)]

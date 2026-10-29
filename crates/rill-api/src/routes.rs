@@ -492,6 +492,7 @@ async fn update_proxy(
     match selection.set(&body.name).await {
         Ok(()) => {
             info!("Proxy group '{}' switched to '{}'", group_name, body.name);
+            reset_dns_outbound_connections(&state);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (
@@ -517,7 +518,15 @@ async fn unfix_proxy(
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     }
     selection.force_set(None);
+    reset_dns_outbound_connections(&state);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// A kept DoH/TCP connection belongs to the old selector choice. Retire it
+/// after a successful change so the next query resolves the live outbound.
+fn reset_dns_outbound_connections(state: &AppState) {
+    state.tunnel.resolver().reset_connections();
+    rill_dns::reset_pooled_connections();
 }
 
 async fn get_groups(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse> {
@@ -2468,6 +2477,7 @@ async fn select_proxy_in_group(
     match selection.set(&body.name).await {
         Ok(()) => {
             info!("Proxy group '{}' switched to '{}'", group_name, body.name);
+            reset_dns_outbound_connections(&state);
             StatusCode::NO_CONTENT
         }
         Err(_) => StatusCode::BAD_REQUEST,

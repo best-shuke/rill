@@ -20,6 +20,99 @@ use tracing::{debug, info, warn};
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
 const DEFAULT_FAKE_IP_RANGE_V4: &str = "198.18.0.1/16";
 
+/// Startup builds proxies twice to attach DIRECT's resolver. DNS must resolve
+/// named outbounds against the published generation, rather than retaining the
+/// first pass's independent selectors and health state. The weak registry edge
+/// also avoids a resolver -> group -> DIRECT -> resolver ownership cycle.
+pub(crate) fn startup_dns_registry(
+    proxies: &HashMap<smol_str::SmolStr, Arc<dyn rill_common::Proxy>>,
+    registry: &rill_proxy::dialer::ProxyRegistry,
+) -> HashMap<smol_str::SmolStr, Arc<dyn rill_common::Proxy>> {
+    proxies
+        .iter()
+        .map(|(name, proxy)| {
+            let outbound = StartupDnsProxy {
+                identity: Arc::clone(proxy),
+                target: rill_proxy::dialer::DialerTarget::new(name.clone(), registry),
+            };
+            (
+                name.clone(),
+                Arc::new(outbound) as Arc<dyn rill_common::Proxy>,
+            )
+        })
+        .collect()
+}
+
+struct StartupDnsProxy {
+    // Metadata stays available during config validation without a registry lookup.
+    identity: Arc<dyn rill_common::Proxy>,
+    target: rill_proxy::dialer::DialerTarget,
+}
+
+impl StartupDnsProxy {
+    fn target(&self) -> rill_common::Result<Arc<dyn rill_common::Proxy>> {
+        self.target.resolve().ok_or_else(|| {
+            rill_common::RillError::Dns(format!(
+                "DNS outbound '{}' is no longer available",
+                self.target.name()
+            ))
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl rill_common::ProxyAdapter for StartupDnsProxy {
+    fn name(&self) -> &str {
+        self.identity.name()
+    }
+    fn adapter_type(&self) -> rill_common::AdapterType {
+        self.identity.adapter_type()
+    }
+    fn addr(&self) -> &str {
+        self.identity.addr()
+    }
+    fn support_udp(&self) -> bool {
+        self.identity.support_udp()
+    }
+    fn health(&self) -> &rill_common::ProxyHealth {
+        self.identity.health()
+    }
+    async fn dial_tcp(
+        &self,
+        metadata: &rill_common::Metadata,
+    ) -> rill_common::Result<Box<dyn rill_common::ProxyConn>> {
+        self.target()?.dial_tcp(metadata).await
+    }
+    async fn dial_udp(
+        &self,
+        metadata: &rill_common::Metadata,
+    ) -> rill_common::Result<Box<dyn rill_common::ProxyPacketConn>> {
+        self.target()?.dial_udp(metadata).await
+    }
+}
+
+impl rill_common::Proxy for StartupDnsProxy {
+    fn alive(&self) -> bool {
+        self.target.resolve().is_some_and(|p| p.alive())
+    }
+    fn alive_for_url(&self, url: &str) -> bool {
+        self.target.resolve().is_some_and(|p| p.alive_for_url(url))
+    }
+    fn last_delay(&self) -> u16 {
+        self.target.resolve().map_or(0, |p| p.last_delay())
+    }
+    fn last_delay_for_url(&self, url: &str) -> u16 {
+        self.target
+            .resolve()
+            .map_or(0, |p| p.last_delay_for_url(url))
+    }
+    fn delay_history(&self) -> Vec<rill_common::DelayHistory> {
+        self.target
+            .resolve()
+            .map_or_else(Vec::new, |p| p.delay_history())
+    }
+}
+
 /// `prior` is the resolver generation being replaced (config reload); its
 /// fake-IP pool is carried over when the configured range and store
 /// identity (in-memory vs the same backing file) are unchanged, so clients

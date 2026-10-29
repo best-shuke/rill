@@ -7,6 +7,9 @@
 /// BoringSSL record-layer AEAD shared by Snell, VMess and VLESS encryption.
 #[cfg(any(feature = "snell", feature = "vmess", feature = "vless-encryption"))]
 mod aead;
+#[cfg(feature = "xpro")]
+pub mod xpro;
+
 pub mod dialer;
 pub mod direct;
 pub mod group;

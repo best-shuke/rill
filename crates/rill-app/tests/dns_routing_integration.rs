@@ -60,6 +60,42 @@ async fn configured(dns: &str) -> (Arc<Resolver>, Tunnel) {
 }
 
 #[tokio::test]
+async fn named_dns_outbound_follows_nested_live_selector_changes() {
+    let (upstream, count) = dns_stub([203, 0, 113, 9]).await;
+    let config = rill_config::load_config_from_str(&format!(
+        "ipv6: false\nproxies: []\nproxy-groups:\n  - name: inner\n    type: select\n    proxies: [REJECT, DIRECT]\n  - name: outer\n    type: select\n    proxies: [inner]\nrules: [MATCH,DIRECT]\ndns:\n  enable: true\n  nameserver: ['tcp://{upstream}#outer']\n"
+    )).await.unwrap();
+    let resolver = Arc::clone(&config.dns.resolver);
+    let selector = config.proxies["inner"].selection().unwrap();
+    assert!(resolver.resolve_ips("before-switch.test").await.is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+
+    selector.set("DIRECT").await.unwrap();
+    assert_eq!(
+        resolver
+            .resolve_ips("after-switch.test")
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    selector.set("REJECT").await.unwrap();
+    assert!(resolver.resolve_ips("switched-back.test").await.is_err());
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "must not reuse the earlier DIRECT choice"
+    );
+    drop(config);
+    assert!(
+        resolver.resolve_ips("after-owner-drop.test").await.is_err(),
+        "a retained resolver must fail closed after its registry owner stops"
+    );
+}
+
+#[tokio::test]
 async fn respect_rules_and_explicit_outbound_tags_use_live_routing() {
     let (upstream, count) = dns_stub([203, 0, 113, 7]).await;
     let (resolver, tunnel) = configured(&format!(
@@ -290,7 +326,7 @@ async fn mihomo_parameters_and_missing_outbounds_still_load() {
     // queries — never a direct query — and the other upstreams still answer.
     for lists in [
         format!("  nameserver: ['tcp://{upstream}#节点选择']\n"),
-        format!("  nameserver: [tcp://127.0.0.1:1]\n  fallback: ['tcp://{upstream}#节点选择']\n"),
+        format!("  nameserver: [tcp://127.0.0.1:1]\n  fallback: ['tcp://{upstream}#节点选择']\n  fallback-filter: {{geoip: false}}\n"),
         format!("  nameserver: [tcp://127.0.0.1:1]\n  direct-nameserver: ['tcp://{upstream}#节点选择']\n"),
     ] {
         let (resolver, _tunnel) = configured(&lists).await;

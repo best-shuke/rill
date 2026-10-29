@@ -12,7 +12,9 @@ keywords = ["proxy", "clash", "mihomo", "vpn", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
 [features]
-# Default = everything a release binary ships: all protocols/listeners/DNS.
+# XPro/1 is opt-in and excluded from full.
+xpro = ["rill-config/xpro", "rill-proxy/xpro"]
+# Default desktop bundle; release builds additionally enable opt-in XPro.
 # TLS is BoringSSL everywhere (proxies, health probes, DoT/DoH, provider
 # fetches; ECH/uTLS included) — boring-sys is a hard requirement of the
 # `full` and `minimal` bundles alike, so every build needs cmake + a C++

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.5 — 2026-10-29
+
+- DNS named outbounds follow the published proxy generation, including
+  nested selector choices and health changes, instead of retaining the
+  independent startup groups. Successful API node changes retire kept
+  DoH/TCP connections so subsequent queries use the new outbound.
+- Add the opt-in XPro/1 H2 and WSS outbound, with verified TLS, device-key
+  authentication and native TCP dialing. Desktop release builds enable
+  XPro; unsupported UDP and invalid nodes fail closed.
+- Include enabled XPro dependencies in the bundled license notices.
+
 ## 0.1.4 — 2026-10-26
 
 Daily use below 1 Gbps: what a page waits on before its first byte. See

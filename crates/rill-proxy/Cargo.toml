@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+# XPro/1 is opt-in and excluded from full.
+xpro = ["dep:xpro-client", "dep:url", "dep:h2"]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["dep:shadowsocks", "rill-transport/simple-obfs", "rill-transport/shadow-tls", "rill-transport/restls", "rill-transport/jls"]
 trojan = []
@@ -71,6 +73,8 @@ ech-tls-tunnel = ["ss"]
 kcptun = ["ss", "mux", "dep:tokio-util", "rill-transport/kcptun"]
 
 [dependencies]
+url = { version = "2", optional = true }
+xpro-client = { path = "../../vendor/xpro/crates/xpro-client", version = "=0.1.0", optional = true }
 rill-common = { workspace = true }
 rill-dns = { workspace = true }
 rill-transport = { workspace = true, features = ["tls", "ws"] }

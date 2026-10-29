@@ -10,6 +10,7 @@ crates are rill's own (LICENSE, NOTICE) except the vendored ones that carry a li
 Run after `cargo fetch --locked`; it reads the sources offline.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,8 @@ target = sys.argv[2] if len(sys.argv) > 2 else next(
     if line.startswith('host: '))
 metadata = json.loads(subprocess.check_output([
     'cargo', 'metadata', '--format-version', '1', '--locked', '--offline',
-    '--filter-platform', target
+    '--filter-platform', target,
+    *(['--features', os.environ['RILL_FEATURES']] if os.environ.get('RILL_FEATURES') else [])
 ]))
 nodes = {node['id']: node for node in metadata['resolve']['nodes']}
 members = set(metadata['workspace_members'])

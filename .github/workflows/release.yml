@@ -15,6 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RILL_FEATURES: xpro
 
 jobs:
   build:
@@ -71,11 +72,11 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          # Default features = full (rill-app/Cargo.toml); TLS is BoringSSL.
+          # Desktop builds include full plus the opt-in XPro protocol.
           if [ "${{ runner.os }}" = "Linux" ]; then
-            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rill
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rill --features "$RILL_FEATURES"
           else
-            cargo build --release --locked --target ${{ matrix.target }} --bin rill
+            cargo build --release --locked --target ${{ matrix.target }} --bin rill --features "$RILL_FEATURES"
           fi
 
       - name: Package

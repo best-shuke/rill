@@ -2030,6 +2030,14 @@ fn insert_parsed_leaves(
                     "proxies: failed to parse '{name}' (strict mode): {e}"
                 ));
             }
+            Err(e) if proxy_parser::node_is_xpro(raw_proxy) => {
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                warn!("XPro node is unavailable: {e}");
+                unavailable_placeholder(name, &e, rill_common::AdapterType::Xpro)
+            }
             Err(e) if proxy_parser::node_is_trusttunnel(raw_proxy) => {
                 let name = raw_proxy
                     .get("name")
@@ -4544,14 +4552,15 @@ pub async fn build_config(
         _ => HashMap::new(),
     };
 
-    // DNS — pass the explicit mmdb path so fallback-filter GeoIP uses the
-    // same path as the rule engine, plus the proxy registry from step 1
-    // so #PROXY-tagged nameservers can resolve their referenced adapter.
+    // DNS resolves #name against the shared registry on each dial. Capturing
+    // step-1 groups here would freeze separate selector/health state, so API
+    // selections applied to step 2 would never reach DNS.
+    let dns_proxies = dns_parser::startup_dns_registry(&proxies, &dialer_registry);
     let dns_config = dns_parser::parse_dns(
         &raw,
         geodata.mmdb_path.as_deref(),
         cache_dir,
-        &proxies,
+        &dns_proxies,
         ctx.geosite.clone(),
         &rule_providers,
         None,

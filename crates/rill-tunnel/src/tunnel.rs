@@ -778,7 +778,9 @@ impl RouteTargetProbe<'_> {
             "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
             cur.name()
         );
-        false
+        // An excessively deep UDP capability chain must remain a rejecting
+        // route rather than falling through to a later DIRECT rule.
+        want == AdapterType::Xpro
     }
 }
 
@@ -797,7 +799,12 @@ impl TargetProbe for RouteTargetProbe<'_> {
         if self.unwraps_to(Arc::clone(p), AdapterType::Pass) {
             return TargetCheck::Pass;
         }
-        if self.metadata.network == Network::Udp && !p.support_udp() {
+        // XPro/1 explicitly rejects UDP. Preserve this route so an unsupported
+        // datagram cannot skip the selected proxy and fall through to DIRECT.
+        if self.metadata.network == Network::Udp
+            && !p.support_udp()
+            && !self.unwraps_to(Arc::clone(p), AdapterType::Xpro)
+        {
             return TargetCheck::Missing;
         }
         TargetCheck::Usable
@@ -1335,6 +1342,82 @@ mod tests {
             true,
         ));
         Tunnel::new(resolver)
+    }
+
+    #[tokio::test]
+    async fn xpro_udp_route_rejects_instead_of_skipping_to_direct() {
+        struct TcpOnly;
+        #[async_trait::async_trait]
+        impl rill_common::ProxyAdapter for TcpOnly {
+            fn name(&self) -> &str {
+                "XPro-test"
+            }
+            fn addr(&self) -> &str {
+                "localhost:443"
+            }
+            fn adapter_type(&self) -> AdapterType {
+                AdapterType::Xpro
+            }
+            fn support_udp(&self) -> bool {
+                false
+            }
+            fn health(&self) -> &rill_common::ProxyHealth {
+                static H: std::sync::OnceLock<rill_common::ProxyHealth> =
+                    std::sync::OnceLock::new();
+                H.get_or_init(rill_common::ProxyHealth::new)
+            }
+            async fn dial_tcp(
+                &self,
+                _: &Metadata,
+            ) -> rill_common::Result<Box<dyn rill_common::ProxyConn>> {
+                Err(rill_common::RillError::NoProxyAvailable)
+            }
+            async fn dial_udp(
+                &self,
+                _: &Metadata,
+            ) -> rill_common::Result<Box<dyn rill_common::ProxyPacketConn>> {
+                Err(rill_common::RillError::UdpNotSupported)
+            }
+        }
+        let leaf: Arc<dyn Proxy> = Arc::new(rill_config::proxy_parser::WrappedProxy::new(
+            Box::new(TcpOnly),
+        ));
+        let mut deep = Arc::clone(&leaf);
+        for i in 0..32 {
+            deep = Arc::new(rill_proxy::SelectorGroup::new(
+                &format!("deep-{i}"),
+                vec![deep],
+            ));
+        }
+        for proxy in [
+            Arc::clone(&leaf),
+            Arc::new(rill_proxy::SelectorGroup::new(
+                "SEL",
+                vec![Arc::clone(&leaf)],
+            )) as Arc<dyn Proxy>,
+            deep,
+        ] {
+            let tunnel = test_tunnel();
+            let mut built = rill_config::rebuild_from_raw(&Default::default()).unwrap();
+            built.proxies.insert("XPRO".into(), proxy);
+            tunnel.update_routing(
+                built.proxies,
+                vec![
+                    Box::new(rill_rules::domain::DomainRule::new("example.com", "XPRO")),
+                    Box::new(rill_rules::final_rule::FinalRule::new("DIRECT")),
+                ],
+                built.dialer_registry,
+            );
+            let metadata = Metadata {
+                network: Network::Udp,
+                host: "example.com".into(),
+                dst_port: 443,
+                ..Default::default()
+            };
+            let resolved = tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+            assert_ne!(resolved.adapter.adapter_type(), AdapterType::Direct);
+            assert!(resolved.adapter.dial_udp(&metadata).await.is_err());
+        }
     }
 
     #[test]

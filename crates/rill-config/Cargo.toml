@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+# XPro/1 is opt-in and excluded from full.
+xpro = ["rill-proxy/xpro"]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["rill-proxy/ss"]
 trojan = ["rill-proxy/trojan"]

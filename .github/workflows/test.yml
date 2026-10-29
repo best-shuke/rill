@@ -3,9 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "vendor/**", "scripts/licenses.py", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
   pull_request:
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "vendor/**", "scripts/licenses.py", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
 
 # One active run per ref: a superseded push to the same PR/branch cancels the
 # in-flight run instead of racing it to completion. `push` is limited to
@@ -190,6 +190,14 @@ jobs:
 
       - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
         run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
+      - name: XPro opt-in protocol and configuration tests
+        run: |
+          cargo nextest run -p rill-proxy --no-default-features --features xpro --test xpro_integration --no-fail-fast
+          cargo nextest run -p rill-proxy --no-default-features --features xpro --lib xpro --no-fail-fast
+          cargo nextest run -p rill-config --no-default-features --features xpro --test xpro_config_test --no-fail-fast
+          cargo nextest run -p rill-config --no-default-features --test xpro_config_test --no-fail-fast
+          cargo nextest run -p rill-tunnel --lib xpro_udp_route --no-fail-fast
 
       - name: TrustTunnel opt-in protocol and configuration tests
         env:

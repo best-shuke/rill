@@ -959,6 +959,14 @@ impl ProxyProvider {
                 // whole feed would let its operator empty the registry on
                 // every refresh — and, for a protocol missing from this
                 // build, stop the daemon from starting at all.
+                Err(e) if proxy_parser::node_is_xpro(raw_map) => {
+                    warn!("XPro provider node is unavailable: {e}");
+                    result.push(crate::unavailable_placeholder(
+                        raw_name,
+                        &e,
+                        rill_common::AdapterType::Xpro,
+                    ));
+                }
                 Err(e) if proxy_parser::node_is_trusttunnel(raw_map) => {
                     let label = if raw_name.is_empty() {
                         "<unnamed>"
@@ -1078,6 +1086,9 @@ impl ProxyProvider {
                 self.allow_external_plugin,
                 &direct,
             );
+        }
+        if proxy_parser::node_is_xpro(raw_map) {
+            return Err("xpro: provider dialer-proxy chaining is unsupported".into());
         }
         if dialer_name == raw_name {
             return Err("`dialer-proxy` points to the node itself".to_string());

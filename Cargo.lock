@@ -3234,7 +3234,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rill-anytls"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "rill-api"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "rill-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "rill-bench"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "rill-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -3379,7 +3379,7 @@ dependencies = [
 
 [[package]]
 name = "rill-common"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3405,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "rill-config"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3437,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "rill-dns"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "rill-listener"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "rill-lwip"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bindgen",
  "bytes",
@@ -3511,7 +3511,7 @@ dependencies = [
 
 [[package]]
 name = "rill-proxy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -3558,14 +3558,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "webpki-root-certs",
  "x25519-dalek",
+ "xpro-client",
  "yamux",
 ]
 
 [[package]]
 name = "rill-rules"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "criterion",
  "ipnet",
@@ -3583,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "rill-transport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -3634,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "rill-trie"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "criterion",
  "proptest",
@@ -3642,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "rill-tunnel"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "criterion",
@@ -5563,6 +5565,50 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "xpro-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boring",
+ "bytes",
+ "h2",
+ "http",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "xpro-protocol",
+ "xpro-transport",
+]
+
+[[package]]
+name = "xpro-protocol"
+version = "0.1.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "futures-util",
+ "hex",
+ "tokio",
+]
+
+[[package]]
+name = "xpro-transport"
+version = "0.1.0"
+dependencies = [
+ "boring",
+ "bytes",
+ "futures-util",
+ "h2",
+ "http",
+ "tokio",
+ "tokio-boring",
+ "tokio-tungstenite",
+ "tokio-util",
+ "webpki-root-certs",
+ "xpro-protocol",
 ]
 
 [[package]]
