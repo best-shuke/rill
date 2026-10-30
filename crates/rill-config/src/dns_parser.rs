@@ -71,8 +71,10 @@ impl rill_common::ProxyAdapter for StartupDnsProxy {
     fn addr(&self) -> &str {
         self.identity.addr()
     }
+    // A selector's UDP support follows its live choice, which only the
+    // published generation tracks.
     fn support_udp(&self) -> bool {
-        self.identity.support_udp()
+        self.target.resolve().is_some_and(|p| p.support_udp())
     }
     fn health(&self) -> &rill_common::ProxyHealth {
         self.identity.health()

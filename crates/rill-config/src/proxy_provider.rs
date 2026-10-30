@@ -960,9 +960,14 @@ impl ProxyProvider {
                 // every refresh — and, for a protocol missing from this
                 // build, stop the daemon from starting at all.
                 Err(e) if proxy_parser::node_is_xpro(raw_map) => {
-                    warn!("XPro provider node is unavailable: {e}");
+                    let label = if raw_name.is_empty() {
+                        "<unnamed>"
+                    } else {
+                        raw_name
+                    };
+                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable xpro node so nothing can dial past it");
                     result.push(crate::unavailable_placeholder(
-                        raw_name,
+                        label,
                         &e,
                         rill_common::AdapterType::Xpro,
                     ));

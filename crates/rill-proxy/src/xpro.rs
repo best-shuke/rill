@@ -100,6 +100,9 @@ fn canonical_host(host: &str) -> Result<String> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(ip.to_string());
     }
+    // XPro/1 encodes relative names only; an absolute FQDN (`example.com.`,
+    // as sniffed or sent by some clients) names the same host.
+    let host = host.strip_suffix('.').unwrap_or(host);
     Ok(url::Host::parse(host)
         .map_err(|_| RillError::Config("invalid XPro destination".into()))?
         .to_string()
@@ -117,6 +120,7 @@ mod tests {
             ("[2606:4700::1111]", "2606:4700::1111"),
             ("1.2.3.4", "1.2.3.4"),
             ("EXAMPLE.COM", "example.com"),
+            ("example.com.", "example.com"),
             ("例子.测试", "xn--fsqu00a.xn--0zwm56d"),
         ] {
             let host = canonical_host(input).unwrap();
