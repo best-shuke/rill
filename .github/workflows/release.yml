@@ -59,6 +59,12 @@ jobs:
           cache-on-failure: true
           key: release-${{ matrix.target }}
 
+      - name: Install NASM for BoringSSL
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+        with:
+          version: 2.16.01
+
       - name: Install zig
         if: runner.os == 'Linux'
         uses: mlugg/setup-zig@v1
@@ -73,6 +79,9 @@ jobs:
         shell: bash
         run: |
           # Desktop builds include full plus the opt-in XPro protocol.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=13.0
+          fi
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rill --features "$RILL_FEATURES"
           else
@@ -131,6 +140,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -141,7 +152,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat dist/*.sha256 > dist/SHA256SUMS
+          NOTES_FILE="$RUNNER_TEMP/rill-release-notes.md"
+          if [ -f "docs/releases/${GITHUB_REF_NAME#v}.md" ]; then
+            cp "docs/releases/${GITHUB_REF_NAME#v}.md" "$NOTES_FILE"
+          else
+            printf '%s\n' 'Static Linux (musl), macOS arm64 and Windows x64/arm64 builds of rill. SHA256SUMS lists every archive.' > "$NOTES_FILE"
+          fi
           gh release create "${{ github.ref_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --title "rill ${{ github.ref_name }}" \
-            --notes "Static Linux (musl), macOS arm64 and Windows x64/arm64 builds of rill. SHA256SUMS lists every archive."
+            --notes-file "$NOTES_FILE"
