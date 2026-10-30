@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6 — 2026-10-30
+
+- XPro nodes dial absolute host names (`example.com.`, as some clients
+  send or the sniffer reports) instead of failing with "invalid XPro
+  destination".
+- A `#name` DNS outbound reports UDP support from the group's live
+  selection, not the selection it had at startup.
+- An XPro provider node that fails to parse is logged with its provider
+  and node name, like TrustTunnel's.
+
 ## 0.1.5 — 2026-10-29
 
 - DNS named outbounds follow the published proxy generation, including
