@@ -43,12 +43,21 @@ pub(crate) async fn sniff_unnamed<R>(
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    if !tunnel.needs_sniffed_name(metadata) {
+    let unnamed = tunnel.needs_sniffed_name(metadata);
+    let configured = if unnamed {
+        None
+    } else {
+        tunnel.configured_sniffer(metadata)
+    };
+    if !unnamed && configured.is_none() {
         return Vec::new();
     }
     let prefix = read_first_bytes(conn, SNIFF_WINDOW).await;
     if let Some(name) = sniff_tls(&prefix).or_else(|| sniff_http(&prefix)) {
-        metadata.sniff_host = name;
+        match configured {
+            Some(sniffer) => sniffer.apply(&name, metadata),
+            None => metadata.sniff_host = name,
+        }
     }
     prefix
 }

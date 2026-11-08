@@ -354,6 +354,13 @@ pub fn parse_proxy_with_dialer(
             let adapter = parse_socks5(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        // mihomo `type: dns`; the config build hands it the resolver.
+        "dns" => {
+            reject_unthreaded_dialer(name, "dns", dialer)?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(
+                rill_proxy::DnsOutAdapter::new(name, None),
+            ))))
+        }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
             let adapter = parse_direct(name, config, ipv6)?;

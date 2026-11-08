@@ -1313,6 +1313,12 @@ async fn run(
 
     // Build shared SnifferRuntime from config (once per startup).
     let sniffer_runtime = Arc::new(SnifferRuntime::new(config.sniffer));
+    // TUN flows are read by the tunnel itself; give it the same policy.
+    if sniffer_runtime.is_enabled() {
+        tunnel.set_stream_sniffer(Some(
+            Arc::clone(&sniffer_runtime) as Arc<dyn rill_tunnel::StreamSniffer>
+        ));
+    }
     let auth = config.auth;
     // Suppress unused-variable warnings: sniffer_runtime and auth are
     // consumed only inside feature-gated listener blocks below.

@@ -12,6 +12,7 @@ pub mod xpro;
 
 pub mod dialer;
 pub mod direct;
+pub mod dns_out;
 pub mod group;
 pub mod health;
 pub mod http_adapter;
@@ -88,6 +89,7 @@ pub mod vless_adapter;
 pub mod vmess;
 
 pub use direct::DirectAdapter;
+pub use dns_out::DnsOutAdapter;
 pub use group::dialer_proxy::DialerProxyAdapter;
 pub use group::fallback::FallbackGroup;
 pub use group::load_balance::{LbStrategy, LoadBalanceGroup};

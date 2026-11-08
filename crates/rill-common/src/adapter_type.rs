@@ -32,6 +32,8 @@ pub enum AdapterType {
     /// Direct-dialing built-in named `COMPATIBLE` — upstream registers it
     /// as GLOBAL's default member (upstream `C.Compatible`).
     Compatible,
+    /// `type: dns` — answered by rill's own resolver (upstream `C.Dns`).
+    Dns,
 }
 
 impl fmt::Display for AdapterType {
@@ -59,6 +61,7 @@ impl fmt::Display for AdapterType {
             AdapterType::Pass => write!(f, "Pass"),
             AdapterType::PassRule => write!(f, "PassRule"),
             AdapterType::Compatible => write!(f, "Compatible"),
+            AdapterType::Dns => write!(f, "Dns"),
         }
     }
 }

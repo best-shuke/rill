@@ -4718,6 +4718,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         };

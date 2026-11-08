@@ -22,6 +22,7 @@ pub use relay::{
 pub use statistics::{ProxyTraffic, Statistics};
 pub use tcp::{route_inbound_tcp, route_inbound_tcp_with_socket, ConnectionGuard};
 pub use tunnel::{
-    OutboundFlush, PreHandleVerdict, ResolvedTarget, TrackedTcp, TunHandle, Tunnel, TunnelInner,
+    OutboundFlush, PreHandleVerdict, ResolvedTarget, StreamSniffer, TrackedTcp, TunHandle, Tunnel,
+    TunnelInner,
 };
 pub use udp::UdpFlushWatch;

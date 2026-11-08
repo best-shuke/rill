@@ -2265,6 +2265,25 @@ fn build_proxy_layer(
         ipv6,
         strict,
     )?;
+    // `type: dns` nodes answer from this build's resolver, which the
+    // parser does not see.
+    for raw_proxy in raw.proxies.as_deref().unwrap_or(&[]) {
+        let is_dns = raw_proxy
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t.eq_ignore_ascii_case("dns"));
+        let name = raw_proxy.get("name").and_then(|v| v.as_str());
+        if let (true, Some(name)) = (is_dns, name) {
+            if proxies.contains_key(name) {
+                proxies.insert(
+                    SmolStr::from(name),
+                    Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+                        rill_proxy::DnsOutAdapter::new(name, resolver.cloned()),
+                    ))),
+                );
+            }
+        }
+    }
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
 

@@ -142,6 +142,26 @@ impl SnifferRuntime {
     }
 }
 
+/// The `sniffer:` policy for TUN flows, whose first bytes the tunnel reads
+/// itself (`rill_tunnel::tcp::handle_tcp`).
+impl rill_tunnel::StreamSniffer for SnifferRuntime {
+    /// mihomo's `shouldOverride`: a flow on a configured TLS / HTTP port
+    /// with no name (with `parse-pure-ip`), or whose name is in
+    /// `force-domain`.
+    fn wants(&self, metadata: &Metadata) -> bool {
+        if !self.cfg.enable || !self.port_map.contains_key(&metadata.dst_port) {
+            return false;
+        }
+        let unnamed = metadata.host.is_empty() || metadata.host.parse::<IpAddr>().is_ok();
+        (unnamed && self.cfg.parse_pure_ip)
+            || (!unnamed && self.force.search(&metadata.host).is_some())
+    }
+
+    fn apply(&self, host: &str, metadata: &mut Metadata) {
+        self.maybe_apply_sniff(host, metadata);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +182,38 @@ mod tests {
 
     fn make_runtime(cfg: SnifferConfig) -> SnifferRuntime {
         SnifferRuntime::new(cfg)
+    }
+
+    #[test]
+    fn stream_sniffer_wants_unnamed_flows_on_configured_ports() {
+        use rill_tunnel::StreamSniffer;
+        let rt = make_runtime(SnifferConfig {
+            enable: true,
+            force_domain: vec!["+.forced.example".into()],
+            ..SnifferConfig::default()
+        });
+        let mut md = make_metadata("", 443);
+        md.dst_ip = Some("1.2.3.4".parse().unwrap());
+        assert!(rt.wants(&md), "pure IP on a TLS port");
+        assert!(!rt.wants(&make_metadata("", 22)), "port not configured");
+        assert!(
+            !rt.wants(&make_metadata("named.example", 443)),
+            "already named"
+        );
+        assert!(
+            rt.wants(&make_metadata("a.forced.example", 443)),
+            "force-domain"
+        );
+
+        let off = make_runtime(SnifferConfig {
+            enable: true,
+            parse_pure_ip: false,
+            ..SnifferConfig::default()
+        });
+        assert!(
+            !off.wants(&md),
+            "parse-pure-ip: false leaves IP flows alone"
+        );
     }
 
     // Build a minimal TLS ClientHello with the given SNI hostname.

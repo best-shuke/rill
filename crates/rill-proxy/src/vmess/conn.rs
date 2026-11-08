@@ -78,8 +78,10 @@ pub fn spawn_vmess_relay(
                 // nonce-budget exhaustion (issue #513 — otherwise an
                 // unexplained ~1 GiB disconnect), or a transport error.
                 // Fatal: the write side is stopped too.
+                // One connection's fate: debug, not the process-wide warn
+                // log (a server that resets instead of closing is common).
                 Err(e) => {
-                    tracing::warn!("vmess: read side closed: {e}");
+                    tracing::debug!("vmess: read side closed: {e}");
                     break false;
                 }
             }

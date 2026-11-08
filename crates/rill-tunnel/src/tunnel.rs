@@ -158,6 +158,20 @@ pub struct TunnelInner {
     udp_flush: tokio::sync::watch::Sender<u64>,
     /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
     connection_notes: AtomicBool,
+    /// The `sniffer:` configuration, for flows the tunnel reads from a
+    /// netstack (TUN) — see [`Tunnel::set_stream_sniffer`].
+    stream_sniffer: RwLock<Option<Arc<dyn StreamSniffer>>>,
+}
+
+/// The `sniffer:` policy as applied to a stream whose first bytes the
+/// tunnel reads itself (TUN): which flows to sniff and what a sniffed name
+/// does. Implemented by the listener crate's `SnifferRuntime`.
+pub trait StreamSniffer: Send + Sync {
+    /// Whether the first bytes of `metadata`'s flow should be sniffed.
+    fn wants(&self, metadata: &Metadata) -> bool;
+    /// Record a sniffed `host` on `metadata` (skip-domain,
+    /// override-destination).
+    fn apply(&self, host: &str, metadata: &mut Metadata);
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -387,6 +401,22 @@ impl TunnelInner {
     /// (black-holed otherwise), and the inbound has not sniffed a name
     /// yet. Every other flow already has a name, or is a real address that
     /// dials as-is. Gates the sniff in [`crate::tcp::handle_tcp`].
+    /// The configured sniffer, when it wants `metadata`'s first bytes. A
+    /// destination in the fake-IP pool with a live mapping already has its
+    /// name and is left alone, as in mihomo (it maps fake IPs first).
+    pub(crate) fn configured_sniffer(&self, metadata: &Metadata) -> Option<Arc<dyn StreamSniffer>> {
+        let sniffer = self.stream_sniffer.read().clone()?;
+        if !sniffer.wants(metadata) {
+            return None;
+        }
+        if let Some(ip) = metadata.dst_ip.map(|ip| ip.to_canonical()) {
+            if metadata.host.is_empty() && self.resolver().is_fake_ip(ip) {
+                return None;
+            }
+        }
+        Some(sniffer)
+    }
+
     pub(crate) fn needs_sniffed_name(&self, metadata: &Metadata) -> bool {
         if is_sniffed_name(metadata)
             || (!metadata.host.is_empty() && metadata_ip_literal(&metadata.host).is_none())
@@ -853,6 +883,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
+                stream_sniffer: RwLock::new(None),
             }),
         };
         tunnel
@@ -867,6 +898,13 @@ impl Tunnel {
     /// and recently closed connections. Off by default; each recording
     /// connection allocates its note log. Headless statistics never record:
     /// nothing could read the notes.
+    /// Sniff TUN flows the way `sniffer:` asks, not only those whose
+    /// address the tunnel cannot map back (mihomo sniffs every flow on the
+    /// configured ports that has no name). `None` turns it off.
+    pub fn set_stream_sniffer(&self, sniffer: Option<Arc<dyn StreamSniffer>>) {
+        *self.inner.stream_sniffer.write() = sniffer;
+    }
+
     pub fn set_connection_notes(&self, enabled: bool) {
         self.inner
             .connection_notes
