@@ -3169,6 +3169,7 @@ fn parse_proxy_group_inner(
         .map_err(|e| format!("group '{}': {e}", config.name))?;
 
     let proxy_names = config.proxies.as_deref().unwrap_or(&[]);
+    let mut missing_members = false;
     for name in proxy_names {
         match existing_proxies.get(name.as_str()) {
             Some(proxy) => proxies.push(Arc::clone(proxy)),
@@ -3179,6 +3180,7 @@ fn parse_proxy_group_inner(
                 ));
             }
             None => {
+                missing_members = true;
                 tracing::warn!(
                     "Proxy '{}' not found for group '{}', skipping",
                     name,
@@ -3270,6 +3272,15 @@ fn parse_proxy_group_inner(
         slots
     };
 
+    if proxies.is_empty() && slots.is_empty() && missing_members {
+        // Every member it names is missing: no group, as before (mihomo
+        // rejects the config outright). Falling back to a direct dial here
+        // would silently undo a `dialer-proxy` chain through the group.
+        return Err(format!(
+            "group '{}' has no valid proxies or providers",
+            config.name
+        ));
+    }
     if proxies.is_empty() && slots.is_empty() {
         // mihomo's `empty-fallback` (default `COMPATIBLE`, a direct dial):
         // a group whose members all filtered away keeps existing, so the
@@ -3661,6 +3672,7 @@ fn parse_xpro(
 #[cfg(test)]
 mod tests {
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
     #[test]
     fn non_uuid_ids_map_to_uuid_v5_in_the_nil_namespace() {
         // Python: uuid.uuid5(uuid.UUID(int=0), "not-a-uuid")

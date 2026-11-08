@@ -524,6 +524,18 @@ const RAW_SOCKET_PRIMITIVES: &[&str] = &[
 /// is exact so a *new* raw call in an allowlisted file still fails, and a
 /// removed one forces the entry to be trimmed.
 const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/rill-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v4(",
+        1,
+        "the tproxy listening socket (IP_TRANSPARENT), not an outbound one",
+    ),
+    (
+        "crates/rill-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v6(",
+        1,
+        "the tproxy listening socket (IPV6_TRANSPARENT), not an outbound one",
+    ),
     // The chokepoints themselves.
     (
         "crates/rill-common/src/socket_protect.rs",

@@ -3773,7 +3773,7 @@ fn store_geoip_index_cache(cache: &Path, bytes: &[u8]) {
                 (at, e.path())
             })
             .collect();
-        others.sort_by(|a, b| b.0.cmp(&a.0));
+        others.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (_, stale) in others.into_iter().skip(GEOIP_INDEX_CACHES_KEPT) {
             let _ = std::fs::remove_file(stale);
         }

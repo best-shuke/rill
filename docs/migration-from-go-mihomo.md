@@ -1,6 +1,6 @@
 # Migration guide: Go mihomo → rill
 
-Last updated: 2026-06-19. Tracks the current default app feature set.
+Last updated: 2026-11-08. Tracks the current default app feature set.
 Owner: pm. Tracks roadmap item: **M1.H-3**.
 Review cadence: updated at each milestone exit.
 
@@ -52,7 +52,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
 | `proxies:` — Direct, Reject | ✓ | Fully supported. |
-| `proxies:` — VMess | ✓ | AEAD VMess outbound with TCP/WebSocket transports. |
+| `proxies:` — VMess | ✓ | AEAD VMess outbound over `tcp`, `ws`, `grpc`, `h2`, `httpupgrade` and `http` (header camouflage). A `uuid` that is not a UUID maps to its UUIDv5, as in mihomo. |
 | `proxies:` — VLESS | ✓ | Plain VLESS, XTLS-Vision, Reality/uTLS, and post-quantum Encryption (`mlkem768x25519plus`) in the default app build. |
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
@@ -61,16 +61,16 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
-| `proxy-groups:` — load-balance | ✓ | round-robin + consistent-hashing (M1.C-1). |
+| `proxy-groups:` — load-balance | ✓ | consistent-hashing (default, as in mihomo), round-robin, sticky-sessions. |
 | `proxy-groups:` — relay | ✓ | Chain multiple outbounds (M1.C-2). |
 | `rules:` — DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD | ✓ | Fully supported. |
 | `rules:` — IP-CIDR, IP-CIDR6 | ✓ | Fully supported. |
 | `rules:` — GEOIP | ✓ | MaxMind MMDB. |
 | `rules:` — GEOSITE | ✓ | mrs format only — see §Rules. |
 | `rules:` — RULE-SET | ✓ | M1.D-5, mrs + yaml formats. |
-| `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. |
-| `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
-| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
+| `rules:` — PROCESS-NAME, PROCESS-PATH (+ `-REGEX`, `-WILDCARD`) | ✓ | Platform lookup wired. |
+| `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired; IN-TYPE takes `/`-separated lists (`SOCKS/HTTP`). |
+| `rules:` — SUB-RULE | ✓ | mihomo's `SUB-RULE,(<condition>),<block>` and the bare `SUB-RULE,<block>`; cycle detection. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |
@@ -79,7 +79,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
-| `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
+| `dns:` — DoQ (`quic://`) | ~ | Queried over DoT (`tls://<host>:853`) with a warning; DoQ providers serve both. |
+| `dns:` — `system`, `system://`, `dhcp://<if>` | ~ | The system resolvers (`/etc/resolv.conf` on Unix); DHCP is not queried. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. As in mihomo, a match is final: no fallback-filter, no fall-through to `nameserver`/`fallback`. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP (incl. `geoip-code: LAN`)/IP-CIDR/domain/geosite gates. |
@@ -105,8 +106,8 @@ These fields parse without error but behave differently from Go mihomo:
 | `authentication: ["user:"]` (empty password) | Accepted silently | Accepted; warn-once | B |
 | `skip-auth-prefixes` | Defaults to `[]` | Always includes `127.0.0.1/32` + `::1/128` | A |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
-| `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
-| `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
+| `dns.nameserver: quic://...` | Supported | Queried over DoT on the same host, with a warning | B |
+| `dns.nameserver: sdns://...` | Warn-drop (silent) | Dropped with a warning | B |
 | `dns.default-nameserver: tls://...` | Allowed (bootstrap loop risk) | Hard error | A |
 | `dns.default-nameserver` absent with encrypted hostname upstream | Fails at first query | Hard error at load | A |
 | `nameserver-policy` entry with all URLs stripped | Runtime panic | Hard parse error at load | A |
@@ -114,7 +115,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `fallback-filter.geoip: true` with no MMDB | Startup error | Same (after the on-demand download fails) | — |
 | `nameserver-policy` key with `geosite:` prefix | Resolved via geosite DB | Same — resolved via geosite DB (needs geosite DB; warn-skip if absent) | — |
 | `nameserver-policy` key with `rule-set:` prefix | Resolved via rule-provider | Same — resolved via rule-provider (domain/classical); `ipcidr` behavior and missing provider are hard errors | — |
-| `IN-TYPE` with unknown value (e.g. `IN-TYPE,QUIC`) | Silently no-match | Hard parse error | A |
+| `IN-TYPE` with unknown value (e.g. `IN-TYPE,QUIC`) | Config error | Rule skipped with a warning (an error under `strict`) | — |
 | `PUT /configs` in-flight connections | Graceful handover | Established flows keep running; setups still dialing under the old policy are cancelled + logged | — |
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |
 | `GET /configs` response includes null Option fields | Full struct with nulls | Only non-null fields returned | B |
@@ -133,7 +134,7 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 |---------|-----------|-------------|
 | Duplicate listener port | Silently overwrites last | Hard parse error naming both conflicting listeners |
 | Duplicate listener name | Silently overwrites last | Hard parse error |
-| Unknown listener type (e.g. `type: redir`) | Silently ignored | Hard parse error |
+| Unknown listener type (e.g. `type: foo`) | Config error | Hard parse error. `socks` and `redir` are supported; mihomo inbounds rill lacks (`vmess`, `tuic`, `tunnel`, …) are skipped with a warning. |
 | Shorthand port + `listeners:` entry on same port | Both accepted | Hard parse error (same as duplicate port) |
 | `authentication` entry with no `:` | Silently stored with empty password | Hard parse error |
 | `authentication` entry with empty username (`:pass`) | Silently accepted | Hard parse error |
@@ -143,7 +144,7 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 | `sub-rules:` cycle | May panic or loop | Hard parse error |
 | `sub-rules:` reference to undefined block | Runtime no-match | Hard parse error |
 | `nameserver-policy` entry with zero valid nameservers | Runtime panic at first query | Hard parse error at load |
-| `IN-TYPE` with unknown protocol name | Silently no-matches all traffic of that type | Hard parse error |
+| `IN-TYPE` with unknown protocol name | Config error | Rule skipped with a warning |
 | Base64 payload with URL-safe alphabet (`-`, `_`) | Accepted in some dashboard versions | 400 with decode-error message |
 
 ---
@@ -310,10 +311,12 @@ sweeps static members of every group type since v1.18.4).
 
 ### load-balance
 
-Supported in M1.C-1. Two strategies: `round-robin` (default) and
-`consistent-hashing` (sticky by destination — mihomo `getKey`: IP-literal
-host verbatim, domain reduced to eTLD+1, else `dst_ip`). Periodic
-health-check using the same URL-probe mechanism as `url-test`.
+Three strategies, as in mihomo: `consistent-hashing` (the default —
+sticky by destination, mihomo `getKey`: IP-literal host verbatim, domain
+reduced to eTLD+1, else `dst_ip`), `round-robin`, and `sticky-sessions`
+(a source/destination pair keeps a random member for ten minutes, moving
+on only when it is down). Periodic health-check using the same URL-probe
+mechanism as `url-test`.
 
 ```yaml
 proxy-groups:
@@ -325,7 +328,7 @@ proxy-groups:
       - proxy-c
     url: https://www.gstatic.com/generate_204
     interval: 300               # health-check sweep, seconds (0 = disabled)
-    strategy: round-robin       # round-robin (default) | consistent-hashing
+    strategy: consistent-hashing  # (default) | round-robin | sticky-sessions
     lazy: false
 ```
 
@@ -333,7 +336,7 @@ proxy-groups:
 
 | Behaviour | Go mihomo | rill |
 |-----------|-----------|-------------|
-| Unknown `strategy` value | Falls back to round-robin silently | Hard parse error — wrong strategy means wrong distribution (ADR-0002 Class A). |
+| Unknown `strategy` value | Config error (`errStrategy`) | Hard parse error. |
 | All proxies dead | Returns a dead proxy slot; dial fails | Returns `NoProxyAvailable` immediately — fast, named failure (Class B). |
 | `consistent-hashing` with no alive proxies | Panics (index out of bounds) | Returns `NoProxyAvailable` cleanly (Class A). |
 | `consistent-hashing` hash seed | `utils.MapHash` is process-seeded — assignments reshuffle on every restart | Same destination key (`getKey`: IP-literal host → host, domain → eTLD+1, else `dst_ip`) + `jumpHash` over the **full** member list with dead-member retry — but hashed with a fixed FNV-1a-64, so assignments are stable across restarts (Class B, strictly better for stability). |
@@ -487,8 +490,9 @@ An answer that has expired less than an hour ago is served at once — with
 TTL 1 to DNS clients — while a background query refreshes it, as mihomo's
 cache does.
 
-**DoQ (`quic://`) is a hard error** with a message pointing at roadmap M1.E-6.
-Replace with `tls://` or `https://` equivalents.
+**DoQ (`quic://`) is queried over DoT**: `quic://host[:port]` becomes
+`tls://host` (port 853) with a warning. `system` / `system://` /
+`dhcp://<interface>` stand for the system resolvers.
 
 **`default-nameserver` required when encrypted upstream uses a hostname** (not
 an IP literal). If you specify `https://cloudflare-dns.com/dns-query` without
@@ -641,8 +645,8 @@ Most common format from public providers. Typical issues:
    ```bash
    metacubex convert-geo geosite.dat -o geosite.mrs
    ```
-5. **`quic://` nameservers** — replace with `tls://` or `https://` equivalents.
-   `quic://` is a hard parse error with a message pointing at the roadmap.
+5. **`quic://` nameservers** — load, and are queried over DoT on the same
+   host; prefer writing `tls://` or `https://` directly.
 6. Run `-t` to validate: `rill -f config.yaml -t`
 
 ### Type 2: Enterprise split-tunnel (nameserver-policy, IN-NAME rules)
@@ -693,8 +697,11 @@ Most common format from public providers. Typical issues:
 
 ### Type 4: Proxy provider subscription (`proxy-providers:`)
 
-1. **`proxy-providers:`** — supported in M1.H-1 (http + file sources, health-check,
-   `include-all` shorthand).
+1. **`proxy-providers:`** — `http`, `file` and `inline` (`payload:`)
+   sources; `health-check` runs on its interval (lazy by default, as in
+   mihomo); every `override:` key mihomo lists, including
+   `additional-prefix`/`-suffix` and `proxy-name` renames (not
+   `override-expr`).
 2. **`interval:` refresh** — scheduled for both `http` and `file` proxy
    providers (`http` refetches and rewrites the `path:` cache, `file`
    re-reads). `0`/absent disables the timer; manual
@@ -702,8 +709,12 @@ Most common format from public providers. Typical issues:
    additionally fs-watches `file` providers, so a file edit reloads
    immediately even without `interval` — here an un-`interval`ed file
    provider does not auto-reload.
-3. **`use:` in proxy groups** — wired for proxy providers. Provider filters and
-   `include-all` shorthands are applied when groups are resolved.
+3. **`use:` in proxy groups** — wired for proxy providers. As in mihomo,
+   `include-all` takes every top-level proxy and every provider, `filter`
+   (several patterns separated by a backtick, look-around allowed) narrows
+   provider members and the `include-all` proxies, `exclude-filter` /
+   `exclude-type` drop any member, and a group left empty holds
+   `empty-fallback` (default `COMPATIBLE`).
 
 ---
 
@@ -730,8 +741,7 @@ These have been tested against a real subscription and confirmed working:
 
 The following are unsupported or intentionally rejected:
 
-- **`quic://` nameservers** — hard error; replace with `tls://` or `https://`.
-- **TUIC / WireGuard / SSH / ShadowsocksR proxies** — hard error; no default-build adapter.
+- **TUIC / WireGuard / SSH / ShadowsocksR / Hysteria (v1) / Mieru proxies** — not implemented; such nodes are skipped with a warning and groups keep their other members.
 - **AnyTLS proxies in a `minimal` build** — hard error; the `full` bundle and
   the release binaries support them.
 - **Snell v1/v2** — hard error; use Snell v3/v4/v5/v6.

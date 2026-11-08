@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.2.0 — 2026-11-08
+
+mihomo configuration compatibility. Every item was checked against
+mihomo v1.19.30 on the same configs (`-t` side by side, and real traffic
+through a mihomo server). Measured with a real 3479-rule config: rill uses
+18.6 MB RSS idle and 18.9 MB under load against mihomo's 41 MB and 47 MB,
+half the CPU for the same requests, and starts in 20 ms (mihomo ~70 ms).
+
+Proxy groups, as mihomo builds them — these change membership of
+existing configs:
+
+- `include-all: true` adds every top-level proxy as well as every
+  provider. It used to add providers only, so a subscription template's
+  region groups came up empty.
+- `filter` narrows the `include-all` proxies, not only provider members;
+  several patterns separated by a backtick order members by pattern; and
+  look-around (`^((?!港).)*$`) is accepted, as mihomo's regexp2 accepts it.
+- `exclude-filter` and `exclude-type` drop static members too.
+- A group left with no member holds `empty-fallback` (default
+  `COMPATIBLE`) instead of disappearing with the rules that name it.
+- `load-balance` without `strategy` is consistent-hashing, as in mihomo
+  (it was round-robin); `strategy: sticky-sessions` is supported.
+- A `type: direct` proxy keeps its own name in groups instead of
+  showing as `DIRECT`.
+
+Proxy providers:
+
+- Every `override:` key mihomo lists applies (`udp`, `skip-cert-verify`,
+  `up`/`down`, `interface-name`, `routing-mark`, `ip-version`, `tfo`,
+  `mptcp`, `additional-prefix`, `additional-suffix`, `proxy-name`, …);
+  only `dialer-proxy` did.
+- `type: inline` providers with `payload:`.
+- `health-check` runs on its interval — lazily by default, as in mihomo,
+  only after the provider's nodes carried traffic. It used to be inert.
+
+Proxies and transports:
+
+- VMess over `grpc`, `h2`, `httpupgrade` and `http` (V2Ray header
+  camouflage); only `tcp` and `ws` worked.
+- A VLESS/VMess `uuid` that is not a UUID maps to its UUIDv5, as mihomo
+  and Xray map it, instead of dropping the node.
+- `type: dns` proxies answer the connections routed to them from rill's
+  own resolver.
+
+DNS:
+
+- `system`, `system://` and `dhcp://<interface>` nameservers use the
+  system resolvers; `quic://` is queried over DoT on the same host;
+  `sdns://` is skipped with a warning. Each used to fail the config.
+- `hosts: {name: lan}` resolves to this host's interface addresses.
+
+Rules:
+
+- `IN-TYPE` takes `/`-separated lists (`SOCKS/HTTP`) and mihomo's full set
+  of inbound types.
+- `PROCESS-NAME-REGEX`, `PROCESS-PATH-REGEX`, `PROCESS-NAME-WILDCARD`,
+  `PROCESS-PATH-WILDCARD`.
+- mihomo's `SUB-RULE,(<condition>),<block>`.
+
+Sniffing (TUN):
+
+- TUN flows follow `sniffer:`: a TLS/HTTP flow on a configured port with
+  no name (`parse-pure-ip`) or a `force-domain` name is sniffed. Only flows
+  whose fake IP could not be mapped back were sniffed before.
+- `sniff.QUIC.ports`: the server name of QUIC (HTTP/3) flows is read from
+  their client Initials, reassembled across up to four datagrams.
+
+Listeners:
+
+- `type: socks`, `type: redir` and top-level `redir-port`. mihomo inbound
+  types rill does not have (`vmess`, `tuic`, `tunnel`, …) are skipped with
+  a warning instead of failing the config.
+- The tproxy TCP listener works with real `TPROXY` rules as well as
+  REDIRECT (IP_TRANSPARENT, original destination from the local address).
+
+CLI and API:
+
+- A relative `-f` is taken from the current directory and no `-f` means
+  `<home>/config.yaml`, as in mihomo; `-d` used to be prefixed to `-f`.
+- JSON request bodies are accepted without `Content-Type`, as mihomo
+  accepts them; they got 415.
+
+Startup:
+
+- The GeoIP country index is cached beside the database (a few hundred
+  KB, at most four files): a `GEOIP` rule no longer walks the whole
+  database at every start (~80 ms, a few MB of peak memory).
+- The first of startup's two build passes no longer parses every rule
+  and rule-set only to discard them.
+
 ## 0.1.6 — 2026-10-30
 
 - XPro nodes dial absolute host names (`example.com.`, as some clients

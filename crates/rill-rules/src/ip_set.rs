@@ -78,7 +78,12 @@ fn decode_intervals<A: Copy + Ord, const N: usize>(
     *pos += need;
     let mut starts = Vec::with_capacity(count);
     let mut ends = Vec::with_capacity(count);
-    for pair in body.chunks_exact(2 * N) {
+    #[allow(
+        clippy::chunks_exact_to_as_chunks,
+        reason = "`2 * N` is a generic expression, which as_chunks' const length cannot take"
+    )]
+    let pairs = body.chunks_exact(2 * N);
+    for pair in pairs {
         let start = read(pair[..N].try_into().ok()?);
         let end = read(pair[N..].try_into().ok()?);
         if start > end || ends.last().is_some_and(|&last| start <= last) {

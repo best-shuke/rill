@@ -330,7 +330,7 @@ impl LoadBalanceGroup {
                     }
                     idx = jump_hash(key.wrapping_add(now_nanos()), len) as usize;
                 }
-                let found = members.iter().position(|p| usable(p))?;
+                let found = members.iter().position(usable)?;
                 self.sticky.set(key, found);
                 Some(Arc::clone(&members[found]))
             }

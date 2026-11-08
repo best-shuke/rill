@@ -185,15 +185,14 @@ fn needs_rewrite(list: Option<&[String]>) -> bool {
 /// The DNS section with every special spelling rewritten, or `None` when
 /// there is nothing to rewrite.
 pub(crate) fn normalize(dns: &RawDns) -> Option<RawDns> {
-    let policy_lists: Vec<&[String]> = dns
+    let policy_lists = dns
         .nameserver_policy
         .iter()
         .flat_map(|m| m.values())
         .map(|v| match v {
             RawNspValue::One(s) => std::slice::from_ref(s),
             RawNspValue::Many(v) => v.as_slice(),
-        })
-        .collect();
+        });
     let any = [
         dns.nameserver.as_deref(),
         dns.fallback.as_deref(),
@@ -202,7 +201,7 @@ pub(crate) fn normalize(dns: &RawDns) -> Option<RawDns> {
         dns.direct_nameserver.as_deref(),
     ]
     .into_iter()
-    .chain(policy_lists.into_iter().map(Some))
+    .chain(policy_lists.map(Some))
     .any(needs_rewrite);
     if !any {
         return None;
