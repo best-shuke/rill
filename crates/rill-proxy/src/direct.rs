@@ -33,6 +33,9 @@ pub struct DirectAdapter {
     /// behaviour for downstream consumers that haven't opted in.
     connect_timeout: Option<Duration>,
     health: ProxyHealth,
+    /// The `name:` of a `type: direct` entry in `proxies:`; the built-ins
+    /// report `DIRECT` / `COMPATIBLE`.
+    name: Option<Box<str>>,
 }
 
 impl DirectAdapter {
@@ -43,7 +46,16 @@ impl DirectAdapter {
             resolver: None,
             connect_timeout: None,
             health: ProxyHealth::new(),
+            name: None,
         }
+    }
+
+    /// Report `name` instead of `DIRECT` — groups list, filter and select
+    /// a user-defined direct node by the name the config gives it.
+    #[must_use]
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     /// `COMPATIBLE` built-in — a direct dialer carrying the `Compatible`
@@ -335,6 +347,9 @@ async fn connect_with_mark(
 #[async_trait]
 impl ProxyAdapter for DirectAdapter {
     fn name(&self) -> &str {
+        if let Some(name) = &self.name {
+            return name;
+        }
         match self.adapter_type {
             AdapterType::Compatible => "COMPATIBLE",
             _ => "DIRECT",

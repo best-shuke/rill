@@ -64,6 +64,9 @@ maxminddb = { workspace = true }
 ipnet = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
+# Look-around in proxy-name filters (mihomo compiles them with regexp2);
+# only patterns the `regex` crate rejects use it.
+fancy-regex = { version = "0.20", default-features = false, features = ["std", "unicode"] }
 parking_lot = { workspace = true }
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }

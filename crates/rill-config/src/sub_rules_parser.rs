@@ -93,33 +93,55 @@ fn build_reference_graph(
     Ok(graph)
 }
 
-/// Extract the target block name from a `SUB-RULE,NAME` line, if the line is
-/// a SUB-RULE reference. Returns `None` for any other rule type.
-///
-/// upstream: `rules/parser.go` SUB-RULE case — two-field form
-/// `SUB-RULE,<block-name>` (upstream also accepts a `(cond)` field that
-/// rill does not implement). Further comma-delimited fields after the
-/// block name are *rejected* at rule-parse time (issue #625); this
-/// extractor still takes the first field so the reference-graph builder
-/// can point the error at the would-be name.
-pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
+/// A `SUB-RULE` line split into its optional condition and block name:
+/// mihomo's `SUB-RULE,(<condition>),<block>` or rill's older
+/// `SUB-RULE,<block>`. `None` for any other rule type. In the mihomo form
+/// the condition is returned without its outer parentheses; anything after
+/// the block name is left in the name for the rule parser to reject.
+pub(crate) fn split_sub_rule(line: &str) -> Option<(Option<&str>, &str)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let mut it = line.splitn(2, ',');
-    let ty = it.next()?.trim();
-    if !ty.eq_ignore_ascii_case("SUB-RULE") {
+    let (ty, rest) = line.split_once(',')?;
+    if !ty.trim().eq_ignore_ascii_case("SUB-RULE") {
         return None;
     }
-    let rest = it.next()?.trim();
+    let rest = rest.trim();
     if rest.is_empty() {
         return None;
     }
-    // Trailing comma-separated fields are rejected at rule-parse time
-    // (issue #625); for reference-graph building we only need the first
-    // field to name the would-be target in the undefined-block error.
-    Some(rest.split(',').next()?.trim().to_string())
+    if rest.starts_with('(') {
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let cond = rest[1..i].trim();
+                        let name = rest[i + 1..].trim().strip_prefix(',')?.trim();
+                        return (!name.is_empty()).then_some((Some(cond), name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    Some((None, rest))
+}
+
+/// Extract the target block name from a `SUB-RULE` line, if the line is a
+/// SUB-RULE reference. Returns `None` for any other rule type.
+///
+/// upstream: `rules/parser.go` SUB-RULE case. Further comma-delimited
+/// fields after the block name are *rejected* at rule-parse time (issue
+/// #625); this extractor still takes the first field so the
+/// reference-graph builder can point the error at the would-be name.
+pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
+    let (_, name) = split_sub_rule(line)?;
+    Some(name.split(',').next()?.trim().to_string())
 }
 
 /// DFS-based topological sort with cycle detection.  Returns the order in
@@ -196,6 +218,25 @@ pub fn build_sub_rule_rule(
         .get(block_name)
         .ok_or_else(|| format!("sub-rule '{block_name}' not defined"))?;
     Ok(Box::new(SubRuleRule::new(block_name, Arc::clone(block))))
+}
+
+/// [`build_sub_rule_rule`] gated on mihomo's `(<condition>)`, parsed as a
+/// rule with a placeholder target.
+pub fn build_conditional_sub_rule(
+    condition: &str,
+    block_name: &str,
+    resolved: &SubRuleBlocks,
+    ctx: &rill_rules::ParserContext,
+) -> Result<Box<dyn Rule>, String> {
+    let block = resolved
+        .get(block_name)
+        .ok_or_else(|| format!("sub-rule '{block_name}' not defined"))?;
+    let cond = rill_rules::parse_rule(&format!("{condition},SUB-RULE-CONDITION"), ctx)
+        .map_err(|e| format!("SUB-RULE condition '({condition})': {e}"))?;
+    Ok(Box::new(
+        SubRuleRule::new(block_name, Arc::clone(block))
+            .with_condition(cond, &format!("({condition})")),
+    ))
 }
 
 #[cfg(test)]

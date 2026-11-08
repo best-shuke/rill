@@ -16,6 +16,7 @@ pub mod ech_dns;
 pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
+pub mod name_regex;
 pub mod proxy_parser;
 pub mod proxy_provider;
 pub mod proxy_provider_refresh;
@@ -27,6 +28,7 @@ mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
 pub mod subscription_userinfo;
+mod system_dns;
 #[cfg(test)]
 mod test_support;
 
@@ -8755,5 +8757,102 @@ mod default_geo_path_tests {
             existing_or_first(dir.path(), ASN),
             dir.path().join("GeoLite2-ASN.mmdb")
         );
+    }
+}
+
+/// Group membership as mihomo builds it (`adapter/outboundgroup/parser.go`,
+/// `groupbase.go`): what subscription templates rely on.
+#[cfg(all(test, feature = "ss"))]
+mod mihomo_group_semantics_tests {
+    use super::load_config_from_str;
+
+    const NODES: &str = r#"
+proxies:
+  - {name: "香港 01", type: ss, server: 1.1.1.1, port: 443, cipher: aes-128-gcm, password: p}
+  - {name: "香港 02", type: ss, server: 1.1.1.2, port: 443, cipher: aes-128-gcm, password: p}
+  - {name: "日本 01", type: ss, server: 1.1.1.3, port: 443, cipher: aes-128-gcm, password: p}
+  - {name: "直连", type: direct}
+"#;
+
+    async fn members(groups: &str, group: &str) -> Vec<String> {
+        let yaml = format!("{NODES}proxy-groups:\n{groups}\nrules:\n  - MATCH,DIRECT\n");
+        let config = load_config_from_str(&yaml).await.expect("config loads");
+        let proxy = config
+            .proxies
+            .get(group)
+            .unwrap_or_else(|| panic!("group {group} exists"));
+        proxy.members().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn include_all_pulls_static_proxies() {
+        let got = members("  - {name: A, type: select, include-all: true}", "A").await;
+        assert_eq!(got, ["日本 01", "直连", "香港 01", "香港 02"]);
+    }
+
+    #[tokio::test]
+    async fn filter_narrows_the_include_all_expansion() {
+        let got = members(
+            "  - {name: A, type: select, include-all: true, filter: \"(?i)港|hk\"}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["香港 01", "香港 02"]);
+    }
+
+    #[tokio::test]
+    async fn look_around_filter_works() {
+        let got = members(
+            "  - {name: A, type: select, include-all-proxies: true, filter: \"^((?!港).)*$\"}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["日本 01", "直连"]);
+    }
+
+    #[tokio::test]
+    async fn backtick_filters_order_members_by_pattern() {
+        let got = members(
+            "  - {name: A, type: select, include-all: true, filter: \"日本`香港\"}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["日本 01", "香港 01", "香港 02"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_members_come_first_and_are_not_repeated() {
+        let got = members(
+            "  - {name: A, type: select, proxies: [DIRECT, \"日本 01\"], include-all: true, filter: 日本}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["DIRECT", "日本 01"]);
+    }
+
+    #[tokio::test]
+    async fn exclude_filter_and_type_drop_static_members() {
+        let got = members(
+            "  - {name: A, type: select, proxies: [\"香港 01\", \"日本 01\", DIRECT], exclude-filter: 香港, exclude-type: \"direct\"}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["日本 01"]);
+    }
+
+    #[tokio::test]
+    async fn empty_group_falls_back_to_compatible() {
+        let got = members(
+            "  - {name: A, type: select, include-all: true, filter: nomatch}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["COMPATIBLE"]);
+        let got = members(
+            "  - {name: A, type: url-test, include-all: true, filter: nomatch, empty-fallback: REJECT, url: \"https://example.com\"}",
+            "A",
+        )
+        .await;
+        assert_eq!(got, ["REJECT"]);
     }
 }

@@ -159,6 +159,11 @@ pub async fn parse_dns(
         }
     };
 
+    // `system`, `dhcp://…` and `quic://…` entries name no single server:
+    // rewrite them first (see `system_dns`).
+    let normalized = crate::system_dns::normalize(dns);
+    let dns = normalized.as_ref().unwrap_or(dns);
+
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
     let respect_rules = dns.respect_rules.unwrap_or(false);

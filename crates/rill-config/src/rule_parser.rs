@@ -5,7 +5,9 @@ use rill_common::Rule;
 use rill_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetBehavior, RuleSetRule};
 use tracing::warn;
 
-use crate::sub_rules_parser::{build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks};
+use crate::sub_rules_parser::{
+    build_conditional_sub_rule, build_sub_rule_rule, split_sub_rule, SubRuleBlocks,
+};
 
 /// Parse rules with no rule-providers or sub-rule blocks available.
 ///
@@ -74,23 +76,30 @@ pub fn parse_one_rule_or_subrule(
     if let Some(result) = try_parse_rule_set(line, providers) {
         return result;
     }
-    if let Some(block_name) = parse_sub_rule_reference(line) {
-        // `SUB-RULE,<name>` takes exactly one field. A further comma field
-        // — upstream's unsupported `SUB-RULE,(cond),name` conditional form,
-        // or a typo'd `SUB-RULE,name,junk` — used to be silently dropped,
-        // which routes by a different block than the author wrote (#625).
-        let rest = line
-            .split_once(',')
-            .map(|(_, r)| r)
-            .unwrap_or_default()
-            .trim();
-        if rest.contains(',') {
+    if let Some((condition, block_name)) = split_sub_rule(line) {
+        // `SUB-RULE,(<cond>),<name>` (mihomo) or `SUB-RULE,<name>`. A
+        // further comma field after the name — a typo'd
+        // `SUB-RULE,name,junk` — used to be silently dropped, which routes
+        // by a different block than the author wrote (#625).
+        if block_name.contains(',') {
             return Err(format!(
-                "SUB-RULE takes exactly <block-name> — trailing fields are \
+                "SUB-RULE takes (<condition>),<block-name> — trailing fields are \
                  not supported: '{line}'"
             ));
         }
-        return build_sub_rule_rule(&block_name, sub_rules);
+        return match condition {
+            Some(cond) => build_conditional_sub_rule(cond, block_name, sub_rules, ctx),
+            None => build_sub_rule_rule(block_name, sub_rules),
+        };
+    }
+    if line
+        .trim_start()
+        .get(..9)
+        .is_some_and(|t| t.eq_ignore_ascii_case("SUB-RULE,"))
+    {
+        return Err(format!(
+            "malformed SUB-RULE (expected `SUB-RULE,(<condition>),<block>`): '{line}'"
+        ));
     }
     rill_rules::parse_rule(line, ctx)
 }
@@ -180,8 +189,8 @@ mod tests {
 
         for line in [
             "SUB-RULE,blk,junk",
-            "SUB-RULE,(DOMAIN,a),blk",
             "SUB-RULE,blk,",
+            "SUB-RULE,(DOMAIN,a),blk,x",
         ] {
             let err =
                 parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules)
@@ -192,6 +201,46 @@ mod tests {
                 "{line}: unexpected error {err}"
             );
         }
+    }
+
+    /// mihomo's `SUB-RULE,(<condition>),<block>`: the block decides only
+    /// for connections the condition matches.
+    #[test]
+    fn conditional_sub_rule_gates_its_block() {
+        let providers = providers();
+        let ctx = ParserContext::default();
+        let block: Vec<Box<dyn Rule>> =
+            vec![rill_rules::parse_rule("DOMAIN-SUFFIX,example.com,PROXY", &ctx).unwrap()];
+        let sub_rules: SubRuleBlocks = HashMap::from([("blk".to_string(), Arc::new(block))]);
+        for line in [
+            "SUB-RULE,(NETWORK,tcp),blk",
+            "SUB-RULE,(AND,((NETWORK,tcp),(DST-PORT,443))),blk",
+        ] {
+            let rule = parse_one_rule_or_subrule(line, &providers, &ctx, &sub_rules)
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+            let mut meta = rill_common::Metadata {
+                host: "www.example.com".into(),
+                dst_port: 443,
+                network: rill_common::Network::Tcp,
+                ..Default::default()
+            };
+            assert!(
+                rule.match_metadata(&meta, &rill_common::RuleMatchHelper),
+                "{line}"
+            );
+            meta.network = rill_common::Network::Udp;
+            assert!(
+                !rule.match_metadata(&meta, &rill_common::RuleMatchHelper),
+                "{line}"
+            );
+        }
+        assert!(parse_one_rule_or_subrule(
+            "SUB-RULE,(NETWORK,tcp,blk",
+            &providers,
+            &ctx,
+            &sub_rules
+        )
+        .is_err());
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

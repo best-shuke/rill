@@ -21,6 +21,9 @@ pub struct SelectorGroup {
     store: Option<Arc<SelectorStore>>,
     health: ProxyHealth,
     display: GroupDisplay,
+    /// Dials through this group — what a lazy provider health check waits
+    /// for (mihomo's `Touch`).
+    usage: super::UsageTracker,
 }
 
 impl SelectorGroup {
@@ -33,6 +36,7 @@ impl SelectorGroup {
             store: None,
             health: ProxyHealth::new(),
             display: GroupDisplay::default(),
+            usage: super::UsageTracker::new(),
         }
     }
 
@@ -49,6 +53,7 @@ impl SelectorGroup {
             store: None,
             health: ProxyHealth::new(),
             display: GroupDisplay::default(),
+            usage: super::UsageTracker::new(),
         }
     }
 
@@ -187,6 +192,7 @@ impl ProxyAdapter for SelectorGroup {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        self.usage.touch_user_traffic(metadata);
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| RillError::Proxy("no proxy selected".into()))?;
@@ -194,13 +200,17 @@ impl ProxyAdapter for SelectorGroup {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        self.usage.touch_user_traffic(metadata);
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| RillError::Proxy("no proxy selected".into()))?;
         proxy.dial_udp(metadata).await
     }
 
-    fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        if touch {
+            self.usage.touch_user_traffic(metadata);
+        }
         self.selected_proxy()
     }
 
@@ -212,6 +222,10 @@ impl ProxyAdapter for SelectorGroup {
 impl Proxy for SelectorGroup {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn usage_generation(&self) -> u64 {
+        self.usage.generation()
     }
 
     fn alive(&self) -> bool {

@@ -814,7 +814,7 @@ fn parse_direct(
     use rill_trie::DomainTrie;
     use std::net::{IpAddr, SocketAddr};
 
-    let mut adapter = DirectAdapter::new();
+    let mut adapter = DirectAdapter::new().with_name(name);
 
     // Optional `connect-timeout:` (seconds) — per-proxy counterpart of the
     // global `tcp-connect-timeout:` that covers the built-in DIRECT. Hard
@@ -1627,18 +1627,15 @@ fn reject_nonzero_hy2_option(
 /// the user may get different distribution behaviour than intended.
 /// Upstream also rejects (`errStrategy` in adapter/outboundgroup/loadbalance.go).
 fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
-    match strategy.unwrap_or("round-robin") {
+    // As in mihomo's `NewLoadBalance`, an absent or empty strategy is
+    // consistent-hashing.
+    match strategy.unwrap_or("") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
-        // Upstream maps "" to consistent-hashing (`case "",
-        // "consistent-hashing"` in NewLoadBalance — the same arm an
-        // absent strategy falls into upstream). Our absent default stays
-        // round-robin via the unwrap_or — deliberate divergence, spec
-        // row 10.
         "" | "consistent-hashing" => Ok(LbStrategy::ConsistentHashing),
+        "sticky-sessions" => Ok(LbStrategy::StickySessions),
         other => Err(format!(
             "load-balance: unknown strategy '{other}'; valid values: \
-             'round-robin' (default), 'consistent-hashing'. \
-             (upstream also rejects via errStrategy — Class A ADR-0002)"
+             'consistent-hashing' (default), 'round-robin', 'sticky-sessions'"
         )),
     }
 }
@@ -3066,13 +3063,8 @@ fn parse_proxy_group_inner(
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
 
-    // Match mihomo: include only top-level `proxies:` entries, not built-ins
-    // or proxy groups that happen to have entered the registry already.
-    if config.include_all_proxies.unwrap_or(false) {
-        for p in include_all_proxies {
-            proxies.push(Arc::clone(p));
-        }
-    }
+    let group_filter = crate::proxy_provider::GroupFilter::from_raw_group(config)
+        .map_err(|e| format!("group '{}': {e}", config.name))?;
 
     let proxy_names = config.proxies.as_deref().unwrap_or(&[]);
     for name in proxy_names {
@@ -3094,11 +3086,40 @@ fn parse_proxy_group_inner(
         }
     }
 
-    // Group-level filter/exclude-filter/exclude-type (issue #358): applies to
-    // provider-sourced members only, mirroring mihomo (static `proxies:`
-    // members bypass it — upstream never filters compatible providers).
-    let group_filter = crate::proxy_provider::GroupFilter::from_raw_group(config)
-        .map_err(|e| format!("group '{}': {e}", config.name))?;
+    // mihomo: `include-all` is `include-all-proxies` plus
+    // `include-all-providers`. The expansion covers the top-level
+    // `proxies:` entries only (not built-ins or groups), in name order, is
+    // narrowed by the group's `filter`, and follows the explicit members.
+    let include_all = config.include_all.unwrap_or(false);
+    if include_all || config.include_all_proxies.unwrap_or(false) {
+        let picked = match &group_filter {
+            Some(f) => include_all_proxies
+                .iter()
+                .filter(|p| f.filter_keeps(p.name()))
+                .map(Arc::clone)
+                .collect::<Vec<_>>(),
+            None => include_all_proxies.to_vec(),
+        };
+        let picked = match &group_filter {
+            // Order by the first backtick-separated pattern matched.
+            Some(f) => f.apply(&picked),
+            None => picked,
+        };
+        for p in picked {
+            if !proxies.iter().any(|q| Arc::ptr_eq(q, &p)) {
+                proxies.push(p);
+            }
+        }
+    }
+    // `exclude-filter` / `exclude-type` drop static members too — mihomo
+    // applies them to the group's compatible provider; `filter` does not
+    // narrow explicitly listed members.
+    if let Some(f) = &group_filter {
+        proxies.retain(|p| !f.excludes(p.as_ref()));
+    }
+
+    // Group-level filter/exclude-filter/exclude-type (issue #358) on
+    // provider-sourced members, as a live view of each provider.
     let provider_slot = |p: &Arc<crate::proxy_provider::ProxyProvider>| match &group_filter {
         Some(f) => p.derived_slot(f),
         None => Arc::clone(&p.slot),
@@ -3109,8 +3130,7 @@ fn parse_proxy_group_inner(
     // the slot order — which defines a load-balance pick space and a
     // selector's default member — is stable across restarts/rebuilds
     // instead of following HashMap iteration order.
-    let include_all_providers =
-        config.include_all.unwrap_or(false) || config.include_all_providers.unwrap_or(false);
+    let include_all_providers = include_all || config.include_all_providers.unwrap_or(false);
     let slots: Vec<rill_common::ProviderSlot> = if include_all_providers {
         let mut sorted: Vec<_> = providers.iter().collect();
         sorted.sort_by_key(|(name, _)| name.as_str());
@@ -3149,10 +3169,19 @@ fn parse_proxy_group_inner(
     };
 
     if proxies.is_empty() && slots.is_empty() {
-        return Err(format!(
-            "group '{}' has no valid proxies or providers",
-            config.name
-        ));
+        // mihomo's `empty-fallback` (default `COMPATIBLE`, a direct dial):
+        // a group whose members all filtered away keeps existing, so the
+        // rules and groups naming it still load.
+        let fallback = config.empty_fallback.as_deref().unwrap_or("COMPATIBLE");
+        match existing_proxies.get(fallback) {
+            Some(p) if !is_group_adapter(p.adapter_type()) => proxies.push(Arc::clone(p)),
+            _ => {
+                return Err(format!(
+                    "group '{}': empty fallback proxy '{fallback}' not found",
+                    config.name
+                ));
+            }
+        }
     }
 
     match config.group_type.as_str() {
@@ -3218,6 +3247,15 @@ fn parse_proxy_group_inner(
         }
         _ => Err(format!("unsupported group type: {}", config.group_type)),
     }
+}
+
+/// Whether `t` is a proxy group rather than a leaf outbound.
+fn is_group_adapter(t: rill_common::AdapterType) -> bool {
+    use rill_common::AdapterType as T;
+    matches!(
+        t,
+        T::Selector | T::Fallback | T::UrlTest | T::LoadBalance | T::Relay
+    )
 }
 
 /// Warn-once for each health-check field present on a group type that
@@ -4396,9 +4434,15 @@ tls: true
 
     #[test]
     fn parse_load_balance_default_strategy() {
-        // No `strategy:` field → round-robin selected.
+        // No `strategy:` field → consistent-hashing, as in mihomo.
         let s = parse_lb_strategy(None).unwrap();
-        assert!(matches!(s, LbStrategy::RoundRobin));
+        assert!(matches!(s, LbStrategy::ConsistentHashing));
+    }
+
+    #[test]
+    fn parse_load_balance_sticky_sessions() {
+        let s = parse_lb_strategy(Some("sticky-sessions")).unwrap();
+        assert!(matches!(s, LbStrategy::StickySessions));
     }
 
     #[test]
@@ -4415,8 +4459,7 @@ tls: true
 
     #[test]
     fn parse_load_balance_empty_strategy_is_consistent_hashing() {
-        // Upstream `case "", "consistent-hashing"` — an explicit empty
-        // `strategy:` is CH, while absent/null defaults to round-robin.
+        // Upstream `case "", "consistent-hashing"`.
         let s = parse_lb_strategy(Some("")).unwrap();
         assert!(matches!(s, LbStrategy::ConsistentHashing));
     }
@@ -4428,10 +4471,6 @@ tls: true
         assert!(
             err.contains("unknown strategy"),
             "error should mention unknown strategy: {err}"
-        );
-        assert!(
-            err.contains("Class A"),
-            "error should cite ADR-0002 Class A: {err}"
         );
     }
 
@@ -4825,6 +4864,7 @@ tls: true
             name: "lb".to_string(),
             group_type: "load-balance".to_string(),
             use_providers: Some(vec!["airport".to_string()]),
+            strategy: Some("round-robin".to_string()),
             ..Default::default()
         };
         let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
@@ -5167,6 +5207,7 @@ tls: true
             header: None,
             allow_external_plugin: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         };

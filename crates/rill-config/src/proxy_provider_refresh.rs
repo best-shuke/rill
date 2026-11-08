@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
-use crate::proxy_provider::ProxyProvider;
+use crate::proxy_provider::{HealthCheckConfig, ProxyProvider};
 use crate::raw::RawProxyProvider;
 
 /// Largest interval the supervisor will spawn a loop for (~10 years) —
@@ -42,6 +42,9 @@ const MAX_REFRESH_INTERVAL_SECS: u64 = rill_common::MAX_DURATION_SECS;
 #[derive(Default)]
 pub struct ProxyProviderRefreshSupervisor {
     tasks: Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
+    /// One `health-check` loop per provider that enables it, keyed by the
+    /// settings it runs with so a changed check restarts.
+    health_tasks: Mutex<HashMap<String, (HealthCheckConfig, JoinHandle<()>)>>,
 }
 
 impl ProxyProviderRefreshSupervisor {
@@ -103,6 +106,8 @@ impl ProxyProviderRefreshSupervisor {
             })
             .collect();
 
+        self.reconcile_health_checks(registry);
+
         let mut tasks = self.tasks.lock();
         tasks.retain(|name, (interval, task)| {
             let keep = wanted.get(name) == Some(interval) && !task.is_finished();
@@ -125,9 +130,45 @@ impl ProxyProviderRefreshSupervisor {
     }
 
     /// Number of running refresh tasks (test introspection).
+    /// Keep one health-check loop per provider whose `health-check` is
+    /// enabled with a non-zero interval (mihomo's `HealthCheck.auto()`).
+    fn reconcile_health_checks(&self, registry: &Arc<DashMap<String, Arc<ProxyProvider>>>) {
+        let wanted: HashMap<String, HealthCheckConfig> = registry
+            .iter()
+            .filter_map(|entry| {
+                let hc = entry.value().health_check.as_ref()?;
+                (hc.interval > 0).then(|| (entry.key().clone(), hc.clone()))
+            })
+            .collect();
+        let mut tasks = self.health_tasks.lock();
+        tasks.retain(|name, (hc, task)| {
+            let keep = wanted.get(name) == Some(hc) && !task.is_finished();
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        for (name, hc) in wanted {
+            if tasks.contains_key(&name) {
+                continue;
+            }
+            let task = tokio::spawn(health_check_loop(
+                name.clone(),
+                hc.clone(),
+                Arc::downgrade(registry),
+            ));
+            tasks.insert(name, (hc, task));
+        }
+    }
+
     #[cfg(test)]
     fn task_count(&self) -> usize {
         self.tasks.lock().len()
+    }
+
+    #[cfg(test)]
+    fn health_task_count(&self) -> usize {
+        self.health_tasks.lock().len()
     }
 
     /// Interval a running task was spawned with (test introspection).
@@ -164,6 +205,60 @@ impl Drop for ProxyProviderRefreshSupervisor {
         for (_, (_, task)) in self.tasks.get_mut().drain() {
             task.abort();
         }
+        for (_, (_, task)) in self.health_tasks.get_mut().drain() {
+            task.abort();
+        }
+    }
+}
+
+/// Probe a provider's nodes every `health-check.interval` seconds, as
+/// mihomo's provider health check does. A lazy check (mihomo's default)
+/// skips a round unless some group holding the provider's nodes carried
+/// traffic since the last one, so an unused subscription costs nothing.
+async fn health_check_loop(
+    name: String,
+    hc: HealthCheckConfig,
+    registry: Weak<DashMap<String, Arc<ProxyProvider>>>,
+) {
+    let interval = Duration::from_secs(hc.interval.clamp(1, MAX_REFRESH_INTERVAL_SECS));
+    let timeout = Duration::from_millis(hc.timeout.max(1));
+    let expected = (!hc.expected_status.is_empty()).then_some(hc.expected_status.as_str());
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_usage = 0u64;
+    loop {
+        ticker.tick().await;
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        let Some(provider) = registry.get(&name).map(|e| Arc::clone(e.value())) else {
+            continue;
+        };
+        drop(registry);
+        if hc.lazy {
+            let usage = provider.usage_generation();
+            if usage == last_usage {
+                continue;
+            }
+            last_usage = usage;
+        }
+        let members: Vec<(String, Arc<dyn rill_common::Proxy>)> = provider
+            .proxies()
+            .into_iter()
+            .map(|p| (p.name().to_string(), p))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        debug!(provider = %name, count = members.len(), "proxy-provider health check");
+        let _ = rill_proxy::health::probe_many_bounded(
+            members,
+            &hc.url,
+            expected,
+            timeout,
+            rill_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
+        )
+        .await;
     }
 }
 
@@ -218,6 +313,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         }
@@ -265,6 +361,56 @@ mod tests {
             .iter()
             .map(|(name, iv)| (name.to_string(), raw_provider(*iv)))
             .collect()
+    }
+
+    /// A provider whose `health-check` is enabled gets its own probe loop
+    /// (mihomo schedules provider health checks; they used to be inert).
+    #[tokio::test]
+    async fn reconcile_schedules_enabled_provider_health_checks() {
+        let sup = ProxyProviderRefreshSupervisor::default();
+        let dir = tempfile::tempdir().unwrap();
+        let reg: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        for (name, hc) in [
+            ("checked", Some((true, 300))),
+            ("disabled", Some((false, 300))),
+            ("zero", Some((true, 0))),
+            ("none", None),
+        ] {
+            let raw = RawProxyProvider {
+                provider_type: "file".to_string(),
+                url: None,
+                path: Some(
+                    dir.path()
+                        .join(format!("{name}.yaml"))
+                        .display()
+                        .to_string(),
+                ),
+                health_check: hc.map(|(enable, interval)| crate::raw::RawHealthCheck {
+                    enable: Some(enable),
+                    url: None,
+                    interval: Some(interval),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                }),
+                ..raw_provider(None)
+            };
+            let provider = ProxyProvider::new(
+                name,
+                &raw,
+                Some(dir.path()),
+                true,
+                false,
+                Default::default(),
+            )
+            .unwrap();
+            reg.insert(name.to_string(), Arc::new(provider));
+        }
+        sup.reconcile(&reg, None);
+        assert_eq!(sup.health_task_count(), 1);
+        reg.remove("checked");
+        sup.reconcile(&reg, None);
+        assert_eq!(sup.health_task_count(), 0);
     }
 
     #[tokio::test]

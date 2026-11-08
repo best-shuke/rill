@@ -207,6 +207,19 @@ fn parse_rule_depth(
         "PROCESS-PATH" => {
             ProcessPathRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
         }
+        "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX"
+        | "PROCESS-NAME-WILDCARD"
+        | "PROCESS-PATH-WILDCARD" => {
+            let rule_type = match rule_type {
+                "PROCESS-NAME-REGEX" => rill_common::RuleType::ProcessNameRegex,
+                "PROCESS-PATH-REGEX" => rill_common::RuleType::ProcessPathRegex,
+                "PROCESS-NAME-WILDCARD" => rill_common::RuleType::ProcessNameWildcard,
+                _ => rill_common::RuleType::ProcessPathWildcard,
+            };
+            crate::process_pattern::ProcessPatternRule::new(payload, adapter, rule_type)
+                .map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "DOMAIN-WILDCARD" => {
             DomainWildcardRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
         }

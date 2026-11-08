@@ -15,6 +15,53 @@ use super::{DialFailureTracker, UsageTracker};
 pub enum LbStrategy {
     RoundRobin,
     ConsistentHashing,
+    /// mihomo `sticky-sessions`: a (source, destination) pair keeps the
+    /// member it was first given — a random one — for ten minutes, moving
+    /// on only when that member is down.
+    StickySessions,
+}
+
+/// mihomo's sticky-session table: at most 1000 entries, 10 minutes each.
+const STICKY_TTL: Duration = Duration::from_secs(600);
+const STICKY_CAPACITY: usize = 1000;
+
+#[derive(Default)]
+struct StickyTable(parking_lot::Mutex<std::collections::HashMap<u64, (usize, std::time::Instant)>>);
+
+impl StickyTable {
+    fn get(&self, key: u64) -> Option<usize> {
+        let mut map = self.0.lock();
+        match map.get(&key) {
+            Some(&(idx, at)) if at.elapsed() < STICKY_TTL => Some(idx),
+            Some(_) => {
+                map.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn set(&self, key: u64, idx: usize) {
+        let mut map = self.0.lock();
+        if map.len() >= STICKY_CAPACITY && !map.contains_key(&key) {
+            map.retain(|_, (_, at)| at.elapsed() < STICKY_TTL);
+            if map.len() >= STICKY_CAPACITY {
+                // Evict the oldest entry, as an LRU of this size would.
+                if let Some(oldest) = map.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        map.insert(key, (idx, std::time::Instant::now()));
+    }
+}
+
+/// A fresh salt for a sticky pick (mihomo adds the wall clock in
+/// nanoseconds to the key).
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 pub struct LoadBalanceGroup {
@@ -29,6 +76,7 @@ pub struct LoadBalanceGroup {
     provider_slots: Vec<ProviderSlot>,
     strategy: LbStrategy,
     counter: AtomicUsize,
+    sticky: StickyTable,
     /// Group health-check `url:` (upstream `TestUrl`) — pick-time member
     /// eligibility is `alive_for_url(test_url)`, and the sweep/API read it
     /// via `Proxy::test_url`.
@@ -62,6 +110,7 @@ impl LoadBalanceGroup {
             provider_slots: slots,
             strategy,
             counter: AtomicUsize::new(0),
+            sticky: StickyTable::default(),
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
@@ -258,6 +307,32 @@ impl LoadBalanceGroup {
                     key = key.wrapping_add(1);
                 }
                 members.iter().find(|p| usable(p)).map(Arc::clone)
+            }
+            LbStrategy::StickySessions => {
+                // mihomo `strategyStickySessions`, keyed on the source IP
+                // plus the consistent-hashing destination key.
+                if members.is_empty() {
+                    return None;
+                }
+                let src = metadata.src_ip.map(|ip| ip.to_string()).unwrap_or_default();
+                let key = fnv1a64(format!("{src}{}", get_key(metadata)).as_bytes());
+                let len = members.len();
+                let cached = self.sticky.get(key).filter(|&i| i < len);
+                let mut idx = cached
+                    .unwrap_or_else(|| jump_hash(key.wrapping_add(now_nanos()), len) as usize);
+                for _ in 1..5 {
+                    let p = &members[idx];
+                    if usable(p) {
+                        if cached != Some(idx) {
+                            self.sticky.set(key, idx);
+                        }
+                        return Some(Arc::clone(p));
+                    }
+                    idx = jump_hash(key.wrapping_add(now_nanos()), len) as usize;
+                }
+                let found = members.iter().position(|p| usable(p))?;
+                self.sticky.set(key, found);
+                Some(Arc::clone(&members[found]))
             }
         }
     }
@@ -697,6 +772,7 @@ mod tests {
             provider_slots: Vec::new(),
             strategy: LbStrategy::RoundRobin,
             counter: AtomicUsize::new(usize::MAX - 1),
+            sticky: StickyTable::default(),
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
@@ -735,6 +811,37 @@ mod tests {
             "select after flap must not panic or return None"
         );
         assert!(r2.as_ref().unwrap().alive(), "selected proxy must be alive");
+    }
+
+    // ─── Sticky sessions ────────────────────────────────────────────────────
+
+    #[test]
+    fn sticky_sessions_keep_a_pair_on_one_member_until_it_dies() {
+        let members: Vec<Arc<MockProxy>> = (0..4).map(|i| MockProxy::new(&i.to_string())).collect();
+        let proxies: Vec<Arc<dyn Proxy>> = members
+            .iter()
+            .map(|p| Arc::clone(p) as Arc<dyn Proxy>)
+            .collect();
+        let group = LoadBalanceGroup::new("lb", proxies, LbStrategy::StickySessions);
+        let mut meta = meta_dst_host("example.com");
+        meta.src_ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+
+        let first = group.select(&meta).unwrap().name().to_string();
+        for _ in 0..20 {
+            assert_eq!(group.select(&meta).unwrap().name(), first);
+        }
+        for p in &members {
+            p.set_alive(p.name() != first);
+        }
+        let moved = group.select(&meta).unwrap().name().to_string();
+        assert_ne!(moved, first, "a dead member is left");
+        for _ in 0..20 {
+            assert_eq!(
+                group.select(&meta).unwrap().name(),
+                moved,
+                "and the new one sticks"
+            );
+        }
     }
 
     // ─── B. Consistent-hashing strategy ──────────────────────────────────────

@@ -228,14 +228,9 @@ enum ProcessPathOp {
     Exact(Box<str>),
 }
 
+/// Inbound-type bitmask (`rill_rules::in_type::in_type_mask`).
 #[derive(Debug, Clone, Copy)]
-struct InTypeMask {
-    http: bool,
-    https: bool,
-    socks5: bool,
-    tproxy: bool,
-    inner: bool,
-}
+struct InTypeMask(u32);
 
 struct MatchInput<'a> {
     metadata: &'a Metadata,
@@ -1076,14 +1071,7 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
         RuleOp::Dscp(value) => Some(value.to_string()),
         RuleOp::Uid(uid) => Some(uid.to_string()),
         RuleOp::Network(network) => Some(format!("{network:?}")),
-        RuleOp::InType(mask) => Some(format!(
-            "{}{}{}{}{}",
-            u8::from(mask.http),
-            u8::from(mask.https),
-            u8::from(mask.socks5),
-            u8::from(mask.tproxy),
-            u8::from(mask.inner)
-        )),
+        RuleOp::InType(mask) => Some(format!("{:x}", mask.0)),
         // Shared-state handles: pointer identity means the same immutable
         // trie/set, so the predicates are interchangeable. GEOSITE also keys
         // on its resolved bucket keys ("google" vs "GOOGLE" fold together).
@@ -1460,7 +1448,11 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         | RuleType::SrcIpSuffix
         | RuleType::IpAsn
         | RuleType::SrcIpAsn
-        | RuleType::SubRule => None,
+        | RuleType::SubRule
+        | RuleType::ProcessNameRegex
+        | RuleType::ProcessPathRegex
+        | RuleType::ProcessNameWildcard
+        | RuleType::ProcessPathWildcard => None,
     }
 }
 
@@ -1928,36 +1920,13 @@ fn compile_network(payload: &str) -> Option<RuleOp> {
 }
 
 fn compile_in_type(payload: &str) -> Option<InTypeMask> {
-    let mut mask = InTypeMask {
-        http: false,
-        https: false,
-        socks5: false,
-        tproxy: false,
-        inner: false,
-    };
-    match payload.to_ascii_uppercase().as_str() {
-        "HTTP" => {
-            mask.http = true;
-            mask.https = true;
-        }
-        "HTTPS" => mask.https = true,
-        "SOCKS5" => mask.socks5 = true,
-        "TPROXY" => mask.tproxy = true,
-        "INNER" => mask.inner = true,
-        _ => return None,
-    }
-    Some(mask)
+    rill_rules::in_type::in_type_mask(payload)
+        .ok()
+        .map(InTypeMask)
 }
 
 fn in_type_matches(mask: InTypeMask, conn_type: ConnType) -> bool {
-    match conn_type {
-        ConnType::Http => mask.http,
-        ConnType::Https => mask.https,
-        ConnType::Socks5 => mask.socks5,
-        ConnType::TProxy => mask.tproxy,
-        ConnType::Inner => mask.inner,
-        _ => false,
-    }
+    rill_rules::in_type::in_type_mask_matches(mask.0, conn_type)
 }
 
 fn compile_process_path(payload: &str) -> Option<ProcessPathOp> {

@@ -1,4 +1,5 @@
 use crate::dropped_providers::DroppedProviders;
+use crate::name_regex::{NameRegex, NameRegexSet};
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use crate::subscription_userinfo::{self, SubscriptionUserinfo};
@@ -37,6 +38,7 @@ pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 /// [`ProxyProvider::subscription_userinfo`]).
 const USERINFO_SUFFIX: &str = ".subscription-userinfo";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HealthCheckConfig {
     pub url: String,
     pub interval: u64,
@@ -50,9 +52,13 @@ pub struct ProxyProvider {
     pub slot: ProviderSlot,
     pub vehicle_type: &'static str,
     vehicle: Vehicle,
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: NameRegexSet,
+    exclude_filter: NameRegexSet,
     exclude_type: Vec<String>,
+    /// mihomo `override:` fields other than `dialer-proxy` (which keeps its
+    /// own precedence slot, `override_dialer`): written into every node's
+    /// mapping before it is parsed.
+    overrides: NodeOverrides,
     pub health_check: Option<HealthCheckConfig>,
     updated_at: AtomicU,
     /// Flattened custom request headers (name-sorted; one entry per value,
@@ -153,8 +159,8 @@ type WeakSlot = std::sync::Weak<RwLock<Vec<Arc<dyn Proxy>>>>;
 /// filter, also matching upstream (compatible providers are not filtered).
 #[derive(Clone, Debug)]
 pub struct GroupFilter {
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: NameRegexSet,
+    exclude_filter: NameRegexSet,
     exclude_type: Vec<String>,
 }
 
@@ -162,10 +168,10 @@ impl GroupFilter {
     /// Compile the filter fields of a raw proxy-group. Returns `Ok(None)`
     /// when the group declares no filtering at all.
     pub fn from_raw_group(raw: &crate::raw::RawProxyGroup) -> Result<Option<Self>, String> {
-        let filter = compile_opt_regex(&raw.filter, "filter")?;
-        let exclude_filter = compile_opt_regex(&raw.exclude_filter, "exclude-filter")?;
+        let filter = NameRegexSet::parse(raw.filter.as_deref(), "filter")?;
+        let exclude_filter = NameRegexSet::parse(raw.exclude_filter.as_deref(), "exclude-filter")?;
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
-        if filter.is_none() && exclude_filter.is_none() && exclude_type.is_empty() {
+        if filter.is_empty() && exclude_filter.is_empty() && exclude_type.is_empty() {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -175,22 +181,154 @@ impl GroupFilter {
         }))
     }
 
-    fn keep(&self, proxy: &dyn Proxy) -> bool {
-        let name = proxy.name();
-        if let Some(re) = &self.filter {
-            if !re.is_match(name) {
-                return false;
+    /// `proxies` with the group's `filter` applied (members ordered by the
+    /// first backtick-separated pattern they match, as mihomo orders them)
+    /// and then `exclude-filter` / `exclude-type`.
+    pub fn apply(&self, proxies: &[Arc<dyn Proxy>]) -> Vec<Arc<dyn Proxy>> {
+        self.filter
+            .select(proxies.iter().map(|p| p.name()))
+            .into_iter()
+            .map(|i| &proxies[i])
+            .filter(|p| !self.excludes(p.as_ref()))
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Whether `exclude-filter` or `exclude-type` drops `proxy`. mihomo
+    /// applies these two to every member of a group — its static
+    /// `proxies:` included — while `filter` only narrows provider members
+    /// and the `include-all-proxies` expansion.
+    pub fn excludes(&self, proxy: &dyn Proxy) -> bool {
+        self.exclude_filter.any_match(proxy.name())
+            || self
+                .exclude_type
+                .iter()
+                .any(|t| adapter_type_matches(t, proxy.adapter_type()))
+    }
+
+    /// Whether `filter` keeps `name` (an empty filter keeps everything).
+    pub fn filter_keeps(&self, name: &str) -> bool {
+        self.filter.is_empty() || self.filter.any_match(name)
+    }
+}
+
+/// The mihomo `override:` fields of a proxy-provider that are written into
+/// each node's mapping before it is parsed (`OverrideSchema.Apply`).
+/// `dialer-proxy` is not among them: it keeps its own precedence slot.
+#[derive(Debug, Default)]
+struct NodeOverrides {
+    fields: Vec<(String, serde_yaml::Value)>,
+    proxy_name: Vec<(NameRegex, String)>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+/// Plain node fields `override:` may set, as in mihomo's `overrideSchema`.
+const OVERRIDE_FIELDS: [&str; 11] = [
+    "tfo",
+    "mptcp",
+    "udp",
+    "udp-over-tcp",
+    "up",
+    "down",
+    "skip-cert-verify",
+    "name-cert-verify",
+    "interface-name",
+    "routing-mark",
+    "ip-version",
+];
+
+impl NodeOverrides {
+    fn parse(name: &str, over: &HashMap<String, serde_yaml::Value>) -> Result<Self, String> {
+        let mut out = Self::default();
+        let mut keys: Vec<&String> = over.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &over[key];
+            match key.as_str() {
+                "dialer-proxy" => {}
+                k if OVERRIDE_FIELDS.contains(&k) => {
+                    if !value.is_null() {
+                        out.fields.push((key.clone(), value.clone()));
+                    }
+                }
+                "additional-prefix" | "additional-suffix" => {
+                    let text = match value {
+                        serde_yaml::Value::Null => continue,
+                        serde_yaml::Value::String(s) => s.clone(),
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        _ => {
+                            return Err(format!(
+                                "proxy-provider '{name}': override.{key} must be a string"
+                            ))
+                        }
+                    };
+                    if key == "additional-prefix" {
+                        out.prefix = Some(text);
+                    } else {
+                        out.suffix = Some(text);
+                    }
+                }
+                "proxy-name" => {
+                    let entries = value.as_sequence().map(Vec::as_slice).unwrap_or_default();
+                    for entry in entries {
+                        let pattern = entry.get("pattern").and_then(serde_yaml::Value::as_str);
+                        let target = entry
+                            .get("target")
+                            .and_then(serde_yaml::Value::as_str)
+                            .unwrap_or("");
+                        let Some(pattern) = pattern else {
+                            return Err(format!(
+                                "proxy-provider '{name}': override.proxy-name entry needs a `pattern`"
+                            ));
+                        };
+                        let re = NameRegex::new(pattern).map_err(|e| {
+                            format!("proxy-provider '{name}': override.proxy-name: {e}")
+                        })?;
+                        out.proxy_name.push((re, target.to_string()));
+                    }
+                }
+                other => {
+                    warn!(provider = %name, "proxy-provider override key '{other}' is not supported");
+                }
             }
         }
-        if let Some(re) = &self.exclude_filter {
-            if re.is_match(name) {
-                return false;
-            }
+        Ok(out)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+            && self.proxy_name.is_empty()
+            && self.prefix.is_none()
+            && self.suffix.is_none()
+    }
+
+    /// Write the overrides into one node mapping, renaming it last.
+    fn apply(&self, map: &mut HashMap<String, serde_yaml::Value>) {
+        for (key, value) in &self.fields {
+            map.insert(key.clone(), value.clone());
         }
-        !self
-            .exclude_type
-            .iter()
-            .any(|t| adapter_type_matches(t, proxy.adapter_type()))
+        if self.proxy_name.is_empty() && self.prefix.is_none() && self.suffix.is_none() {
+            return;
+        }
+        let Some(mut name) = map
+            .get("name")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        for (re, target) in &self.proxy_name {
+            name = re.replace_all(&name, target).into_owned();
+        }
+        if let Some(prefix) = &self.prefix {
+            name.insert_str(0, prefix);
+        }
+        if let Some(suffix) = &self.suffix {
+            name.push_str(suffix);
+        }
+        map.insert("name".to_string(), serde_yaml::Value::String(name));
     }
 }
 
@@ -218,6 +356,9 @@ fn split_exclude_types(raw: Option<&[String]>) -> Vec<String> {
 
 enum Vehicle {
     File(PathBuf),
+    /// `type: inline`: the payload, already serialized as a provider
+    /// document.
+    Inline(String),
     Http {
         url: String,
         /// `None` = fetch to memory only (no containment root available for
@@ -295,27 +436,36 @@ impl ProxyProvider {
                 };
                 (Vehicle::Http { url, cache_path }, "HTTP")
             }
+            "inline" => {
+                let payload = raw.payload.clone().unwrap_or_default();
+                let doc = serde_yaml::Value::Mapping(
+                    [(
+                        serde_yaml::Value::String("proxies".into()),
+                        serde_yaml::Value::Sequence(payload),
+                    )]
+                    .into_iter()
+                    .collect(),
+                );
+                let text = serde_yaml::to_string(&doc)
+                    .map_err(|e| format!("proxy-provider '{name}': payload: {e}"))?;
+                (Vehicle::Inline(text), "Inline")
+            }
             t => return Err(format!("unknown proxy-provider type '{t}'")),
         };
 
-        let filter = compile_opt_regex(&raw.filter, "filter")?;
-        let exclude_filter = compile_opt_regex(&raw.exclude_filter, "exclude-filter")?;
+        let filter = NameRegexSet::parse(raw.filter.as_deref(), "filter")
+            .map_err(|e| format!("proxy-provider '{name}': {e}"))?;
+        let exclude_filter = NameRegexSet::parse(raw.exclude_filter.as_deref(), "exclude-filter")
+            .map_err(|e| format!("proxy-provider '{name}': {e}"))?;
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
+        let overrides = match raw.override_.as_ref() {
+            Some(over) => NodeOverrides::parse(name, over)?,
+            None => NodeOverrides::default(),
+        };
 
+        // Probed on `health-check.interval` by the refresh supervisor
+        // (`proxy_provider_refresh`) and on demand by the API.
         let health_check = build_health_check_config(raw.health_check.as_ref());
-        if health_check.is_some() {
-            // The config is honoured by the manual
-            // `GET /providers/proxies/{name}/healthcheck` endpoint, but
-            // nothing probes provider members on a timer (mihomo schedules
-            // the provider health-check alongside `interval`). Warn once
-            // per build so the config isn't silently half-wired.
-            warn!(
-                provider = %name,
-                "proxy-provider 'health-check' is stored but not periodically \
-                 scheduled — members are probed only via the manual \
-                 healthcheck endpoint or a group's own health check"
-            );
-        }
         let header = raw
             .header
             .as_ref()
@@ -371,18 +521,12 @@ impl ProxyProvider {
             }
         };
 
-        // mihomo `override:` — provider-level node defaults. Only
-        // `dialer-proxy` is honoured; every other key warns so a config
-        // relying on, say, `override.udp` does not silently diverge.
-        // `override.Apply` writes unconditionally — it outranks both the
-        // provider-level field and node-level `dialer-proxy`.
+        // mihomo `override:` — provider-level node settings, written over
+        // each node's own (`OverrideSchema.Apply` runs last). The other
+        // keys were parsed into `overrides` above; `dialer-proxy` outranks
+        // both the provider-level field and node-level `dialer-proxy`.
         let mut override_dialer = None;
         if let Some(over) = raw.override_.as_ref() {
-            for key in over.keys() {
-                if key != "dialer-proxy" {
-                    warn!(provider = %name, "proxy-provider override key '{key}' is not supported");
-                }
-            }
             match over.get("dialer-proxy") {
                 // `""` is the upstream "clear the chain" knob:
                 // `OverrideSchema.Apply` writes the string unconditionally,
@@ -418,6 +562,7 @@ impl ProxyProvider {
             filter,
             exclude_filter,
             exclude_type,
+            overrides,
             health_check,
             updated_at: AtomicU::new(0),
             header,
@@ -474,13 +619,7 @@ impl ProxyProvider {
     /// (issue #358). The view is seeded from the current slot contents and
     /// re-populated on every [`refresh`](Self::refresh).
     pub fn derived_slot(&self, filter: &GroupFilter) -> ProviderSlot {
-        let seeded: Vec<Arc<dyn Proxy>> = self
-            .slot
-            .read()
-            .iter()
-            .filter(|p| filter.keep(p.as_ref()))
-            .map(Arc::clone)
-            .collect();
+        let seeded = filter.apply(&self.slot.read());
         let slot: ProviderSlot = Arc::new(RwLock::new(seeded));
         self.derived
             .write()
@@ -494,11 +633,7 @@ impl ProxyProvider {
             let Some(slot) = weak.upgrade() else {
                 return false;
             };
-            *slot.write() = proxies
-                .iter()
-                .filter(|p| filter.keep(p.as_ref()))
-                .map(Arc::clone)
-                .collect();
+            *slot.write() = filter.apply(proxies);
             true
         });
     }
@@ -534,6 +669,7 @@ impl ProxyProvider {
                         self.name, path, e
                     )
                 }),
+            Vehicle::Inline(text) => Ok((text.clone(), None)),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
                     registry,
@@ -595,7 +731,7 @@ impl ProxyProvider {
                     .await
                     .map(|text| (text, Source::Cache))
             }
-            Vehicle::File(_) => Err(e),
+            Vehicle::File(_) | Vehicle::Inline(_) => Err(e),
         }
     }
 
@@ -921,28 +1057,41 @@ impl ProxyProvider {
 
         let mut declared = Vec::new();
         let mut result = Vec::new();
-        for raw_map in &proxy_maps {
-            // Get raw name/type before parsing so we can filter cheaply.
-            let raw_name = raw_map.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let raw_type = raw_map
+        // mihomo's order: `filter` picks (and orders) nodes by their name in
+        // the payload, `exclude-type` / `exclude-filter` drop some, the
+        // first node of a name wins, and only then does `override:` touch
+        // the mapping — so filters see the payload's own names.
+        let names: Vec<&str> = proxy_maps
+            .iter()
+            .map(|m| m.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        let mut seen_names = std::collections::HashSet::new();
+        for idx in self.filter.select(names.iter().copied()) {
+            let original = &proxy_maps[idx];
+            let raw_name = names[idx];
+            let raw_type = original
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_lowercase();
-
-            if let Some(ref re) = self.filter {
-                if !re.is_match(raw_name) {
-                    continue;
-                }
-            }
-            if let Some(ref re) = self.exclude_filter {
-                if re.is_match(raw_name) {
-                    continue;
-                }
-            }
             if self.exclude_type.iter().any(|t| t == &raw_type) {
                 continue;
             }
+            if self.exclude_filter.any_match(raw_name) {
+                continue;
+            }
+            if !raw_name.is_empty() && !seen_names.insert(raw_name) {
+                continue;
+            }
+            let mut overridden;
+            let raw_map = if self.overrides.is_empty() {
+                original
+            } else {
+                overridden = original.clone();
+                self.overrides.apply(&mut overridden);
+                &overridden
+            };
+            let raw_name = raw_map.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
             match self.parse_node(raw_map, raw_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
@@ -1211,6 +1360,35 @@ impl ProxyProvider {
         self.slot.read().clone()
     }
 
+    /// Sum of the use counters of every published group holding one of
+    /// this provider's nodes: a lazy health check probes only after it
+    /// moved (mihomo probes a lazy provider once a group touched it).
+    pub fn usage_generation(&self) -> u64 {
+        let members: std::collections::HashSet<*const ()> = self
+            .slot
+            .read()
+            .iter()
+            .map(|p| Arc::as_ptr(p).cast::<()>())
+            .collect();
+        if members.is_empty() {
+            return 0;
+        }
+        let Some(snapshot) = self.dialer_registry.snapshot() else {
+            return 0;
+        };
+        snapshot
+            .values()
+            .filter(|p| p.usage_generation() > 0)
+            .filter(|p| {
+                p.member_proxies().is_some_and(|ms| {
+                    ms.iter()
+                        .any(|m| members.contains(&Arc::as_ptr(m).cast::<()>()))
+                })
+            })
+            .map(|p| p.usage_generation())
+            .fold(0u64, u64::wrapping_add)
+    }
+
     #[cfg(test)]
     fn derived_len(&self) -> usize {
         self.derived.read().len()
@@ -1333,14 +1511,14 @@ pub async fn load_proxy_providers_within(
                 continue;
             }
         };
-        if crate::is_offline_validate() {
+        if matches!(provider.vehicle, Vehicle::File(_) | Vehicle::Inline(_)) {
+            provider.initial_load(strict).await?;
+        } else if crate::is_offline_validate() {
             // Offline validation (`rill -t`): the provider parsed and its
             // path/filters are structurally valid — that is what a config
             // test checks. Skip the network fetch so a slow or unreachable
             // subscription can't hang validation (the provider registers
             // empty, exactly as a transient fetch failure would leave it).
-        } else if matches!(provider.vehicle, Vehicle::File(_)) {
-            provider.initial_load(strict).await?;
         } else if provider.load_from_cache().await {
             provider.background_pending.store(true, Ordering::Relaxed);
         } else {
@@ -1495,24 +1673,6 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
     }
 }
 
-fn compile_opt_regex(
-    pattern: &Option<String>,
-    field: &str,
-) -> Result<Option<regex::Regex>, String> {
-    match pattern.as_deref() {
-        Some(p) => regex::Regex::new(p).map(Some).map_err(|e| {
-            let hint = if ["(?!", "(?=", "(?<"].iter().any(|la| p.contains(la)) {
-                "; look-around assertions are not supported — split the pattern \
-                 into `filter` + `exclude-filter` instead"
-            } else {
-                ""
-            };
-            format!("{field} regex error: {e}{hint}")
-        }),
-        None => Ok(None),
-    }
-}
-
 /// Content hash for the unchanged-payload dedup — `DefaultHasher`
 /// (SipHash) is fine here; this is a same-process dedup, not a checksum
 /// persisted or compared across trust boundaries.
@@ -1584,7 +1744,9 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
             .unwrap_or(5000)
             .min(rill_common::MAX_DURATION_SECS.saturating_mul(1000)),
         expected_status: hc.expected_status.clone().unwrap_or_default(),
-        lazy: hc.lazy.unwrap_or(false),
+        // mihomo's provider schema defaults `lazy: true`: probe only
+        // after the provider's nodes carried traffic.
+        lazy: hc.lazy.unwrap_or(true),
     })
 }
 
@@ -1607,6 +1769,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         }
@@ -1674,6 +1837,7 @@ mod tests {
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         };
@@ -1725,6 +1889,7 @@ mod tests {
                 allow_external_plugin: None,
                 header: None,
                 override_: None,
+                payload: None,
                 proxy: None,
                 dialer_proxy: None,
             },
@@ -1753,6 +1918,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         };
@@ -1790,6 +1956,7 @@ mod tests {
             allow_external_plugin: None,
             header: Some(headers),
             override_: None,
+            payload: None,
             proxy: None,
             dialer_proxy: None,
         };
@@ -1969,12 +2136,12 @@ header:
         write_provider_file(tmp.path(), &[("US ss", "ss"), ("US direct", "direct")]);
         let provider = file_provider(tmp.path()).await;
 
-        // Note: parse_direct keeps DirectAdapter's hardcoded "DIRECT" name.
+        // A `type: direct` node keeps its own name, as in mihomo.
         let by_alias = provider.derived_slot(&group_filter(None, None, Some(&["ss"])));
-        assert_eq!(slot_names(&by_alias), ["DIRECT"]);
+        assert_eq!(slot_names(&by_alias), ["US direct"]);
 
         let by_display = provider.derived_slot(&group_filter(None, None, Some(&["Shadowsocks"])));
-        assert_eq!(slot_names(&by_display), ["DIRECT"]);
+        assert_eq!(slot_names(&by_display), ["US direct"]);
 
         // mihomo-style `|`-separated string form.
         let piped = provider.derived_slot(&group_filter(None, None, Some(&["ss|direct"])));
@@ -1991,16 +2158,19 @@ header:
         assert!(GroupFilter::from_raw_group(&raw).unwrap().is_none());
     }
 
+    /// mihomo compiles filters with regexp2, so look-around works there and
+    /// must work here (`^((?!港).)*$` is the stock "not Hong Kong" filter).
     #[test]
-    fn group_filter_lookahead_error_carries_hint() {
+    fn group_filter_supports_lookahead() {
         let raw = crate::raw::RawProxyGroup {
             name: "g".to_string(),
             group_type: "select".to_string(),
             filter: Some("^(?!.*expat).*US".to_string()),
             ..Default::default()
         };
-        let err = GroupFilter::from_raw_group(&raw).unwrap_err();
-        assert!(err.contains("look-around"), "unexpected error: {err}");
+        let f = GroupFilter::from_raw_group(&raw).unwrap().unwrap();
+        assert!(f.filter_keeps("US 01"));
+        assert!(!f.filter_keeps("US expat 01"));
     }
 
     // ─── issue #489: provider-sourced nodes honour `dialer-proxy` ─────────
@@ -2977,6 +3147,7 @@ header:
             allow_external_plugin: None,
             header: None,
             override_: None,
+            payload: None,
             proxy: proxy.map(str::to_string),
             dialer_proxy: None,
         }

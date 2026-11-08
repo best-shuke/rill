@@ -867,6 +867,11 @@ impl ProxyRegistry {
     /// no generation has been published yet or the name is absent. For
     /// one-shot lookups (provider `proxy:` / subscription fetches); adapters
     /// that dial repeatedly keep a [`DialerTarget`] instead.
+    /// The currently published snapshot, if any.
+    pub fn snapshot(&self) -> Option<ProxySnapshot> {
+        self.cell.proxies.read().clone()
+    }
+
     pub fn resolve_name(&self, name: &str) -> Option<Arc<dyn Proxy>> {
         self.cell
             .proxies

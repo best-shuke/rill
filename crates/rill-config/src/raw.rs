@@ -546,9 +546,13 @@ pub struct RawProxyGroup {
     pub exclude_type: Option<Vec<String>>,
     pub include_all: Option<bool>,
     pub include_all_proxies: Option<bool>,
-    /// Upstream's providers-only alias — identical to `include-all` here
-    /// (our `include-all` never pulls statics; `include-all-proxies` does).
+    /// Every proxy-provider. `include-all` is this plus
+    /// `include-all-proxies`, as in mihomo.
     pub include_all_providers: Option<bool>,
+    /// mihomo `empty-fallback`: the leaf outbound a group holds when no
+    /// member is left (default `COMPATIBLE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_fallback: Option<String>,
     /// mihomo `hidden:` — asks GUIs to leave the group out of their group
     /// list. Reported on the group in `GET /proxies`; routing ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -598,10 +602,15 @@ pub struct RawProxyProvider {
     pub dialer_proxy: Option<String>,
     /// mihomo `override:` block — provider-level defaults applied to every
     /// node unconditionally (`OverrideSchema.Apply` writes last, so it
-    /// outranks node-level fields). Only `dialer-proxy` is honoured
-    /// (issue #489); other keys warn at load time.
+    /// outranks node-level fields): `dialer-proxy`, the node fields
+    /// mihomo's `overrideSchema` lists, and the `proxy-name` /
+    /// `additional-prefix` / `additional-suffix` renames.
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<HashMap<String, serde_yaml::Value>>,
+    /// mihomo `payload:` — the nodes of a `type: inline` provider, written
+    /// in the config itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<serde_yaml::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

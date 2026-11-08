@@ -35,6 +35,10 @@ pub enum RuleType {
     InName,
     InType,
     InUser,
+    ProcessNameRegex,
+    ProcessPathRegex,
+    ProcessNameWildcard,
+    ProcessPathWildcard,
 }
 
 impl RuleType {
@@ -71,6 +75,10 @@ impl RuleType {
             RuleType::InName => "IN-NAME",
             RuleType::InType => "IN-TYPE",
             RuleType::InUser => "IN-USER",
+            RuleType::ProcessNameRegex => "PROCESS-NAME-REGEX",
+            RuleType::ProcessPathRegex => "PROCESS-PATH-REGEX",
+            RuleType::ProcessNameWildcard => "PROCESS-NAME-WILDCARD",
+            RuleType::ProcessPathWildcard => "PROCESS-PATH-WILDCARD",
         }
     }
 }
@@ -109,6 +117,7 @@ impl fmt::Display for RuleType {
             RuleType::InName => write!(f, "IN-NAME"),
             RuleType::InType => write!(f, "IN-TYPE"),
             RuleType::InUser => write!(f, "IN-USER"),
+            other => f.write_str(other.as_str()),
         }
     }
 }

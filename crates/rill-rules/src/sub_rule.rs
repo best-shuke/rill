@@ -52,6 +52,10 @@ pub type SubRuleBlock = Arc<Vec<Box<dyn Rule>>>;
 pub struct SubRuleRule {
     block_name: String,
     block: SubRuleBlock,
+    /// mihomo's `SUB-RULE,(<condition>),<block>`: the block is consulted
+    /// only for connections the condition matches. `None` for rill's
+    /// unconditional `SUB-RULE,<block>`.
+    condition: Option<(Box<dyn Rule>, String)>,
 }
 
 impl SubRuleRule {
@@ -59,7 +63,21 @@ impl SubRuleRule {
         Self {
             block_name: block_name.to_string(),
             block,
+            condition: None,
         }
+    }
+
+    /// Gate the block on `condition` (its source text is `text`).
+    #[must_use]
+    pub fn with_condition(mut self, condition: Box<dyn Rule>, text: &str) -> Self {
+        self.condition = Some((condition, text.to_string()));
+        self
+    }
+
+    fn condition_matches(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool {
+        self.condition
+            .as_ref()
+            .is_none_or(|(cond, _)| cond.match_metadata(metadata, helper))
     }
 
     /// Test-only constructor that hides the `Arc` wrapping. Keeping the
@@ -87,6 +105,9 @@ impl Rule for SubRuleRule {
         if self.should_resolve_ip() && !metadata.resolved() {
             return false;
         }
+        if !self.condition_matches(metadata, helper) {
+            return false;
+        }
         self.block
             .iter()
             .any(|r| r.match_metadata(metadata, helper))
@@ -102,27 +123,41 @@ impl Rule for SubRuleRule {
     }
 
     fn payload(&self) -> &str {
-        &self.block_name
+        match &self.condition {
+            Some((_, text)) => text,
+            None => &self.block_name,
+        }
     }
 
     fn should_resolve_ip(&self) -> bool {
         // Dead children can never fire — their metadata demands must not
         // leak into the aggregate (#625).
-        self.block
-            .iter()
-            .any(|r| !r.never_matches() && r.should_resolve_ip())
+        self.condition
+            .as_ref()
+            .is_some_and(|(c, _)| c.should_resolve_ip())
+            || self
+                .block
+                .iter()
+                .any(|r| !r.never_matches() && r.should_resolve_ip())
     }
 
     fn should_find_process(&self) -> bool {
-        self.block
-            .iter()
-            .any(|r| !r.never_matches() && r.should_find_process())
+        self.condition
+            .as_ref()
+            .is_some_and(|(c, _)| c.should_find_process())
+            || self
+                .block
+                .iter()
+                .any(|r| !r.never_matches() && r.should_find_process())
     }
 
     fn never_matches(&self) -> bool {
         // An empty or all-dead block can never produce a match —
         // SUB-RULE falls through when every inner rule misses.
-        self.block.iter().all(|r| r.never_matches())
+        self.condition
+            .as_ref()
+            .is_some_and(|(c, _)| c.never_matches())
+            || self.block.iter().all(|r| r.never_matches())
     }
 
     fn match_and_resolve<'a>(
@@ -135,6 +170,9 @@ impl Rule for SubRuleRule {
         // skipped while the dst IP is unresolved (#625); same gate as
         // `match_metadata` above.
         if self.should_resolve_ip() && !metadata.resolved() {
+            return None;
+        }
+        if !self.condition_matches(metadata, helper) {
             return None;
         }
         // upstream: rules/logic/logic.go::matchSubRules — an inner rule
