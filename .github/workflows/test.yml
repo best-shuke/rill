@@ -24,7 +24,10 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which drops the simple-obfs
+    # package the obfs tests install and ships a clang whose bindgen output
+    # trips rustc lints in rill-lwip's generated bindings.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -64,7 +67,10 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which drops the simple-obfs
+    # package the obfs tests install and ships a clang whose bindgen output
+    # trips rustc lints in rill-lwip's generated bindings.
+    runs-on: ubuntu-24.04
     needs: lint
     # Every test target links the whole engine; with full debuginfo the
     # debug target dir outgrew the hosted runner's disk and the linker died
@@ -344,7 +350,10 @@ jobs:
             --test httpupgrade_test --retries 2 --no-fail-fast
 
   features:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which drops the simple-obfs
+    # package the obfs tests install and ships a clang whose bindgen output
+    # trips rustc lints in rill-lwip's generated bindings.
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v5

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 — 2026-11-08
+
+- A mixed / http / socks entry in `listeners:` honours its `users:`, as
+  in mihomo: they replace the global `authentication` for that listener,
+  and `users: []` turns authentication off. They used to be dropped
+  without a word, leaving the listener open to anyone the global
+  credentials did not cover.
+- A `tproxy` entry with `udp: true` and no `firewall:` loads with its
+  rules managed externally, as a mihomo tproxy listener always is; it
+  failed the config. An explicit `firewall: true` is still rejected.
+
 ## 0.2.0 — 2026-11-08
 
 mihomo configuration compatibility. Every item was checked against

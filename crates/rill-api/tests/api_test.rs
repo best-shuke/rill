@@ -208,6 +208,7 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7894,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            users: None,
         },
         NamedListener {
             name: "mixed".into(),
@@ -215,6 +216,7 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7890,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            users: None,
         },
     ];
 
@@ -6477,13 +6479,14 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
-    // `udp: true` without `firewall: false` fails `build_named_listeners`.
+    // `udp: true` with a managed firewall fails `build_named_listeners`.
     let yaml = concat!(
         "mode: rule\n",
         "listeners:\n",
         "  - name: tp\n",
         "    type: tproxy\n",
         "    port: 7895\n",
+        "    firewall: true\n",
         "    udp: true\n",
         "rules:\n",
         "  - MATCH,DIRECT\n",

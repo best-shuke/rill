@@ -2517,14 +2517,14 @@ listeners:
     assert_eq!(udp_timeout, 120);
 }
 
-/// `udp: true` without `firewall: false` is a hard error — the managed
-/// firewall only installs host TCP REDIRECT rules and cannot express UDP
-/// TPROXY policy routing, so silently degrading to TCP-only is not an
-/// option.
+/// `udp: true` with an explicit `firewall: true` is a hard error — the
+/// managed firewall only installs host TCP REDIRECT rules and cannot
+/// express UDP TPROXY policy routing. Without a `firewall:` key the entry is
+/// externally managed, as a mihomo `tproxy` listener always is.
 #[tokio::test]
 async fn test_tproxy_udp_requires_external_firewall() {
-    for firewall_line in ["", "    firewall: true\n"] {
-        let yaml = format!(
+    let listener = |firewall_line: &str| {
+        format!(
             r#"
 listeners:
   - name: my-tproxy
@@ -2532,16 +2532,38 @@ listeners:
     listen: 0.0.0.0:5332
 {firewall_line}    udp: true
 "#
-        );
-        let err = load_config_from_str(&yaml)
-            .await
-            .err()
-            .expect("udp: true with managed firewall must fail");
-        assert!(
-            err.to_string().contains("firewall: false"),
-            "error must name the required setting, got: {err}"
-        );
-    }
+        )
+    };
+    let err = load_config_from_str(&listener("    firewall: true\n"))
+        .await
+        .err()
+        .expect("udp: true with managed firewall must fail");
+    assert!(
+        err.to_string().contains("firewall: false"),
+        "error must name the required setting, got: {err}"
+    );
+
+    let config = load_config_from_str(&listener(""))
+        .await
+        .expect("udp: true without firewall: loads, externally managed");
+    let nl = config
+        .listeners
+        .named
+        .iter()
+        .find(|l| l.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert!(
+        matches!(
+            nl.spec,
+            rill_config::ListenerSpec::TProxy {
+                firewall: false,
+                udp: true,
+                ..
+            }
+        ),
+        "{:?}",
+        nl.spec
+    );
 }
 
 #[tokio::test]
@@ -3073,4 +3095,48 @@ geox-url:
         "https://explicit.test/Country.mmdb"
     );
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
+}
+
+/// mihomo listener `users:` replace the global `authentication` for that
+/// listener; `[]` turns it off; vmess-shaped users on an unsupported
+/// inbound do not break the config.
+#[tokio::test]
+async fn listener_users_are_parsed() {
+    let config = load_config_from_str(
+        r#"
+authentication: ["global:pw"]
+listeners:
+  - {name: s, type: socks, port: 27101, listen: 127.0.0.1, users: [{username: aaa, password: bbb}]}
+  - {name: open, type: mixed, port: 27102, listen: 127.0.0.1, users: []}
+  - {name: default, type: http, port: 27103, listen: 127.0.0.1}
+  - {name: vm, type: vmess, port: 27104, listen: 127.0.0.1, users: [{username: 1, uuid: 9d0cb9d0-964f-4ef6-897d-6c6b3ccf9e68, alterId: 1}]}
+"#,
+    )
+    .await
+    .expect("config loads");
+    let users = |name: &str| {
+        config
+            .listeners
+            .named
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("listener {name}"))
+            .users
+            .clone()
+    };
+    assert_eq!(
+        users("s"),
+        Some(vec![("aaa".to_string(), "bbb".to_string())])
+    );
+    assert_eq!(users("open"), Some(Vec::new()));
+    assert_eq!(users("default"), None);
+    assert!(config.listeners.named.iter().all(|l| l.name != "vm"));
+
+    let err = load_config_from_str(
+        "listeners:\n  - {name: s, type: socks, port: 27105, users: [{username: x}]}\n",
+    )
+    .await
+    .err()
+    .expect("a user without a password is an error");
+    assert!(err.to_string().contains("users[0]"), "{err}");
 }

@@ -5182,7 +5182,7 @@ mod global_route_binding_tests {
     /// Rejected after the rebuild (and so after its fetch) by the
     /// `listeners:` admission check.
     const BAD_LISTENERS: &str =
-        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7895\n    udp: true\n";
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7895\n    firewall: true\n    udp: true\n";
 
     const GLOBAL_LO: &str =
         "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";

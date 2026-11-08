@@ -277,6 +277,12 @@ pub struct NamedListener {
     /// `max-connections` field, falling back to the global `max-connections`.
     #[serde(default)]
     pub max_connections: usize,
+    /// `users:` of a mixed / http / socks `listeners:` entry as
+    /// `(username, password)`: these replace the global `authentication`
+    /// for the listener, and an empty list turns authentication off.
+    /// `None` uses the global credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<(String, String)>>,
 }
 
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
@@ -4227,7 +4233,22 @@ fn parse_listener_spec(
             // it cannot promise LAN UDP TPROXY policy routing, so the
             // combination is rejected rather than silently TCP-only.
             let udp = raw_l.udp.unwrap_or(false);
-            let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
+            // A mihomo `tproxy` listener never touches the firewall, and
+            // `udp: true` only works with rules the deployer installs — so
+            // without an explicit `firewall:` such an entry is externally
+            // managed, as it is in mihomo.
+            let firewall = match raw_l.firewall {
+                Some(firewall) => firewall,
+                None if udp => {
+                    info!(
+                        "listeners[{}]: `udp: true` without `firewall:` — the TPROXY rules \
+                         are managed externally, as with mihomo",
+                        raw_l.name
+                    );
+                    false
+                }
+                None => default_tproxy_firewall(),
+            };
             if udp && firewall {
                 anyhow::bail!(
                     "listeners[{}]: `udp: true` requires `firewall: false` — rill does \
@@ -4415,6 +4436,7 @@ fn build_named_listeners(
             port,
             listen: listen.to_string(),
             max_connections,
+            users: None,
         });
         Ok(())
     };
@@ -4503,6 +4525,7 @@ fn build_named_listeners(
     }
 
     // Explicit `listeners:` entries
+    let mut listener_users: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
         // Inbound protocols mihomo has and rill does not: leave them out
         // with a warning instead of failing the whole config.
@@ -4589,11 +4612,65 @@ fn build_named_listeners(
                 );
             }
         }
+        if let Some(users) = raw_l.users.as_ref() {
+            if matches!(
+                spec,
+                ListenerSpec::Mixed | ListenerSpec::Http | ListenerSpec::Socks5
+            ) {
+                listener_users.push((
+                    raw_l.name.clone(),
+                    parse_listener_users(&raw_l.name, users)?,
+                ));
+            } else {
+                warn!(
+                    "listeners[{}].users: only used on mixed / http / socks listeners, ignored",
+                    raw_l.name
+                );
+            }
+        }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(&raw_l.name, spec, port, &listen, max_connections)?;
     }
+    for (name, users) in listener_users {
+        if let Some(listener) = result.iter_mut().find(|l| l.name == name) {
+            listener.users = Some(users);
+        }
+    }
 
     Ok(result)
+}
+
+/// mihomo's listener `users:` — a list of `{username, password}`. A
+/// malformed entry fails the config: dropping it would leave the listener
+/// open, or locked, against the author's intent.
+fn parse_listener_users(
+    listener: &str,
+    users: &serde_yaml::Value,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let Some(list) = users.as_sequence() else {
+        if users.is_null() {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("listeners[{listener}].users: expected a list of {{username, password}}");
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let field = |key: &str| -> Option<String> {
+                match entry.get(key)? {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                }
+            };
+            match (field("username"), field("password")) {
+                (Some(user), Some(pass)) if !user.is_empty() => Ok((user, pass)),
+                _ => anyhow::bail!(
+                    "listeners[{listener}].users[{i}]: needs a non-empty `username` and a `password`"
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Build a runnable [`Config`] from an already-parsed raw document. This is

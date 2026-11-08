@@ -3260,7 +3260,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rill-anytls"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3289,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "rill-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "rill-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3364,7 +3364,7 @@ dependencies = [
 
 [[package]]
 name = "rill-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3378,7 +3378,7 @@ dependencies = [
 
 [[package]]
 name = "rill-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3405,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "rill-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "rill-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3465,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "rill-dns"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3496,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "rill-listener"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -3529,7 +3529,7 @@ dependencies = [
 
 [[package]]
 name = "rill-lwip"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bindgen",
  "bytes",
@@ -3543,7 +3543,7 @@ dependencies = [
 
 [[package]]
 name = "rill-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "rill-rules"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "ipnet",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "rill-transport"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "rill-trie"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "proptest",
@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "rill-tunnel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "criterion",

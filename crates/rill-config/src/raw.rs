@@ -421,6 +421,11 @@ pub struct RawListener {
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
+    /// mihomo `users:` of a mixed / http / socks listener: replaces the
+    /// global `authentication` for it (`[]`: no authentication). Kept raw:
+    /// other mihomo inbounds (vmess, tuic, …) shape their users differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<serde_yaml::Value>,
 
     // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
     pub cipher: Option<String>,

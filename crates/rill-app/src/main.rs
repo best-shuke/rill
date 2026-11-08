@@ -1350,9 +1350,20 @@ async fn run(
                     };
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
+                    // A listener's own `users:` replace the global
+                    // credentials (mihomo `AuthUsers`); `[]` means none.
+                    let listener_auth = match &nl.users {
+                        Some(users) => Arc::new(rill_common::auth::AuthConfig::new(
+                            Arc::new(rill_common::auth::Credentials::new(
+                                users.iter().cloned().collect(),
+                            )),
+                            auth.skip_prefixes.clone(),
+                        )),
+                        None => Arc::clone(&auth),
+                    };
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
-                        .with_auth(Arc::clone(&auth))
+                        .with_auth(listener_auth)
                         .with_max_connections(nl.max_connections);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
@@ -1891,6 +1902,7 @@ mod tests {
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
+            users: None,
         };
         let err = rill_api::ensure_listeners_supported(&[named], super::listener_feature_gate)
             .expect_err("ss listener must fail on a feature-less build");
