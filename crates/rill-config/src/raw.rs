@@ -224,6 +224,10 @@ pub struct RawConfig {
     /// because it rejects real-world mihomo subscriptions that mix in node
     /// types rill does not support.
     pub strict: Option<bool>,
+    /// mihomo `redir-port`: a REDIRECT (Linux) / rdr (macOS) inbound
+    /// whose firewall rules the deployer installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redir_port: Option<u16>,
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,

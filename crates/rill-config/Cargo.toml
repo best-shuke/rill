@@ -70,6 +70,8 @@ fancy-regex = { version = "0.20", default-features = false, features = ["std", "
 parking_lot = { workspace = true }
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }
+# VLESS/VMess ids that are not UUIDs map to UUIDv5 (mihomo `UUIDMap`).
+sha1 = { workspace = true }
 url = "2"
 httparse = "1"
 # Optional: only compiled when the `external-ui-download` feature is enabled.

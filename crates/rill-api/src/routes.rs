@@ -480,7 +480,7 @@ struct UpdateProxyRequest {
 async fn update_proxy(
     State(state): State<Arc<AppState>>,
     Path(group_name): Path<String>,
-    Json(body): Json<UpdateProxyRequest>,
+    LooseJson(body): LooseJson<UpdateProxyRequest>,
 ) -> Response {
     let route = state.tunnel.route_snapshot();
     let Some(proxy) = route.proxies.get(group_name.as_str()).cloned() else {
@@ -858,7 +858,7 @@ struct UpdateConfigRequest {
 
 async fn update_configs(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateConfigRequest>,
+    LooseJson(body): LooseJson<UpdateConfigRequest>,
 ) -> Response {
     // Validate every field first so we never partially apply on error.
     let mode = body.mode.map(|s| s.parse::<TunnelMode>());
@@ -1141,7 +1141,7 @@ async fn get_dns_results(
 
 async fn dns_query(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<DnsQueryRequest>,
+    LooseJson(body): LooseJson<DnsQueryRequest>,
 ) -> Json<serde_json::Value> {
     let resolver = state.tunnel.resolver();
     let result = resolver.resolve_ip(&body.name).await.ok().flatten();
@@ -2064,7 +2064,7 @@ struct AddSubscriptionRequest {
 
 async fn add_subscription(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<AddSubscriptionRequest>,
+    LooseJson(body): LooseJson<AddSubscriptionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // `strict` follows the daemon's live config — the subscription payload
     // doesn't carry the flag (issue #533).
@@ -2367,7 +2367,7 @@ struct CreateProxyGroupRequest {
 
 async fn create_proxy_group(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateProxyGroupRequest>,
+    LooseJson(body): LooseJson<CreateProxyGroupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let group_name = body.name.clone();
     let _mutation = CONFIG_MUTATION.lock().await;
@@ -2401,7 +2401,7 @@ async fn create_proxy_group(
 async fn update_proxy_group(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(body): Json<CreateProxyGroupRequest>,
+    LooseJson(body): LooseJson<CreateProxyGroupRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
@@ -2465,7 +2465,7 @@ struct SelectProxyRequest {
 async fn select_proxy_in_group(
     State(state): State<Arc<AppState>>,
     Path(group_name): Path<String>,
-    Json(body): Json<SelectProxyRequest>,
+    LooseJson(body): LooseJson<SelectProxyRequest>,
 ) -> StatusCode {
     let route = state.tunnel.route_snapshot();
     let Some(proxy) = route.proxies.get(group_name.as_str()).cloned() else {
@@ -2493,7 +2493,7 @@ struct ReplaceRulesRequest {
 
 async fn replace_rules(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ReplaceRulesRequest>,
+    LooseJson(body): LooseJson<ReplaceRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let count = body.rules.len();
     let _mutation = CONFIG_MUTATION.lock().await;
@@ -2516,7 +2516,7 @@ struct UpdateRuleRequest {
 
 async fn update_rule_at_index(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateRuleRequest>,
+    LooseJson(body): LooseJson<UpdateRuleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
@@ -2562,7 +2562,7 @@ struct ReorderRulesRequest {
 
 async fn reorder_rules(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ReorderRulesRequest>,
+    LooseJson(body): LooseJson<ReorderRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
@@ -2602,6 +2602,31 @@ struct DelayResp {
 }
 
 /// `{"message": "..."}` body matching upstream's error render.
+/// A JSON request body, read whatever its `Content-Type` says. mihomo's
+/// handlers (`render.DecodeJSON`) never look at the header, and dashboards
+/// and scripts written against it often leave it out — axum's `Json`
+/// would answer those with 415. A malformed body is a 400 `Body invalid`,
+/// mihomo's `ErrBadRequest`.
+pub(crate) struct LooseJson<T>(pub T);
+
+impl<S, T> axum::extract::FromRequest<S> for LooseJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        serde_json::from_slice(&bytes).map(LooseJson).map_err(|e| {
+            debug!("request body is not the expected JSON: {e}");
+            msg_err(StatusCode::BAD_REQUEST, "Body invalid")
+        })
+    }
+}
+
 fn msg_err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "message": message }))).into_response()
 }
@@ -3310,7 +3335,7 @@ struct PutConfigsBody {
 async fn put_configs(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
-    Json(body): Json<PutConfigsBody>,
+    LooseJson(body): LooseJson<PutConfigsBody>,
 ) -> Response {
     let force = params.get("force").is_some_and(|v| v == "true");
 

@@ -37,6 +37,59 @@ pub(crate) fn system_nameservers() -> Vec<SocketAddr> {
     out
 }
 
+/// This host's interface addresses other than loopback and link-local —
+/// what mihomo's `hosts: {name: lan}` resolves `name` to.
+pub(crate) fn lan_addresses() -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    #[cfg(unix)]
+    // SAFETY: getifaddrs hands back a linked list we only read and then
+    // free with freeifaddrs; each `ifa_addr` is checked for null and its
+    // family before it is reinterpreted as the matching sockaddr type.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) == 0 {
+            let mut cur = head;
+            while !cur.is_null() {
+                let addr = (*cur).ifa_addr;
+                if !addr.is_null() {
+                    let ip = match i32::from((*addr).sa_family) {
+                        libc::AF_INET => {
+                            let sin = addr.cast::<libc::sockaddr_in>();
+                            Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                                (*sin).sin_addr.s_addr,
+                            ))))
+                        }
+                        libc::AF_INET6 => {
+                            let sin6 = addr.cast::<libc::sockaddr_in6>();
+                            Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                                (*sin6).sin6_addr.s6_addr,
+                            )))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ip) = ip.filter(|ip| is_lan_candidate(*ip)) {
+                        if !out.contains(&ip) {
+                            out.push(ip);
+                        }
+                    }
+                }
+                cur = (*cur).ifa_next;
+            }
+            libc::freeifaddrs(head);
+        }
+    }
+    out
+}
+
+fn is_lan_candidate(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 /// `nameserver` lines of a resolv.conf; scoped IPv6 addresses (`%zone`)
 /// are left out, since a nameserver URL cannot carry the zone.
 pub(crate) fn parse_resolv_conf(contents: &str) -> Vec<SocketAddr> {
@@ -244,6 +297,17 @@ mod tests {
             "# comment\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\nsearch lan\nnameserver 127.0.0.53\n",
         );
         assert_eq!(got, ["127.0.0.53:53".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn lan_addresses_skip_loopback_and_link_local() {
+        for ip in lan_addresses() {
+            assert!(is_lan_candidate(ip), "{ip}");
+        }
+        assert!(!is_lan_candidate("127.0.0.1".parse().unwrap()));
+        assert!(!is_lan_candidate("169.254.1.1".parse().unwrap()));
+        assert!(!is_lan_candidate("fe80::1".parse().unwrap()));
+        assert!(is_lan_candidate("192.168.1.2".parse().unwrap()));
     }
 
     #[test]

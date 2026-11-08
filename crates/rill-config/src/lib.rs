@@ -2835,6 +2835,22 @@ fn rebuild_from_raw_impl(
         proxy_provider::validate_paths(map, cache_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    // Startup's first pass only needs the proxy layer (DNS `#name`
+    // outbounds and provider downloads resolve against it); the rules it
+    // would parse here are thrown away, so skip them — on a large rule
+    // list or rule-set that halves the startup parse.
+    if PROXIES_ONLY.with(std::cell::Cell::get) {
+        return Ok(RebuildResult {
+            proxies,
+            rules: Vec::new(),
+            dialer_registry: registry.clone(),
+            rule_providers: HashMap::new(),
+            proxy_providers: candidate_providers,
+            dropped_providers: dropped,
+            prefetched_payloads: prefetched_payloads.unwrap_or_default(),
+        });
+    }
+
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
     // the same bytes, so nothing is fetched twice. The `Arc` is returned on
@@ -2985,6 +3001,49 @@ async fn prefetch_rule_provider_payloads_async(
         warn!("rule-provider payload prefetch task failed: {e}");
         rule_provider::PrefetchedPayloads::default()
     })
+}
+
+thread_local! {
+    /// Set on the blocking thread running startup's first build pass: stop
+    /// after the proxy layer (see `rebuild_from_raw_impl`).
+    static PROXIES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`rebuild_from_raw_impl_async`] that builds only the proxy layer — the
+/// returned rules and rule providers are empty.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards rebuild_from_raw_impl_async's arguments"
+)]
+async fn rebuild_proxy_layer_async(
+    raw: raw::RawConfig,
+    cache_dir: Option<PathBuf>,
+    providers: HashMap<String, Arc<ProxyProvider>>,
+    selector_store: Option<Arc<rill_proxy::SelectorStore>>,
+    ctx: rill_rules::ParserContext,
+    provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
+    registry: rill_proxy::dialer::ProxyRegistry,
+    provider_dialer_registry: rill_proxy::dialer::ProxyRegistry,
+) -> Result<RebuildResult, anyhow::Error> {
+    spawn_blocking_with_current_dispatcher(move || {
+        PROXIES_ONLY.with(|f| f.set(true));
+        let res = rebuild_from_raw_impl(
+            &raw,
+            cache_dir.as_deref(),
+            None,
+            &providers,
+            selector_store.as_ref(),
+            Some(&ctx),
+            Some(provider_payloads),
+            &registry,
+            &provider_dialer_registry,
+            None,
+        );
+        PROXIES_ONLY.with(|f| f.set(false));
+        res
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("config rebuild task failed: {e}"))?
 }
 
 #[allow(
@@ -3986,6 +4045,22 @@ pub(crate) fn resolve_listener_bind(
     )
 }
 
+/// mihomo listener types rill has no inbound for.
+const UNSUPPORTED_MIHOMO_INBOUNDS: [&str; 12] = [
+    "tun",
+    "tunnel",
+    "vmess",
+    "vless",
+    "trojan",
+    "tuic",
+    "hysteria2",
+    "anytls",
+    "mieru",
+    "sudoku",
+    "trusttunnel",
+    "shadowquic",
+];
+
 /// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 ///
@@ -4004,7 +4079,16 @@ fn parse_listener_spec(
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
-        "socks5" => Ok(ListenerSpec::Socks5),
+        // mihomo's `socks` listener; rill's SOCKS inbound speaks 4/4a/5.
+        "socks" | "socks5" => Ok(ListenerSpec::Socks5),
+        // mihomo `redir`: Linux REDIRECT / macOS pf rdr, rules managed by
+        // the deployer — the tproxy listener with `firewall: false`.
+        "redir" => Ok(ListenerSpec::TProxy {
+            sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
+            firewall: false,
+            udp: false,
+            udp_timeout: default_udp_timeout_secs(),
+        }),
         "tproxy" => {
             // #564: `udp` is opt-in and IPv4-only in this release, and the
             // managed firewall only produces host TCP OUTPUT REDIRECT rules —
@@ -4051,7 +4135,8 @@ fn parse_listener_spec(
             simple_obfs: None,
         })),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, or shadowsocks"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, redir, \
+             tproxy, or shadowsocks"
         ),
     }
 }
@@ -4270,8 +4355,34 @@ fn build_named_listeners(
         )?;
     }
 
+    if let Some(port) = raw.redir_port.filter(|p| *p != 0) {
+        add(
+            "redir",
+            ListenerSpec::TProxy {
+                sni: global_tproxy_sni,
+                firewall: false,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
+            },
+            port,
+            default_bind,
+            global_max_conns,
+        )?;
+    }
+
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
+        // Inbound protocols mihomo has and rill does not: leave them out
+        // with a warning instead of failing the whole config.
+        let ty = raw_l.listener_type.to_ascii_lowercase();
+        if UNSUPPORTED_MIHOMO_INBOUNDS.contains(&ty.as_str()) {
+            warn!(
+                "listeners[{}]: inbound type '{ty}' is not supported by rill; the listener \
+                 is not started",
+                raw_l.name
+            );
+            continue;
+        }
         let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
@@ -4513,22 +4624,18 @@ pub async fn build_config(
     )
     .await?;
 
-    let (proxies, _, _) = {
-        let res = rebuild_from_raw_impl_async(
-            raw.clone(),
-            cache_dir_buf.clone(),
-            None,
-            proxy_providers.clone(),
-            selector_store.clone(),
-            ctx.clone(),
-            Arc::clone(&provider_payloads),
-            dialer_registry.clone(),
-            provider_dialer_registry.clone(),
-            None,
-        )
-        .await?;
-        (res.proxies, res.rules, res.dialer_registry)
-    };
+    let proxies = rebuild_proxy_layer_async(
+        raw.clone(),
+        cache_dir_buf.clone(),
+        proxy_providers.clone(),
+        selector_store.clone(),
+        ctx.clone(),
+        Arc::clone(&provider_payloads),
+        dialer_registry.clone(),
+        provider_dialer_registry.clone(),
+    )
+    .await?
+    .proxies;
 
     // Load rule-providers before DNS so that `nameserver-policy` `rule-set:`
     // entries can resolve against them. This uses the step-1 proxy registry;

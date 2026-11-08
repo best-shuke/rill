@@ -3453,6 +3453,7 @@ dependencies = [
  "rill-trie",
  "serde",
  "serde_yaml",
+ "sha1",
  "smol_str",
  "tempfile",
  "tokio",

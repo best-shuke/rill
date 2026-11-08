@@ -13,8 +13,19 @@ pub fn get_original_dst(stream: &TcpStream, listen_addr: SocketAddr) -> io::Resu
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = listen_addr;
-        linux::get_original_dst(stream)
+        // REDIRECT (NAT) records the original destination in conntrack;
+        // a `TPROXY`-delivered connection keeps it as its local address,
+        // which is all there is when the flow is not conntracked.
+        match linux::get_original_dst(stream) {
+            Ok(dst) => Ok(dst),
+            Err(e) => match stream.local_addr() {
+                // A local address on the listener's own port is a plain
+                // connection to the listener (which may be bound to
+                // 0.0.0.0), not a redirected one.
+                Ok(local) if local.port() != listen_addr.port() => Ok(local),
+                _ => Err(e),
+            },
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

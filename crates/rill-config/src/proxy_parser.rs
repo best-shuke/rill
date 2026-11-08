@@ -1950,108 +1950,9 @@ fn parse_vless(
                 WsLayer::new(ws_cfg).map_err(|e| format!("vless: ws layer error: {e}"))?;
             chain.push(Box::new(ws_layer));
         }
-        "grpc" => {
-            use rill_transport::grpc::{GrpcConfig, GrpcLayer};
-            let grpc_opts = config.get("grpc-opts");
-            let service_name = grpc_opts
-                .and_then(|o| o.get("grpc-service-name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("GunService")
-                .to_string();
-            // Authority: mihomo's gun transport sets `Host` to `servername`
-            // and only falls back to the dial host when `servername` is empty
-            // (adapter/outbound/vless.go). Front-ends that route gRPC by
-            // `:authority` are provisioned against that value, so match it
-            // rather than always sending the dial host (issue #377). Resolved
-            // here per ADR-0001 §1 — the transport never infers it.
-            let authority = config
-                .get("servername")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(server)
-                .to_string();
-            let grpc_cfg = GrpcConfig {
-                service_name,
-                authority,
-            };
-            chain.push(Box::new(GrpcLayer::new(grpc_cfg)));
-        }
-        "h2" => {
-            use rill_transport::h2::{H2Config, H2Layer};
-            let h2_opts = config.get("h2-opts");
-            let path = h2_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            // `h2-opts.host` is a list; default to server when absent.
-            // Class A: empty host list is rejected — H2Layer asserts non-empty
-            // (debug) and upstream requires at least one authority value.
-            let hosts: Vec<String> = h2_opts
-                .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_sequence())
-                .map_or_else(
-                    || vec![server.to_string()],
-                    |seq| {
-                        seq.iter()
-                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                            .collect()
-                    },
-                );
-            if hosts.is_empty() {
-                return Err(format!(
-                    "vless: h2-opts.host must not be empty for proxy '{name}' \
-                     (H2 requires at least one authority value)"
-                ));
-            }
-            let h2_cfg = H2Config { path, hosts };
-            chain.push(Box::new(H2Layer::new(h2_cfg)));
-        }
-        "httpupgrade" => {
-            use rill_transport::httpupgrade::{
-                HttpUpgradeConfig, HttpUpgradeLayer, MAX_EXTRA_HEADERS,
-            };
-            let hu_opts = config.get("http-upgrade-opts");
-            let path = hu_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            let host_header = hu_opts
-                .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string)
-                .or_else(|| Some(server.to_string()));
-            let extra_headers: Vec<(String, String)> = match hu_opts
-                .and_then(|o| o.get("headers"))
-                .and_then(|h| h.as_mapping())
-            {
-                Some(m) => {
-                    // Same remotely-supplied header-list bound as xhttp
-                    // (issue #648); `connect()` re-checks it.
-                    if m.len() > MAX_EXTRA_HEADERS {
-                        return Err(format!(
-                            "vless: http-upgrade-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
-                            m.len()
-                        ));
-                    }
-                    m.iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.as_str()?.to_string();
-                            let val = v.as_str()?.to_string();
-                            Some((key, val))
-                        })
-                        .collect()
-                }
-                None => Vec::new(),
-            };
-            let hu_cfg = HttpUpgradeConfig {
-                path,
-                host_header,
-                extra_headers,
-            };
-            chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
-        }
+        "grpc" => chain.push(grpc_layer(config, server)),
+        "h2" => chain.push(h2_layer(config, server, name, "vless")?),
+        "httpupgrade" => chain.push(httpupgrade_layer(config, server, "vless")?),
         "xhttp" => {
             let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
             chain.push(Box::new(rill_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
@@ -2664,12 +2565,39 @@ fn parse_reality_short_id(s: &str) -> std::result::Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// A VLESS / VMess user id. As in mihomo (`utils.UUIDMap`, after
+/// Xray-core), a string that is not a UUID stands for the version-5 UUID
+/// of that string in the nil namespace, so `uuid: my-password` works.
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn parse_uuid(s: &str) -> std::result::Result<[u8; 16], String> {
+    match parse_uuid_literal(s) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) if !s.trim().is_empty() => Ok(uuid_v5_nil(s)),
+        Err(e) => Err(e),
+    }
+}
+
+/// RFC 9562 version-5 UUID of `name` in the nil namespace.
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn uuid_v5_nil(name: &str) -> [u8; 16] {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update([0u8; 16]);
+    h.update(name.as_bytes());
+    let digest = h.finalize();
+    let mut u = [0u8; 16];
+    u.copy_from_slice(&digest[..16]);
+    u[6] = (u[6] & 0x0f) | 0x50;
+    u[8] = (u[8] & 0x3f) | 0x80;
+    u
+}
+
 /// Parse a UUID string (dashed or hex-only) into a 16-byte array.
 ///
 /// Accepts: `"b831381d-6324-4d53-ad4f-8cda48b30811"` or
 ///          `"b831381d63244d53ad4f8cda48b30811"`.
-#[cfg(feature = "vless")]
-fn parse_uuid(s: &str) -> std::result::Result<[u8; 16], String> {
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn parse_uuid_literal(s: &str) -> std::result::Result<[u8; 16], String> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
         return Err(format!(
@@ -2806,6 +2734,168 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `network: grpc` (`grpc-opts`), shared by VLESS and VMess.
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn grpc_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+) -> Box<dyn rill_transport::Transport> {
+    use rill_transport::grpc::{GrpcConfig, GrpcLayer};
+    let grpc_opts = config.get("grpc-opts");
+    let service_name = grpc_opts
+        .and_then(|o| o.get("grpc-service-name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("GunService")
+        .to_string();
+    // Authority: mihomo's gun transport sets `Host` to `servername` and only
+    // falls back to the dial host when `servername` is empty
+    // (adapter/outbound/vless.go). Front-ends that route gRPC by
+    // `:authority` are provisioned against that value, so match it rather
+    // than always sending the dial host (issue #377). Resolved here per
+    // ADR-0001 §1 — the transport never infers it.
+    let authority = config
+        .get("servername")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(server)
+        .to_string();
+    Box::new(GrpcLayer::new(GrpcConfig {
+        service_name,
+        authority,
+    }))
+}
+
+/// `network: h2` (`h2-opts`).
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn h2_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+    name: &str,
+    proto: &str,
+) -> std::result::Result<Box<dyn rill_transport::Transport>, String> {
+    use rill_transport::h2::{H2Config, H2Layer};
+    let h2_opts = config.get("h2-opts");
+    let path = h2_opts
+        .and_then(|o| o.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    // `h2-opts.host` is a list; default to server when absent. An empty
+    // host list is rejected — H2Layer asserts non-empty (debug) and
+    // upstream requires at least one authority value.
+    let hosts: Vec<String> = h2_opts
+        .and_then(|o| o.get("host"))
+        .and_then(|v| v.as_sequence())
+        .map_or_else(
+            || vec![server.to_string()],
+            |seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                    .collect()
+            },
+        );
+    if hosts.is_empty() {
+        return Err(format!(
+            "{proto}: h2-opts.host must not be empty for proxy '{name}' \
+             (H2 requires at least one authority value)"
+        ));
+    }
+    Ok(Box::new(H2Layer::new(H2Config { path, hosts })))
+}
+
+/// `network: httpupgrade` (`http-upgrade-opts`).
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn httpupgrade_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+    proto: &str,
+) -> std::result::Result<Box<dyn rill_transport::Transport>, String> {
+    use rill_transport::httpupgrade::{HttpUpgradeConfig, HttpUpgradeLayer, MAX_EXTRA_HEADERS};
+    let hu_opts = config.get("http-upgrade-opts");
+    let path = hu_opts
+        .and_then(|o| o.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let host_header = hu_opts
+        .and_then(|o| o.get("host"))
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string)
+        .or_else(|| Some(server.to_string()));
+    let extra_headers: Vec<(String, String)> = match hu_opts
+        .and_then(|o| o.get("headers"))
+        .and_then(|h| h.as_mapping())
+    {
+        Some(m) => {
+            // Same remotely-supplied header-list bound as xhttp (issue
+            // #648); `connect()` re-checks it.
+            if m.len() > MAX_EXTRA_HEADERS {
+                return Err(format!(
+                    "{proto}: http-upgrade-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
+                    m.len()
+                ));
+            }
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let val = v.as_str()?.to_string();
+                    Some((key, val))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    Ok(Box::new(HttpUpgradeLayer::new(HttpUpgradeConfig {
+        path,
+        host_header,
+        extra_headers,
+    })))
+}
+
+/// VMess `network: http` (`http-opts`): V2Ray's HTTP header camouflage.
+#[cfg(feature = "vmess")]
+fn http_header_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+) -> Box<dyn rill_transport::Transport> {
+    use rill_transport::http_header::{HttpHeaderConfig, HttpHeaderLayer};
+    let opts = config.get("http-opts");
+    let strings = |v: Option<&serde_yaml::Value>| -> Vec<String> {
+        match v {
+            Some(serde_yaml::Value::String(s)) => vec![s.clone()],
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let method = opts
+        .and_then(|o| o.get("method"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let paths = strings(opts.and_then(|o| o.get("path")));
+    let headers = opts
+        .and_then(|o| o.get("headers"))
+        .and_then(|h| h.as_mapping())
+        .map(|m| {
+            let mut out: Vec<(String, Vec<String>)> = m
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), strings(Some(v)))))
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        })
+        .unwrap_or_default();
+    Box::new(HttpHeaderLayer::new(HttpHeaderConfig {
+        method,
+        host: server.to_string(),
+        paths,
+        headers,
+    }))
 }
 
 #[cfg(feature = "vmess")]
@@ -2948,9 +3038,14 @@ fn parse_vmess(
                 WsLayer::new(ws_cfg).map_err(|e| format!("vmess: ws layer error: {e}"))?;
             chain.push(Box::new(ws_layer));
         }
+        "grpc" => chain.push(grpc_layer(config, server)),
+        "h2" => chain.push(h2_layer(config, server, name, "vmess")?),
+        "httpupgrade" => chain.push(httpupgrade_layer(config, server, "vmess")?),
+        "http" => chain.push(http_header_layer(config, server)),
         other => {
             return Err(format!(
-                "vmess: unsupported network '{other}'; valid values: tcp, ws"
+                "vmess: unsupported network '{other}'; valid values: tcp, ws, grpc, h2, \
+                 httpupgrade, http"
             ));
         }
     }
@@ -3558,6 +3653,19 @@ fn parse_xpro(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn non_uuid_ids_map_to_uuid_v5_in_the_nil_namespace() {
+        // Python: uuid.uuid5(uuid.UUID(int=0), "not-a-uuid")
+        let want = parse_uuid_literal("9b70e619-d7b3-55b1-b743-756ebd573b4e").unwrap();
+        assert_eq!(parse_uuid("not-a-uuid").unwrap(), want);
+        let literal = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        assert_eq!(
+            parse_uuid(literal).unwrap(),
+            parse_uuid_literal(literal).unwrap()
+        );
+        assert!(parse_uuid("").is_err());
+    }
     use super::*;
     use hickory_proto::op::{Message, MessageType, OpCode};
     use hickory_proto::rr::rdata::AAAA;

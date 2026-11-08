@@ -88,7 +88,7 @@ pub(super) fn install(config_override: Option<&str>, args: &Args) -> Result<()> 
         )
     })?;
     let requested_config = resolve_service_config(
-        config_override.unwrap_or(&args.config),
+        config_override.or(args.config.as_deref()),
         args.directory.as_deref().map(|_| home_dir.as_path()),
         &current_dir,
     );
@@ -419,14 +419,24 @@ fn resolve_service_home(explicit: Option<&str>, default_home: &Path, cwd: &Path)
 /// Mirrors the runtime rule in `run_application_inner`: a relative `-f` is
 /// resolved under `-d` when a home directory was given, otherwise under the
 /// invoking directory.
-fn resolve_service_config(config: &str, explicit_home: Option<&Path>, cwd: &Path) -> PathBuf {
-    let config = PathBuf::from(config);
-    if config.is_absolute() {
-        config
-    } else if let Some(home) = explicit_home {
-        home.join(config)
-    } else {
-        cwd.join(config)
+/// `-f` as mihomo reads it: an absolute path, or one relative to the
+/// current directory; without `-f`, `config.yaml` in the explicit home (or
+/// the current directory when there is none).
+fn resolve_service_config(
+    config: Option<&str>,
+    explicit_home: Option<&Path>,
+    cwd: &Path,
+) -> PathBuf {
+    match config {
+        Some(config) => {
+            let config = PathBuf::from(config);
+            if config.is_absolute() {
+                config
+            } else {
+                cwd.join(config)
+            }
+        }
+        None => explicit_home.unwrap_or(cwd).join("config.yaml"),
     }
 }
 
@@ -696,13 +706,17 @@ mod tests {
         let cwd = Path::new(r"E:\test");
         let home = Path::new(r"D:\rill-data");
 
-        let under_home = resolve_service_config("config.yaml", Some(home), cwd);
+        let under_home = resolve_service_config(None, Some(home), cwd);
         assert_eq!(under_home, PathBuf::from(r"D:\rill-data\config.yaml"));
 
-        let under_cwd = resolve_service_config("config.yaml", None, cwd);
+        // A relative `-f` is taken from the current directory, as in mihomo.
+        let relative = resolve_service_config(Some("config.yaml"), Some(home), cwd);
+        assert_eq!(relative, PathBuf::from(r"E:\test\config.yaml"));
+
+        let under_cwd = resolve_service_config(None, None, cwd);
         assert_eq!(under_cwd, PathBuf::from(r"E:\test\config.yaml"));
 
-        let absolute = resolve_service_config(r"C:\configs\config.yaml", Some(home), cwd);
+        let absolute = resolve_service_config(Some(r"C:\configs\config.yaml"), Some(home), cwd);
         assert_eq!(absolute, PathBuf::from(r"C:\configs\config.yaml"));
     }
 

@@ -58,6 +58,11 @@ pub mod h2;
 #[cfg(feature = "httpupgrade")]
 pub mod httpupgrade;
 
+/// V2Ray HTTP header camouflage (`network: http`); rides on the
+/// `httpupgrade` feature, which brings the same dependencies.
+#[cfg(feature = "httpupgrade")]
+pub mod http_header;
+
 #[cfg(feature = "xhttp")]
 pub mod xhttp;
 

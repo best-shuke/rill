@@ -136,6 +136,52 @@ impl TProxyListener {
         self
     }
 
+    /// Bind the TCP socket for a tproxy listener. On Linux it is marked
+    /// `IP_TRANSPARENT` (best effort — it needs CAP_NET_ADMIN), so iptables
+    /// / nftables `TPROXY` rules can deliver connections to it, as they can
+    /// to mihomo's `tproxy-port`; REDIRECT'd connections work either way.
+    pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket.set_reuseaddr(true)?;
+            let on: libc::c_int = 1;
+            let (level, opt) = if addr.is_ipv4() {
+                (libc::SOL_IP, libc::IP_TRANSPARENT)
+            } else {
+                (libc::SOL_IPV6, libc::IPV6_TRANSPARENT)
+            };
+            // SAFETY: plain setsockopt on a socket we own, with a c_int value.
+            let rc = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    opt,
+                    std::ptr::addr_of!(on).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                debug!(
+                    "tproxy {addr}: IP_TRANSPARENT unavailable ({}); TPROXY rules cannot \
+                     reach this listener, REDIRECT still works",
+                    std::io::Error::last_os_error()
+                );
+            }
+            socket.bind(addr)?;
+            socket.listen(1024)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpListener::bind(addr).await
+        }
+    }
+
     /// Bind on `listen_addr` and serve — performs the fallible firewall/
     /// UDP setup internally via [`Self::prepare`]. Callers that spawn
     /// this in a detached task should instead bind the socket, call
@@ -144,7 +190,7 @@ impl TProxyListener {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind first so a port-0 listen can resolve to the OS-assigned port
         // before firewall rules are installed against it.
-        let listener = TcpListener::bind(self.listen_addr).await?;
+        let listener = Self::bind(self.listen_addr).await?;
         self.run_on(listener).await
     }
 

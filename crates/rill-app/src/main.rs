@@ -39,9 +39,11 @@ const SERVICE_NAME: &str = "rill";
 #[derive(Parser)]
 #[command(name = "rill", version = env!("RILL_VERSION"), about = "A rule-based tunnel in Rust")]
 struct Args {
-    /// Path to configuration file
-    #[arg(short = 'f', long = "config", default_value = "config.yaml")]
-    config: String,
+    /// Path to configuration file (default: config.yaml in the home
+    /// directory). A relative path is taken from the current directory, as
+    /// mihomo takes it.
+    #[arg(short = 'f', long = "config")]
+    config: Option<String>,
 
     /// Home directory
     #[arg(short = 'd', long = "directory")]
@@ -495,19 +497,24 @@ fn run_application_inner(
         rill_common::set_home_dir(std::path::PathBuf::from(dir));
     }
 
-    // Load config
-    let config_path = if let Some(dir) = &args.directory {
-        let config = std::path::Path::new(&args.config);
-        if config.is_absolute() {
-            args.config.clone()
-        } else {
-            std::path::Path::new(dir)
-                .join(config)
-                .to_string_lossy()
-                .to_string()
+    // Load config. As in mihomo, `-f` is used as given (a relative path
+    // from the current directory); without it the config is `config.yaml`
+    // in the home directory (`-d`, else the default home). A `config.yaml`
+    // in the current directory is still found when the home has none, as
+    // earlier rill releases looked there.
+    let config_path = match &args.config {
+        Some(path) => path.clone(),
+        None => {
+            let home = rill_config::rill_config_dir().join("config.yaml");
+            if args.directory.is_none()
+                && !home.exists()
+                && std::path::Path::new("config.yaml").exists()
+            {
+                "config.yaml".to_string()
+            } else {
+                home.to_string_lossy().to_string()
+            }
         }
-    } else {
-        args.config.clone()
     };
 
     if args.test {
@@ -784,7 +791,7 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
         .to_string();
 
     // Determine config path (absolute)
-    let config_rel = config_override.unwrap_or(&args.config);
+    let config_rel = config_override.unwrap_or(args.config.as_deref().unwrap_or("config.yaml"));
     let config_path = if std::path::Path::new(config_rel).is_absolute() {
         config_rel.to_string()
     } else {
@@ -903,7 +910,7 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
         .to_string();
 
     // Resolve source config path
-    let config_rel = config_override.unwrap_or(&args.config);
+    let config_rel = config_override.unwrap_or(args.config.as_deref().unwrap_or("config.yaml"));
     let src_config = if std::path::Path::new(config_rel).is_absolute() {
         std::path::PathBuf::from(config_rel)
     } else {
@@ -1362,7 +1369,7 @@ async fn run(
             } => {
                 #[cfg(feature = "listener-tproxy")]
                 {
-                    let socket = match tokio::net::TcpListener::bind(addr).await {
+                    let socket = match TProxyListener::bind(addr).await {
                         Ok(s) => s,
                         Err(e) => {
                             listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));

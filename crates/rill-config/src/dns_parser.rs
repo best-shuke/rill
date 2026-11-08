@@ -1243,7 +1243,15 @@ fn build_hosts_trie(
             warn!("hosts: entry '{}' has no values, skipping", host);
             continue;
         }
-        let host_entry = if values.len() == 1 {
+        let host_entry = if values.len() == 1 && values[0].trim() == "lan" {
+            // mihomo: `lan` stands for this host's interface addresses.
+            let ips = crate::system_dns::lan_addresses();
+            if ips.is_empty() {
+                warn!("hosts: '{host}: lan' found no interface address, skipping");
+                continue;
+            }
+            HostEntry::Addresses(ips)
+        } else if values.len() == 1 {
             let raw = values[0].trim();
             match raw.parse::<IpAddr>() {
                 Ok(ip) => HostEntry::Addresses(vec![ip]),

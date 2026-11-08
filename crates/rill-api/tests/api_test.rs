@@ -2407,6 +2407,45 @@ async fn put_proxy_selector_switch() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+/// mihomo decodes request bodies without looking at `Content-Type`;
+/// clients that leave it out (or send `text/plain`) must still work.
+#[tokio::test]
+async fn put_proxy_accepts_json_without_content_type() {
+    let mut raw = test_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "MySelector".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+    let state = test_state(raw);
+    for content_type in [None, Some("text/plain")] {
+        let mut req = Request::builder().method("PUT").uri("/proxies/MySelector");
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                req.body(axum::body::Body::from(r#"{"name":"REJECT"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{content_type:?}");
+    }
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/proxies/MySelector")
+                .body(axum::body::Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn put_and_delete_automatic_group_selection() {
     let mut raw = test_raw_config();

@@ -1511,14 +1511,15 @@ proxies:
         .expect("hex-only UUID must be accepted");
 }
 
-// ─── D19: invalid UUID → proxy skipped ───────────────────────────────────────
+// ─── D19: a non-UUID id maps to a UUIDv5 ─────────────────────────────────────
 
-/// D19: `parse_vless_uuid_invalid_hard_errors`
+/// D19: `parse_vless_uuid_string_maps_to_v5`
 ///
-/// `uuid: "not-a-uuid"` → proxy parse error; proxy absent from config.
-/// guard-rail: an invalid UUID would produce a zeroed or garbage auth ID with no diagnostic.
+/// `uuid: "not-a-uuid"` is accepted, as mihomo (`utils.UUIDMap`) and
+/// Xray-core accept it: the id is the version-5 UUID of the string in the
+/// nil namespace. An empty id is still rejected.
 #[tokio::test]
-async fn parse_vless_uuid_invalid_hard_errors() {
+async fn parse_vless_uuid_string_maps_to_v5() {
     let yaml = r#"
 proxies:
   - name: v
@@ -1526,13 +1527,19 @@ proxies:
     server: example.com
     port: 443
     uuid: "not-a-uuid"
+  - name: empty
+    type: vless
+    server: example.com
+    port: 443
+    uuid: ""
 "#;
     let config = load_config_from_str(yaml)
         .await
         .expect("config load must succeed (warn-and-skip)");
+    assert!(config.proxies.contains_key("v"), "a string id is mapped");
     assert!(
-        !config.proxies.contains_key("v"),
-        "proxy with invalid uuid must be skipped"
+        !config.proxies.contains_key("empty"),
+        "an empty id is skipped"
     );
 }
 
