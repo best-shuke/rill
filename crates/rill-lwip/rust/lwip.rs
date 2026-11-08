@@ -4,6 +4,10 @@
 #![allow(improper_ctypes)]
 #![allow(dead_code)]
 #![allow(clippy::all)]
+// bindgen's bitfield accessors transmute between integer types; newer
+// bindgen/libclang pairs (the CI runner's) emit them where rustc's
+// `unnecessary_transmutes` lint (1.88+) fires on generated code.
+#![allow(unnecessary_transmutes)]
 
 // Note the bindings are generated on macOS.
 // This shouldn't be problematic since we only use lwip functions from
