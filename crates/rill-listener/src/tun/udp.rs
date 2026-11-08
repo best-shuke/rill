@@ -349,6 +349,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     ) {
         return Err("unmapped fake-ip destination".into());
     }
+    // `sniff.QUIC`: read the server name from the client's Initials before
+    // routing; the datagrams read go out first once the flow is dialed.
+    let pending = sniff_quic(inner, &mut rx, &mut metadata).await;
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
@@ -429,6 +432,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // replies, and the idle deadline. Reply source addresses are not
     // rewritten: the tun flow is locked to one (src, dst) tuple, so every
     // reply is delivered as coming from `dst`.
+    for data in pending {
+        conn.write_packet(&data, &dst_addr)
+            .await
+            .map_err(|e| format!("upstream write {dst_addr}: {e}"))?;
+    }
+
     let idle = sleep(udp_timeout);
     tokio::pin!(idle);
     let result = loop {
@@ -468,6 +477,43 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     reply_task.abort();
     let _ = conn.close();
     result
+}
+
+/// How long a QUIC flow may take to deliver the rest of its ClientHello
+/// (browsers send all of their Initials in one flight).
+const QUIC_SNIFF_WINDOW: Duration = Duration::from_millis(100);
+
+/// Feed the flow's first datagrams to the QUIC sniffer when `sniffer:`
+/// asks for it, recording a found name on `metadata`. Returns the
+/// datagrams consumed, which the caller must relay first.
+async fn sniff_quic(
+    inner: &rill_tunnel::TunnelInner,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    metadata: &mut Metadata,
+) -> Vec<Vec<u8>> {
+    use crate::quic_sniff::{QuicSniff, QuicSniffer, MAX_DATAGRAMS};
+    let Some(sniffer) = inner.stream_sniffer().filter(|s| s.wants_quic(metadata)) else {
+        return Vec::new();
+    };
+    let mut quic = QuicSniffer::new();
+    let mut pending = Vec::new();
+    let deadline = Instant::now() + QUIC_SNIFF_WINDOW;
+    while pending.len() < MAX_DATAGRAMS {
+        let Ok(Some(datagram)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            break;
+        };
+        let verdict = quic.feed(&datagram);
+        pending.push(datagram);
+        match verdict {
+            QuicSniff::Host(host) => {
+                sniffer.apply(&host, metadata);
+                break;
+            }
+            QuicSniff::NeedMore => {}
+            QuicSniff::Fail => break,
+        }
+    }
+    pending
 }
 
 /// The subnets assigned to the TUN device: `inet4-address`, plus

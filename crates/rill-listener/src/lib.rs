@@ -50,6 +50,7 @@ pub mod tun;
 pub use mixed::MixedListener;
 #[cfg(feature = "listener-shadowsocks")]
 pub use shadowsocks::{ShadowsocksListener, SsObfsMode};
+pub mod quic_sniff;
 pub use sniffer::SnifferRuntime;
 #[cfg(feature = "listener-tproxy")]
 pub use tproxy::TProxyListener;

@@ -3183,6 +3183,7 @@ fn parse_sniffer_config(
             // Parse per-protocol port lists.
             let mut tls_ports: Vec<u16> = Vec::new();
             let mut http_ports: Vec<u16> = Vec::new();
+            let mut quic_ports: Vec<u16> = Vec::new();
             if let Some(sniff_map) = rs.sniff.as_ref() {
                 for (key, proto) in sniff_map {
                     match key.to_uppercase().as_str() {
@@ -3193,7 +3194,7 @@ fn parse_sniffer_config(
                             http_ports = proto.ports.clone().unwrap_or_default();
                         }
                         "QUIC" => {
-                            warn!("sniffer.sniff.QUIC is not implemented in rill; ignoring");
+                            quic_ports = proto.ports.clone().unwrap_or_default();
                         }
                         // An unrecognized key is a typo'd/dead declaration —
                         // a defect under strict (issue #533 review), unlike
@@ -3209,7 +3210,8 @@ fn parse_sniffer_config(
                         }
                     }
                 }
-                if enable && tls_ports.is_empty() && http_ports.is_empty() {
+                if enable && tls_ports.is_empty() && http_ports.is_empty() && quic_ports.is_empty()
+                {
                     anyhow::bail!(
                         "sniffer.sniff is present and enable: true, but no ports are configured \
                         for any supported protocol (TLS/HTTP)"
@@ -3226,6 +3228,7 @@ fn parse_sniffer_config(
                 override_destination: rs.override_destination.unwrap_or(false),
                 tls_ports,
                 http_ports,
+                quic_ports,
                 skip_domain: rs
                     .skip_domain
                     .iter()
@@ -3253,6 +3256,7 @@ fn parse_sniffer_config(
                 override_destination: false,
                 tls_ports: vec![443],
                 http_ports: Vec::new(),
+                quic_ports: Vec::new(),
                 skip_domain: Vec::new(),
                 force_domain: Vec::new(),
             })
@@ -3672,6 +3676,115 @@ fn build_parser_context_at(
 /// `trigger` names what needed it, for the error. Shared by the rule parser
 /// context and the DNS fallback filter.
 pub(crate) fn load_geoip_index(
+    dat: bool,
+    path: &Path,
+    allowed: &std::collections::HashSet<String>,
+    trigger: &str,
+) -> Result<rill_rules::country_index::CountryIndex, anyhow::Error> {
+    // Walking a whole country database takes ~80 ms and a few MiB at
+    // every start; the result only changes with the database or the
+    // countries the config names, so it is kept on disk next to it.
+    let cache = if allowed.is_empty() {
+        None
+    } else {
+        geoip_index_cache_path(dat, path, allowed)
+    };
+    if let Some(index) = cache
+        .as_deref()
+        .and_then(|c| std::fs::read(c).ok())
+        .and_then(|bytes| rill_rules::country_index::CountryIndex::from_bytes(&bytes))
+    {
+        debug!("GeoIP country index read from its cache");
+        return Ok(index);
+    }
+    let index = load_geoip_index_uncached(dat, path, allowed, trigger)?;
+    if let Some(cache) = cache {
+        store_geoip_index_cache(&cache, &index.to_bytes());
+    }
+    Ok(index)
+}
+
+/// Prefix of the cache files [`load_geoip_index`] keeps beside a database.
+const GEOIP_INDEX_CACHE_PREFIX: &str = ".rill-geoip-index-";
+
+/// `<db dir>/.rill-geoip-index-<key>.bin`, the key covering the database's
+/// path, size and modification time, its format and the country set.
+/// `None` when the database cannot be stat'ed.
+fn geoip_index_cache_path(
+    dat: bool,
+    path: &Path,
+    allowed: &std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let mut countries: Vec<String> = allowed.iter().map(|c| c.to_ascii_uppercase()).collect();
+    countries.sort();
+    countries.dedup();
+    // FNV-1a: stable across builds and processes, unlike DefaultHasher's
+    // seed-free but unspecified algorithm.
+    struct Fnv(u64);
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    (dat, path, meta.len(), modified, &countries).hash(&mut h);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty())?;
+    Some(dir.join(format!("{GEOIP_INDEX_CACHE_PREFIX}{:016x}.bin", h.finish())))
+}
+
+/// Cache files kept besides the one being written: the rules and the DNS
+/// fallback filter may each name their own country set.
+const GEOIP_INDEX_CACHES_KEPT: usize = 3;
+
+/// Write the cache atomically and drop all but the newest few others, so
+/// geodata updates never accumulate them. Best effort: a read-only
+/// directory just means no cache.
+fn store_geoip_index_cache(cache: &Path, bytes: &[u8]) {
+    let Some(dir) = cache.parent() else {
+        return;
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(GEOIP_INDEX_CACHE_PREFIX)
+                    && e.path() != cache
+            })
+            .map(|e| {
+                let at = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (at, e.path())
+            })
+            .collect();
+        others.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, stale) in others.into_iter().skip(GEOIP_INDEX_CACHES_KEPT) {
+            let _ = std::fs::remove_file(stale);
+        }
+    }
+    let tmp = cache.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, cache).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn load_geoip_index_uncached(
     dat: bool,
     path: &Path,
     allowed: &std::collections::HashSet<String>,
@@ -8980,5 +9093,65 @@ proxies:
         )
         .await;
         assert_eq!(got, ["REJECT"]);
+    }
+}
+
+#[cfg(test)]
+mod geoip_index_cache_tests {
+    use super::*;
+
+    #[test]
+    fn key_follows_the_database_and_the_country_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("geoip.metadb");
+        std::fs::write(&db, b"one").unwrap();
+        let cn: std::collections::HashSet<String> = ["cn".to_string()].into();
+        let cn_upper: std::collections::HashSet<String> = ["CN".to_string()].into();
+        let us: std::collections::HashSet<String> = ["US".to_string()].into();
+        let a = geoip_index_cache_path(false, &db, &cn).unwrap();
+        assert_eq!(a, geoip_index_cache_path(false, &db, &cn_upper).unwrap());
+        assert_ne!(a, geoip_index_cache_path(false, &db, &us).unwrap());
+        assert_ne!(a, geoip_index_cache_path(true, &db, &cn).unwrap());
+        assert_eq!(a.parent(), Some(dir.path()));
+        std::fs::write(&db, b"a longer database").unwrap();
+        assert_ne!(a, geoip_index_cache_path(false, &db, &cn).unwrap());
+        assert!(geoip_index_cache_path(false, &dir.path().join("missing"), &cn).is_none());
+    }
+
+    #[test]
+    fn store_keeps_only_the_newest_few() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            let p = dir
+                .path()
+                .join(format!("{GEOIP_INDEX_CACHE_PREFIX}{i:016x}.bin"));
+            store_geoip_index_cache(&p, b"x");
+        }
+        std::fs::write(dir.path().join("geoip.metadb"), b"db").unwrap();
+        let caches = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(GEOIP_INDEX_CACHE_PREFIX)
+            })
+            .count();
+        assert_eq!(caches, GEOIP_INDEX_CACHES_KEPT + 1);
+        assert!(dir.path().join("geoip.metadb").exists(), "other files stay");
+    }
+}
+
+#[cfg(test)]
+mod sniffer_quic_config_tests {
+    #[tokio::test]
+    async fn quic_ports_are_read() {
+        let config = super::load_config_from_str(
+            "sniffer:\n  enable: true\n  sniff:\n    QUIC:\n      ports: [443, 8443]\n",
+        )
+        .await
+        .expect("a QUIC-only sniffer config loads");
+        assert_eq!(config.sniffer.quic_ports, [443, 8443]);
+        assert!(config.sniffer.enable);
     }
 }

@@ -20,6 +20,9 @@ pub struct SnifferConfig {
     pub tls_ports: Vec<u16>,
     /// Destination ports on which to try HTTP Host extraction.
     pub http_ports: Vec<u16>,
+    /// Destination UDP ports on which to read the SNI of QUIC Initials
+    /// (`sniff.QUIC.ports`); none unless configured, as in mihomo.
+    pub quic_ports: Vec<u16>,
     /// Glob-style domain patterns; sniffed results matching these are discarded.
     pub skip_domain: Vec<SmolStr>,
     /// Glob-style domain patterns; hosts matching these bypass `parse_pure_ip`.
@@ -35,6 +38,7 @@ impl Default for SnifferConfig {
             override_destination: false,
             tls_ports: vec![443, 8443],
             http_ports: vec![80, 8080, 8880],
+            quic_ports: Vec::new(),
             skip_domain: Vec::new(),
             force_domain: Vec::new(),
         }

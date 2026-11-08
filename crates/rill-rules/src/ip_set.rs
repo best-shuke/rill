@@ -66,6 +66,33 @@ impl<A: Copy + Ord> Intervals<A> {
     }
 }
 
+fn decode_intervals<A: Copy + Ord, const N: usize>(
+    bytes: &[u8],
+    pos: &mut usize,
+    read: fn([u8; N]) -> A,
+) -> Option<Intervals<A>> {
+    let count = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+    *pos += 4;
+    let need = count.checked_mul(2 * N)?;
+    let body = bytes.get(*pos..pos.checked_add(need)?)?;
+    *pos += need;
+    let mut starts = Vec::with_capacity(count);
+    let mut ends = Vec::with_capacity(count);
+    for pair in body.chunks_exact(2 * N) {
+        let start = read(pair[..N].try_into().ok()?);
+        let end = read(pair[N..].try_into().ok()?);
+        if start > end || ends.last().is_some_and(|&last| start <= last) {
+            return None;
+        }
+        starts.push(start);
+        ends.push(end);
+    }
+    Some(Intervals {
+        starts: starts.into_boxed_slice(),
+        ends: ends.into_boxed_slice(),
+    })
+}
+
 /// Immutable IPv4 + IPv6 range set. Build with [`IpRangeSetBuilder`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpRangeSet {
@@ -74,6 +101,32 @@ pub struct IpRangeSet {
 }
 
 impl IpRangeSet {
+    /// Append the set's compact binary form to `out`: the IPv4 interval
+    /// count and bounds, then the IPv6 ones, big-endian. Read back by
+    /// [`Self::decode`]; used to cache a built index on disk.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.v4.len() as u32).to_be_bytes());
+        for (s, e) in self.v4.starts.iter().zip(self.v4.ends.iter()) {
+            out.extend_from_slice(&s.to_be_bytes());
+            out.extend_from_slice(&e.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.v6.len() as u32).to_be_bytes());
+        for (s, e) in self.v6.starts.iter().zip(self.v6.ends.iter()) {
+            out.extend_from_slice(&s.to_be_bytes());
+            out.extend_from_slice(&e.to_be_bytes());
+        }
+    }
+
+    /// Parse [`Self::encode`]'s output at the start of `bytes`; the set and
+    /// the bytes it took. `None` unless the intervals are well-formed:
+    /// each `start <= end`, sorted and disjoint.
+    pub fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let mut pos = 0;
+        let v4 = decode_intervals::<u32, 4>(bytes, &mut pos, u32::from_be_bytes)?;
+        let v6 = decode_intervals::<u128, 16>(bytes, &mut pos, u128::from_be_bytes)?;
+        Some((Self { v4, v6 }, pos))
+    }
+
     /// Build directly from networks; convenience over the builder.
     pub fn from_nets<I: IntoIterator<Item = IpNet>>(nets: I) -> Self {
         let mut builder = IpRangeSetBuilder::default();
@@ -221,6 +274,28 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let s = set(&["10.0.0.0/8", "192.168.1.0/24", "2001:db8::/32", "fd00::/8"]);
+        let mut bytes = vec![0xaa];
+        s.encode(&mut bytes);
+        let (back, used) = IpRangeSet::decode(&bytes[1..]).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(used, bytes.len() - 1);
+        assert!(
+            IpRangeSet::decode(&bytes[1..bytes.len() - 1]).is_none(),
+            "truncated"
+        );
+        // Unsorted intervals are rejected.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&2u32.to_be_bytes());
+        for v in [10u32, 20, 5, 6] {
+            bad.extend_from_slice(&v.to_be_bytes());
+        }
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        assert!(IpRangeSet::decode(&bad).is_none());
     }
 
     #[test]

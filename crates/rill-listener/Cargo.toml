@@ -57,6 +57,12 @@ ipnet = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
 rill-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
+# QUIC Initial decryption for the sniffer (already in the build via the
+# proxy crates).
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 rill-config = { workspace = true }

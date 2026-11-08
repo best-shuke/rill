@@ -54,6 +54,9 @@ use crate::ip_set::{IpRangeSet, IpRangeSetBuilder};
 /// country. Cheap to clone.
 pub type CountryRanges = Arc<IpRangeSet>;
 
+/// Leads [`CountryIndex::to_bytes`]; bump on any format change.
+const INDEX_MAGIC: &[u8] = b"RILLCI1\n";
+
 /// mihomo's built-in `GEOIP,LAN`: the addresses Go's `IsPrivate`,
 /// `IsLoopback`, `IsUnspecified`, `IsMulticast` and `IsLinkLocalUnicast`
 /// accept. Answered without any database, so a `GEOIP,LAN` rule works (and
@@ -334,6 +337,39 @@ impl CountryIndex {
         Self { by_country }
     }
 
+    /// The index's compact binary form, for an on-disk cache: a magic,
+    /// then each country's code and range set.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        let mut codes: Vec<&String> = self.by_country.keys().collect();
+        codes.sort();
+        out.extend_from_slice(&(codes.len() as u32).to_be_bytes());
+        for code in codes {
+            out.push(code.len() as u8);
+            out.extend_from_slice(code.as_bytes());
+            self.by_country[code].encode(&mut out);
+        }
+        out
+    }
+
+    /// Parse [`Self::to_bytes`]; `None` for anything malformed.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut rest = bytes.strip_prefix(INDEX_MAGIC)?;
+        let count = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        rest = &rest[4..];
+        let mut by_country = HashMap::with_capacity(count.min(256));
+        for _ in 0..count {
+            let len = usize::from(*rest.first()?);
+            let code = std::str::from_utf8(rest.get(1..1 + len)?).ok()?.to_string();
+            rest = &rest[1 + len..];
+            let (set, used) = IpRangeSet::decode(rest)?;
+            rest = &rest[used..];
+            by_country.insert(code, Arc::new(set));
+        }
+        rest.is_empty().then_some(Self { by_country })
+    }
+
     /// Look up ranges for a country code. Unknown codes return an empty set
     /// (no panic) — the rule will simply never match, mirroring upstream's
     /// "MMDB has no record" path.
@@ -579,6 +615,31 @@ pub(crate) mod test_db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_bytes_round_trip() {
+        let mut by_country = HashMap::new();
+        by_country.insert(
+            "CN".to_string(),
+            Arc::new(IpRangeSet::from_nets(
+                ["1.0.1.0/24", "240e::/20"]
+                    .iter()
+                    .map(|n| n.parse().unwrap()),
+            )),
+        );
+        by_country.insert(
+            "JP".to_string(),
+            Arc::new(IpRangeSet::from_nets(["1.0.16.0/20".parse().unwrap()])),
+        );
+        let index = CountryIndex { by_country };
+        let bytes = index.to_bytes();
+        let back = CountryIndex::from_bytes(&bytes).unwrap();
+        assert!(back.ranges_for("cn").contains("1.0.1.9".parse().unwrap()));
+        assert!(back.ranges_for("CN").contains("240e::1".parse().unwrap()));
+        assert!(back.ranges_for("JP").contains("1.0.17.1".parse().unwrap()));
+        assert!(CountryIndex::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(CountryIndex::from_bytes(b"garbage").is_none());
+    }
 
     fn allow(codes: &[&str]) -> HashSet<String> {
         codes.iter().map(|c| (*c).to_string()).collect()

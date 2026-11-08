@@ -16,6 +16,7 @@ pub struct SnifferRuntime {
     skip: DomainTrie<()>,
     force: DomainTrie<()>,
     port_map: HashMap<u16, Proto>,
+    quic_ports: Vec<u16>,
 }
 
 impl SnifferRuntime {
@@ -35,11 +36,13 @@ impl SnifferRuntime {
         for &p in &cfg.http_ports {
             port_map.insert(p, Proto::Http);
         }
+        let quic_ports = cfg.quic_ports.clone();
         Self {
             cfg,
             skip,
             force,
             port_map,
+            quic_ports,
         }
     }
 
@@ -142,6 +145,16 @@ impl SnifferRuntime {
     }
 }
 
+impl SnifferRuntime {
+    /// mihomo's `shouldOverride`: no name (with `parse-pure-ip`), or a
+    /// name in `force-domain`.
+    fn name_gate(&self, metadata: &Metadata) -> bool {
+        let unnamed = metadata.host.is_empty() || metadata.host.parse::<IpAddr>().is_ok();
+        (unnamed && self.cfg.parse_pure_ip)
+            || (!unnamed && self.force.search(&metadata.host).is_some())
+    }
+}
+
 /// The `sniffer:` policy for TUN flows, whose first bytes the tunnel reads
 /// itself (`rill_tunnel::tcp::handle_tcp`).
 impl rill_tunnel::StreamSniffer for SnifferRuntime {
@@ -149,12 +162,13 @@ impl rill_tunnel::StreamSniffer for SnifferRuntime {
     /// with no name (with `parse-pure-ip`), or whose name is in
     /// `force-domain`.
     fn wants(&self, metadata: &Metadata) -> bool {
-        if !self.cfg.enable || !self.port_map.contains_key(&metadata.dst_port) {
-            return false;
-        }
-        let unnamed = metadata.host.is_empty() || metadata.host.parse::<IpAddr>().is_ok();
-        (unnamed && self.cfg.parse_pure_ip)
-            || (!unnamed && self.force.search(&metadata.host).is_some())
+        self.cfg.enable
+            && self.port_map.contains_key(&metadata.dst_port)
+            && self.name_gate(metadata)
+    }
+
+    fn wants_quic(&self, metadata: &Metadata) -> bool {
+        self.cfg.enable && self.quic_ports.contains(&metadata.dst_port) && self.name_gate(metadata)
     }
 
     fn apply(&self, host: &str, metadata: &mut Metadata) {
@@ -214,6 +228,28 @@ mod tests {
             !off.wants(&md),
             "parse-pure-ip: false leaves IP flows alone"
         );
+    }
+
+    #[test]
+    fn quic_is_sniffed_only_on_its_configured_ports() {
+        use rill_tunnel::StreamSniffer;
+        let mut md = make_metadata("", 443);
+        md.dst_ip = Some("1.2.3.4".parse().unwrap());
+        let none = make_runtime(SnifferConfig {
+            enable: true,
+            ..SnifferConfig::default()
+        });
+        assert!(
+            !none.wants_quic(&md),
+            "no QUIC ports by default, as in mihomo"
+        );
+        let quic = make_runtime(SnifferConfig {
+            enable: true,
+            quic_ports: vec![443],
+            ..SnifferConfig::default()
+        });
+        assert!(quic.wants_quic(&md));
+        assert!(!quic.wants_quic(&make_metadata("named.example", 443)));
     }
 
     // Build a minimal TLS ClientHello with the given SNI hostname.

@@ -3498,9 +3498,12 @@ dependencies = [
 name = "rill-listener"
 version = "0.1.6"
 dependencies = [
+ "aes 0.8.4",
+ "aes-gcm 0.10.3",
  "async-trait",
  "base64 0.22.1",
  "futures",
+ "hmac",
  "ipnet",
  "libc",
  "parking_lot",
@@ -3513,6 +3516,7 @@ dependencies = [
  "rill-trie",
  "rill-tunnel",
  "route_manager",
+ "sha2",
  "shadowsocks",
  "smallvec",
  "smol_str",

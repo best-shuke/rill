@@ -172,6 +172,11 @@ pub trait StreamSniffer: Send + Sync {
     /// Record a sniffed `host` on `metadata` (skip-domain,
     /// override-destination).
     fn apply(&self, host: &str, metadata: &mut Metadata);
+    /// Whether the client Initials of a UDP flow should be read for the
+    /// QUIC server name (`sniff.QUIC.ports`).
+    fn wants_quic(&self, _metadata: &Metadata) -> bool {
+        false
+    }
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -404,6 +409,11 @@ impl TunnelInner {
     /// The configured sniffer, when it wants `metadata`'s first bytes. A
     /// destination in the fake-IP pool with a live mapping already has its
     /// name and is left alone, as in mihomo (it maps fake IPs first).
+    /// The `sniffer:` policy installed by [`Tunnel::set_stream_sniffer`].
+    pub fn stream_sniffer(&self) -> Option<Arc<dyn StreamSniffer>> {
+        self.stream_sniffer.read().clone()
+    }
+
     pub(crate) fn configured_sniffer(&self, metadata: &Metadata) -> Option<Arc<dyn StreamSniffer>> {
         let sniffer = self.stream_sniffer.read().clone()?;
         if !sniffer.wants(metadata) {
