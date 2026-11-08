@@ -4,9 +4,10 @@
 
 mihomo configuration compatibility. Every item was checked against
 mihomo v1.19.30 on the same configs (`-t` side by side, and real traffic
-through a mihomo server). Measured with a real 3479-rule config: rill uses
-18.6 MB RSS idle and 18.9 MB under load against mihomo's 41 MB and 47 MB,
-half the CPU for the same requests, and starts in 20 ms (mihomo ~70 ms).
+through a mihomo server). Measured with a real 3479-rule config on one
+host: rill uses 18.7 MB RSS idle and 19 MB under load against mihomo's
+40 MB and 47 MB, a third of mihomo's CPU for the same 500 requests, and
+checks the config (`-t`) in 10–20 ms against mihomo's 30 ms.
 
 Proxy groups, as mihomo builds them — these change membership of
 existing configs:
@@ -84,9 +85,9 @@ CLI and API:
 
 Startup:
 
-- The GeoIP country index is cached beside the database (a few hundred
-  KB, at most four files): a `GEOIP` rule no longer walks the whole
-  database at every start (~80 ms, a few MB of peak memory).
+- The GeoIP country index is cached beside the database (about 100 KB
+  for `CN`, at most four files): a `GEOIP` rule no longer walks the whole
+  database at every start (~80 ms and ~3 MB of peak memory).
 - The first of startup's two build passes no longer parses every rule
   and rule-set only to discard them.
 
